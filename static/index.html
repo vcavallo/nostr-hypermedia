@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Nostr Hypermedia Client</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1>Nostr Hypermedia Browser</h1>
+      <p class="subtitle">A generic Siren client for exploring Nostr</p>
+    </header>
+
+    <nav id="navigation">
+      <button onclick="navigate('/timeline?kinds=1&limit=20')">Timeline</button>
+      <button onclick="navigate('/timeline?kinds=1,7&limit=20')">Timeline + Reactions</button>
+    </nav>
+
+    <main id="content">
+      <div class="loading">Loading...</div>
+    </main>
+
+    <footer>
+      <p>Following hypermedia links and actions dynamically</p>
+    </footer>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

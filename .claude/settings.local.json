@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(go:*)",
+      "Bash(/home/vcavallo/.local/share/mise/installs/go/1.25.1/bin/go get github.com/gorilla/websocket)",
+      "Bash(/home/vcavallo/.local/share/mise/installs/go/1.25.1/bin/go build -o nostr-server .)",
+      "Bash(./nostr-server)",
+      "Bash(curl:*)",
+      "Bash(PORT=3000 ./nostr-server)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}
