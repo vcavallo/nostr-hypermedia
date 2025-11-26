@@ -218,12 +218,36 @@ func htmlThreadHandler(w http.ResponseWriter, r *http.Request) {
 		pubkeySet[reply.PubKey] = true
 	}
 
-	// Fetch profiles
+	// Collect all event IDs for reply count fetching
+	allEventIDs := make([]string, 0, 1+len(replies))
+	allEventIDs = append(allEventIDs, rootEvent.ID)
+	for _, reply := range replies {
+		allEventIDs = append(allEventIDs, reply.ID)
+	}
+
+	// Fetch profiles and reply counts in parallel
 	pubkeys := make([]string, 0, len(pubkeySet))
 	for pk := range pubkeySet {
 		pubkeys = append(pubkeys, pk)
 	}
-	profiles := fetchProfiles(relays, pubkeys)
+
+	var profiles map[string]*ProfileInfo
+	var replyCounts map[string]int
+	var wg2 sync.WaitGroup
+
+	wg2.Add(1)
+	go func() {
+		defer wg2.Done()
+		profiles = fetchProfiles(relays, pubkeys)
+	}()
+
+	wg2.Add(1)
+	go func() {
+		defer wg2.Done()
+		replyCounts = fetchReplyCounts(relays, allEventIDs)
+	}()
+
+	wg2.Wait()
 
 	// Build response
 	rootItem := EventItem{
@@ -236,6 +260,7 @@ func htmlThreadHandler(w http.ResponseWriter, r *http.Request) {
 		Sig:           rootEvent.Sig,
 		RelaysSeen:    rootEvent.RelaysSeen,
 		AuthorProfile: profiles[rootEvent.PubKey],
+		ReplyCount:    replyCounts[rootEvent.ID],
 	}
 
 	replyItems := make([]EventItem, len(replies))
@@ -250,6 +275,7 @@ func htmlThreadHandler(w http.ResponseWriter, r *http.Request) {
 			Sig:           evt.Sig,
 			RelaysSeen:    evt.RelaysSeen,
 			AuthorProfile: profiles[evt.PubKey],
+			ReplyCount:    replyCounts[evt.ID],
 		}
 	}
 

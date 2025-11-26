@@ -431,6 +431,7 @@ type HTMLEventItem struct {
 	AuthorProfile *ProfileInfo
 	Reactions     *ReactionsSummary
 	ReplyCount    int
+	ParentID      string // ID of parent event if this is a reply
 }
 
 type HTMLPagination struct {
@@ -792,6 +793,12 @@ var htmlThreadTemplate = `<!DOCTYPE html>
           {{if .Root.RelaysSeen}}
           <span title="{{join .Root.RelaysSeen ", "}}">from {{len .Root.RelaysSeen}} relay(s)</span>
           {{end}}
+          {{if .Root.ParentID}}
+          <a href="/html/thread/{{.Root.ParentID}}" style="color:#667eea;text-decoration:none;">↑ Parent</a>
+          {{end}}
+          {{if gt .Root.ReplyCount 0}}
+          <a href="/html/thread/{{.Root.ID}}" style="color:#667eea;text-decoration:none;">{{.Root.ReplyCount}} replies ↓</a>
+          {{end}}
         </div>
       </article>
 
@@ -840,6 +847,13 @@ var htmlThreadTemplate = `<!DOCTYPE html>
             {{if .RelaysSeen}}
             <span title="{{join .RelaysSeen ", "}}">from {{len .RelaysSeen}} relay(s)</span>
             {{end}}
+            {{if .ParentID}}
+            <a href="/html/thread/{{.ParentID}}" style="color:#667eea;text-decoration:none;">↑ Parent</a>
+            {{end}}
+            {{if gt .ReplyCount 0}}
+            <a href="/html/thread/{{.ID}}" style="color:#667eea;text-decoration:none;">{{.ReplyCount}} replies ↓</a>
+            {{end}}
+            <a href="/html/thread/{{.ID}}" style="color:#667eea;text-decoration:none;">Reply</a>
           </div>
         </article>
         {{end}}
@@ -864,6 +878,23 @@ type HTMLThreadData struct {
 	UserPubKey string
 }
 
+// extractParentID extracts the parent event ID from the "e" tags
+// The parent is typically the last "e" tag, or the one marked as "reply"
+func extractParentID(tags [][]string) string {
+	var parentID string
+	for _, tag := range tags {
+		if len(tag) >= 2 && tag[0] == "e" {
+			// Check if this tag has a marker
+			if len(tag) >= 4 && tag[3] == "reply" {
+				return tag[1] // This is explicitly marked as the reply target
+			}
+			// Otherwise, use the last "e" tag as the parent
+			parentID = tag[1]
+		}
+	}
+	return parentID
+}
+
 func renderThreadHTML(resp ThreadResponse, session *BunkerSession) (string, error) {
 	// Convert root to HTML item
 	root := &HTMLEventItem{
@@ -875,6 +906,8 @@ func renderThreadHTML(resp ThreadResponse, session *BunkerSession) (string, erro
 		ContentHTML:   processContentToHTML(resp.Root.Content),
 		RelaysSeen:    resp.Root.RelaysSeen,
 		AuthorProfile: resp.Root.AuthorProfile,
+		ReplyCount:    resp.Root.ReplyCount,
+		ParentID:      extractParentID(resp.Root.Tags),
 	}
 
 	// Convert replies to HTML items
@@ -889,6 +922,8 @@ func renderThreadHTML(resp ThreadResponse, session *BunkerSession) (string, erro
 			ContentHTML:   processContentToHTML(item.Content),
 			RelaysSeen:    item.RelaysSeen,
 			AuthorProfile: item.AuthorProfile,
+			ReplyCount:    item.ReplyCount,
+			ParentID:      extractParentID(item.Tags),
 		}
 	}
 
