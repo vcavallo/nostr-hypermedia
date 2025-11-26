@@ -11,6 +11,10 @@ Maintains long-lived WebSocket connections to Nostr relays and exposes events ov
 - **Two hypermedia UIs**:
   - **JavaScript Siren browser** - Generic client that discovers features from API responses
   - **Zero-JS HTML client** - Pure server-rendered HTML, works without JavaScript
+- **Zero-trust authentication** - NIP-46 remote signing (your keys never touch the server)
+- **Thread views** - View notes with their replies
+- **Profile enrichment** - Author names/pictures fetched and cached
+- **Reactions & reply counts** - See engagement on notes
 - **Multiple response formats** - JSON, Siren (HATEOAS), or HTML based on Accept header
 - **Smart caching** - ETag/Last-Modified support for efficient refreshes
 - **Signature verification** - Validates Nostr event signatures
@@ -46,8 +50,32 @@ A **pure HTML hypermedia client** that:
 - Uses plain `<a>` tags for navigation and `<form>` tags for actions
 - Server renders complete HTML pages
 - True REST/HATEOAS over HTML—the original web architecture
+- **NIP-46 authentication** - Login with remote signers (nsec.app, Amber)
+- **Post notes** - Create and publish notes without JavaScript
 
 Both clients follow the same hypermedia principles: links and actions are discovered from server responses, not hardcoded.
+
+## Authentication (NIP-46)
+
+The HTML client supports **zero-trust authentication** via NIP-46 (Nostr Connect). Your private key never leaves your signer app.
+
+### How it works
+
+1. Go to `/html/login`
+2. Paste your `bunker://` URL from a remote signer:
+   - [nsec.app](https://nsec.app) - Web-based remote signer
+   - [Amber](https://github.com/greenart7c3/Amber) - Android signer
+3. The server connects to your signer via relay
+4. When you post, the server requests a signature from your signer
+5. You approve/reject in your signer app
+
+### Security model
+
+- Server only sees your **public key**
+- All signing happens in your signer app
+- Communication is **NIP-44 encrypted** (ChaCha20 + HMAC-SHA256)
+- Server uses a **disposable keypair** for each session
+- Sessions stored server-side with HTTP-only cookies
 
 ## API Endpoints
 
@@ -59,7 +87,23 @@ Fetch aggregated events from Nostr relays (JSON/Siren formats).
 
 Fetch aggregated events as server-rendered HTML (zero-JS client).
 
-**Query Parameters:**
+### `GET /html/thread/{eventId}`
+
+View a note with its replies as server-rendered HTML.
+
+### `GET /html/login`
+
+Login page for NIP-46 authentication. POST with `bunker_url` to connect.
+
+### `GET /html/logout`
+
+Logout and clear session.
+
+### `POST /html/post`
+
+Post a new note (requires login). Form field: `content`.
+
+**Query Parameters (timeline):**
 - `relays` - Comma-separated relay URLs (default: relay.damus.io, relay.nostr.band)
 - `authors` - Comma-separated pubkeys to filter by
 - `kinds` - Comma-separated event kinds (e.g., `1` for notes, `7` for reactions)
@@ -201,10 +245,13 @@ curl -H 'If-None-Match: "4bff5e5ea3f03f38"' http://localhost:3000/timeline?kinds
 **Server:**
 - `main.go` - HTTP server and routes
 - `handlers.go` - Timeline endpoint and response building
-- `html_handlers.go` - Server-side HTML rendering
+- `html_handlers.go` - Server-side HTML rendering for timeline/threads
+- `html_auth.go` - NIP-46 login/logout/post handlers
 - `relay.go` - WebSocket client, fan-out, dedup, EOSE handling
 - `siren.go` - Hypermedia (Siren) format conversion
 - `html.go` - HTML template rendering
+- `nip46.go` - NIP-46 bunker client (remote signing)
+- `nip44.go` - NIP-44 encryption (ChaCha20 + HMAC-SHA256)
 
 **Clients:**
 - `static/index.html` - JS Siren browser entry point
@@ -222,11 +269,19 @@ curl -H 'If-None-Match: "4bff5e5ea3f03f38"' http://localhost:3000/timeline?kinds
 - [x] JavaScript Siren browser (generic client)
 - [x] Zero-JS HTML client (server-rendered)
 
-### Phase 2
+### Phase 2 (✅ Complete)
+- [x] Thread views (`/html/thread/{id}`)
+- [x] Profile enrichment with caching
+- [x] Reactions and reply counts
+- [x] NIP-46 remote signing (zero-trust auth)
+- [x] NIP-44 encryption
+- [x] Note posting via HTML forms
+
+### Phase 3
 - [ ] SSE endpoint for live updates (`/stream/timeline`)
-- [ ] Thread expansion (`/threads/{id}`)
-- [ ] Profile lookup with caching (`/profiles/{pubkey}`)
-- [ ] Write support (POST `/events` with NIP-46 signing)
+- [ ] Profile pages (`/html/profile/{pubkey}`)
+- [ ] Reply to notes (thread participation)
+- [ ] Reactions via HTML forms
 - [ ] Search endpoint (NIP-50)
 - [ ] Relay health tracking and scoring
 - [ ] Persistent storage (Redis/Postgres)
@@ -234,6 +289,8 @@ curl -H 'If-None-Match: "4bff5e5ea3f03f38"' http://localhost:3000/timeline?kinds
 ## Dependencies
 
 - `github.com/gorilla/websocket` - WebSocket client for Nostr relays
+- `github.com/btcsuite/btcd/btcec/v2` - secp256k1 elliptic curve (for NIP-46/NIP-44)
+- `golang.org/x/crypto` - ChaCha20 and HKDF (for NIP-44 encryption)
 
 ## Environment Variables
 
