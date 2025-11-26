@@ -8,6 +8,54 @@ let userState = {
   follows: []
 };
 
+// Client-side profile cache using localStorage
+const PROFILE_CACHE_KEY = 'nostr_profile_cache';
+const PROFILE_CACHE_TTL = 10 * 60 * 1000; // 10 minutes in milliseconds
+
+function getProfileCache() {
+  try {
+    const cached = localStorage.getItem(PROFILE_CACHE_KEY);
+    if (!cached) return {};
+    return JSON.parse(cached);
+  } catch (e) {
+    return {};
+  }
+}
+
+function setProfileCache(cache) {
+  try {
+    localStorage.setItem(PROFILE_CACHE_KEY, JSON.stringify(cache));
+  } catch (e) {
+    // localStorage might be full or unavailable
+    console.warn('Failed to save profile cache:', e);
+  }
+}
+
+function getCachedProfile(pubkey) {
+  const cache = getProfileCache();
+  const entry = cache[pubkey];
+  if (!entry) return null;
+
+  // Check TTL
+  if (Date.now() - entry.timestamp > PROFILE_CACHE_TTL) {
+    // Expired, remove from cache
+    delete cache[pubkey];
+    setProfileCache(cache);
+    return null;
+  }
+
+  return entry.profile;
+}
+
+function setCachedProfile(pubkey, profile) {
+  const cache = getProfileCache();
+  cache[pubkey] = {
+    profile,
+    timestamp: Date.now()
+  };
+  setProfileCache(cache);
+}
+
 // Bech32 decoding (NIP-19)
 const BECH32_CHARSET = 'qpzry9x8gf2tvdw0s3jn54khce6mua7l';
 
@@ -239,26 +287,20 @@ async function navigate(url, skipPushState = false) {
   }
 }
 
-// Convert API URL to display path (e.g., /timeline?kinds=1 -> /timeline or /thread/abc -> /thread/abc)
+// The URL IS the state - no transformation needed for hypermedia
+// Just use the full URL with query params as the browser URL
 function urlToDisplayPath(url) {
-  if (url.startsWith('/thread/')) {
-    return url;
-  }
-  if (url.startsWith('/timeline')) {
-    return '/timeline';
-  }
-  return url.split('?')[0] || '/';
+  return url;
 }
 
 // Convert display path back to API URL
 function displayPathToUrl(path) {
-  if (path === '/' || path === '' || path === '/timeline') {
+  // Handle root path - provide sensible defaults
+  if (path === '/' || path === '') {
     return '/timeline?kinds=1&limit=20&fast=1';
   }
-  if (path.startsWith('/thread/')) {
-    return path;
-  }
-  return path;
+  // Otherwise, the URL is the state - use it directly
+  return path + window.location.search;
 }
 
 // Handle browser back/forward
@@ -502,15 +544,27 @@ function renderNote(props) {
   const noteDiv = document.createElement('div');
   noteDiv.className = 'note';
 
+  // Try to get profile from local cache first, fall back to server-provided
+  let profile = props.author_profile;
+  if (props.pubkey) {
+    const cachedProfile = getCachedProfile(props.pubkey);
+    if (cachedProfile) {
+      profile = cachedProfile;
+    } else if (profile) {
+      // Cache the server-provided profile
+      setCachedProfile(props.pubkey, profile);
+    }
+  }
+
   // Author header with profile info
   const authorDiv = document.createElement('div');
   authorDiv.className = 'note-author';
 
   // Profile picture (if available)
-  if (props.author_profile && props.author_profile.picture) {
+  if (profile && profile.picture) {
     const avatarImg = document.createElement('img');
     avatarImg.className = 'author-avatar';
-    avatarImg.src = props.author_profile.picture;
+    avatarImg.src = profile.picture;
     avatarImg.alt = 'avatar';
     avatarImg.onerror = () => { avatarImg.style.display = 'none'; };
     authorDiv.appendChild(avatarImg);
@@ -520,17 +574,17 @@ function renderNote(props) {
   const authorInfoDiv = document.createElement('div');
   authorInfoDiv.className = 'author-info';
 
-  if (props.author_profile && (props.author_profile.display_name || props.author_profile.name)) {
+  if (profile && (profile.display_name || profile.name)) {
     const nameSpan = document.createElement('span');
     nameSpan.className = 'author-name';
-    nameSpan.textContent = props.author_profile.display_name || props.author_profile.name;
+    nameSpan.textContent = profile.display_name || profile.name;
     authorInfoDiv.appendChild(nameSpan);
 
     // NIP-05 verification
-    if (props.author_profile.nip05) {
+    if (profile.nip05) {
       const nip05Span = document.createElement('span');
       nip05Span.className = 'author-nip05';
-      nip05Span.textContent = props.author_profile.nip05;
+      nip05Span.textContent = profile.nip05;
       authorInfoDiv.appendChild(nip05Span);
     }
   }
@@ -835,13 +889,21 @@ function renderThread(threadData, container) {
   container.appendChild(threadDiv);
 }
 
-// Initialize based on current URL path
+// Initialize based on current URL (path + query string)
 window.onload = () => {
-  const path = window.location.pathname;
-  const url = displayPathToUrl(path);
+  // The full URL (path + search) IS the state
+  const fullUrl = window.location.pathname + window.location.search;
 
-  // Replace current history state with the API URL
-  history.replaceState({ url }, '', path === '/' ? '/timeline' : path);
+  // If just root, redirect to default timeline
+  let url = fullUrl;
+  if (fullUrl === '/' || fullUrl === '') {
+    url = '/timeline?kinds=1&limit=20&fast=1';
+    // Update URL to show the actual state
+    history.replaceState({ url }, '', url);
+  } else {
+    // Keep current URL, just store in state
+    history.replaceState({ url }, '', fullUrl);
+  }
 
   navigate(url, true); // Skip pushState since we just did replaceState
 };

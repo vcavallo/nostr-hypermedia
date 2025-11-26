@@ -310,30 +310,38 @@ func fetchSingleEvent(ctx context.Context, relayURL string, eventID string, even
 }
 
 // fetchProfiles fetches kind 0 (profile metadata) events for the given pubkeys
+// Uses the global profileCache to avoid redundant relay queries
 func fetchProfiles(relays []string, pubkeys []string) map[string]*ProfileInfo {
 	if len(pubkeys) == 0 {
 		return nil
 	}
 
+	// Check cache first
+	cached, missing := profileCache.GetMultiple(pubkeys)
+	if len(missing) == 0 {
+		log.Printf("Profile cache hit for all %d pubkeys", len(pubkeys))
+		return cached
+	}
+	log.Printf("Profile cache: %d hits, %d misses", len(cached), len(missing))
+
+	// Fetch only missing profiles from relays
 	filter := Filter{
-		Authors: pubkeys,
+		Authors: missing,
 		Kinds:   []int{0},
-		Limit:   len(pubkeys),
+		Limit:   len(missing),
 	}
 
 	// Shorter timeout - return what we have quickly rather than waiting for all
 	events, _ := fetchEventsFromRelaysWithTimeout(relays, filter, 1500*time.Millisecond)
 
 	// Parse profile content and build map
-	profiles := make(map[string]*ProfileInfo)
+	freshProfiles := make(map[string]*ProfileInfo)
 	for _, evt := range events {
 		if evt.Kind != 0 {
 			continue
 		}
 		// Only keep the newest profile for each pubkey
-		if existing, ok := profiles[evt.PubKey]; ok {
-			// Profile already exists, check if this one is newer
-			_ = existing // We'd need to track created_at, but for simplicity, first one wins
+		if _, ok := freshProfiles[evt.PubKey]; ok {
 			continue
 		}
 
@@ -356,10 +364,25 @@ func fetchProfiles(relays []string, pubkeys []string) map[string]*ProfileInfo {
 			profile.Nip05 = nip05
 		}
 
-		profiles[evt.PubKey] = profile
+		freshProfiles[evt.PubKey] = profile
 	}
 
-	return profiles
+	// Store freshly fetched profiles in cache
+	if len(freshProfiles) > 0 {
+		profileCache.SetMultiple(freshProfiles)
+		log.Printf("Cached %d new profiles", len(freshProfiles))
+	}
+
+	// Merge cached and fresh profiles
+	result := make(map[string]*ProfileInfo, len(cached)+len(freshProfiles))
+	for pk, p := range cached {
+		result[pk] = p
+	}
+	for pk, p := range freshProfiles {
+		result[pk] = p
+	}
+
+	return result
 }
 
 // fetchReactions fetches kind 7 (reaction) events for the given event IDs

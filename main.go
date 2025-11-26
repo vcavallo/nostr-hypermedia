@@ -4,7 +4,6 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"strings"
 )
 
 func main() {
@@ -17,20 +16,18 @@ func main() {
 	fs := http.FileServer(http.Dir("./static"))
 	http.Handle("/static/", http.StripPrefix("/static/", fs))
 
-	// Root and client-side routes serve the HTML client
+	// API endpoints (these handle content negotiation internally)
+	http.HandleFunc("/timeline", timelineHandler)
+	http.HandleFunc("/thread/", threadHandler)
+
+	// Root path serves HTML client, everything else 404
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		path := r.URL.Path
-		// Serve index.html for client-side routes
-		if path == "/" || path == "/timeline" || strings.HasPrefix(path, "/thread/") {
+		if r.URL.Path == "/" {
 			http.ServeFile(w, r, "./static/index.html")
 		} else {
 			http.NotFound(w, r)
 		}
 	})
-
-	// API endpoints
-	http.HandleFunc("/timeline", timelineHandler)
-	http.HandleFunc("/thread/", threadHandler)
 	http.HandleFunc("/html/timeline", htmlTimelineHandler)
 	http.HandleFunc("/health", healthHandler)
 

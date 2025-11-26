@@ -42,7 +42,7 @@ type SirenField struct {
 	Title string      `json:"title,omitempty"`
 }
 
-func toSirenTimeline(resp TimelineResponse, relays []string, authors []string, kinds []int, limit int) SirenEntity {
+func toSirenTimeline(resp TimelineResponse, relays []string, authors []string, kinds []int, limit int, fast bool) SirenEntity {
 	// Build main entity
 	entity := SirenEntity{
 		Class: []string{"timeline"},
@@ -88,6 +88,9 @@ func toSirenTimeline(resp TimelineResponse, relays []string, authors []string, k
 			}
 		}
 
+		// Add reply count
+		props["reply_count"] = item.ReplyCount
+
 		subEntity := SirenSubEntity{
 			Class:      []string{"event", "note"},
 			Rel:        []string{"item"},
@@ -100,7 +103,7 @@ func toSirenTimeline(resp TimelineResponse, relays []string, authors []string, k
 	}
 
 	// Add self link
-	selfURL := buildTimelineURL("/timeline", relays, authors, kinds, limit, nil)
+	selfURL := buildTimelineURL("/timeline", relays, authors, kinds, limit, nil, fast)
 	entity.Links = append(entity.Links, SirenLink{
 		Rel:  []string{"self"},
 		Href: selfURL,
@@ -117,7 +120,7 @@ func toSirenTimeline(resp TimelineResponse, relays []string, authors []string, k
 	return entity
 }
 
-func buildTimelineURL(base string, relays []string, authors []string, kinds []int, limit int, until *int64) string {
+func buildTimelineURL(base string, relays []string, authors []string, kinds []int, limit int, until *int64, fast bool) string {
 	parts := []string{base + "?"}
 
 	if len(relays) > 0 {
@@ -136,6 +139,9 @@ func buildTimelineURL(base string, relays []string, authors []string, kinds []in
 	parts = append(parts, "limit="+strconv.Itoa(limit))
 	if until != nil {
 		parts = append(parts, "until="+strconv.FormatInt(*until, 10))
+	}
+	if fast {
+		parts = append(parts, "fast=1")
 	}
 
 	return strings.Join(parts, "&")

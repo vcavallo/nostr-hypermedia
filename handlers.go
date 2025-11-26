@@ -63,9 +63,14 @@ type ThreadResponse struct {
 }
 
 func timelineHandler(w http.ResponseWriter, r *http.Request) {
+	// Tell browser to cache based on Accept header
+	w.Header().Set("Vary", "Accept")
+
 	// If browser navigation (Accept: text/html), serve the client app
 	accept := r.Header.Get("Accept")
 	if strings.Contains(accept, "text/html") && !strings.Contains(accept, "application/json") {
+		// Don't cache HTML - always serve fresh so JS can fetch the real data
+		w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
 		http.ServeFile(w, r, "./static/index.html")
 		return
 	}
@@ -218,6 +223,10 @@ func timelineHandler(w http.ResponseWriter, r *http.Request) {
 			}
 			nextURL += "&kinds=" + strings.Join(kindsStr, ",")
 		}
+		// Preserve fast mode in pagination
+		if fast {
+			nextURL += "&fast=1"
+		}
 		resp.Page.Next = &nextURL
 	}
 
@@ -242,7 +251,7 @@ func timelineHandler(w http.ResponseWriter, r *http.Request) {
 	// Check Accept header for hypermedia format
 	if strings.Contains(accept, "application/vnd.siren+json") {
 		w.Header().Set("Content-Type", "application/vnd.siren+json")
-		siren := toSirenTimeline(resp, relays, authors, kinds, limit)
+		siren := toSirenTimeline(resp, relays, authors, kinds, limit, fast)
 		json.NewEncoder(w).Encode(siren)
 	} else {
 		w.Header().Set("Content-Type", "application/json")
@@ -308,9 +317,14 @@ func timeNow() time.Time {
 
 // threadHandler fetches a thread (root event + replies)
 func threadHandler(w http.ResponseWriter, r *http.Request) {
+	// Tell browser to cache based on Accept header
+	w.Header().Set("Vary", "Accept")
+
 	// If browser navigation (Accept: text/html), serve the client app
 	accept := r.Header.Get("Accept")
 	if strings.Contains(accept, "text/html") && !strings.Contains(accept, "application/json") {
+		// Don't cache HTML - always serve fresh so JS can fetch the real data
+		w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
 		http.ServeFile(w, r, "./static/index.html")
 		return
 	}
