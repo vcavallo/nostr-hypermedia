@@ -212,8 +212,11 @@ func htmlTimelineHandler(w http.ResponseWriter, r *http.Request) {
 	errorMsg := q.Get("error")
 	successMsg := q.Get("success")
 
+	// Build current URL for reaction redirects
+	currentURL := r.URL.Path + "?" + r.URL.RawQuery
+
 	// Render HTML - showReactions is opposite of fast mode
-	html, err := renderHTML(resp, relays, authors, kinds, limit, session, errorMsg, successMsg, !fast, feedMode)
+	html, err := renderHTML(resp, relays, authors, kinds, limit, session, errorMsg, successMsg, !fast, feedMode, currentURL)
 	if err != nil {
 		log.Printf("Error rendering HTML: %v", err)
 		http.Error(w, "Error rendering page", http.StatusInternalServerError)
@@ -362,8 +365,11 @@ func htmlThreadHandler(w http.ResponseWriter, r *http.Request) {
 	// Get session for reply form
 	session := getSessionFromRequest(r)
 
+	// Build current URL for reaction redirects
+	currentURL := r.URL.Path
+
 	// Render HTML
-	htmlContent, err := renderThreadHTML(resp, session)
+	htmlContent, err := renderThreadHTML(resp, session, currentURL)
 	if err != nil {
 		log.Printf("Error rendering thread HTML: %v", err)
 		http.Error(w, "Error rendering page", http.StatusInternalServerError)

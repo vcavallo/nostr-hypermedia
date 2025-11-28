@@ -35,6 +35,7 @@ func main() {
 	http.HandleFunc("/html/logout", htmlLogoutHandler)
 	http.HandleFunc("/html/post", htmlPostNoteHandler)
 	http.HandleFunc("/html/reply", htmlReplyHandler)
+	http.HandleFunc("/html/react", htmlReactHandler)
 	http.HandleFunc("/html/check-connection", htmlCheckConnectionHandler)
 	http.HandleFunc("/html/reconnect", htmlReconnectHandler)
 	http.HandleFunc("/health", healthHandler)

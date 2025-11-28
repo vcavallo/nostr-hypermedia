@@ -365,7 +365,6 @@ var htmlTemplate = `<!DOCTYPE html>
           </div>
         </div>
         <div class="note-content">{{.ContentHTML}}</div>
-        {{if or (and .Reactions (gt .Reactions.Total 0)) (gt .ReplyCount 0)}}
         <div class="note-reactions">
           {{if gt .ReplyCount 0}}
           <a href="/html/thread/{{.ID}}" class="reaction-badge" style="text-decoration:none;">replies {{.ReplyCount}}</a>
@@ -375,8 +374,16 @@ var htmlTemplate = `<!DOCTYPE html>
           <span class="reaction-badge">{{$type}} {{$count}}</span>
           {{end}}
           {{end}}
+          {{if $.LoggedIn}}
+          <form method="POST" action="/html/react" style="display:inline;margin:0;">
+            <input type="hidden" name="event_id" value="{{.ID}}">
+            <input type="hidden" name="event_pubkey" value="{{.Pubkey}}">
+            <input type="hidden" name="return_url" value="{{$.CurrentURL}}">
+            <input type="hidden" name="reaction" value="+">
+            <button type="submit" style="background:#f0f0f0;border:none;border-radius:16px;padding:4px 10px;font-size:13px;cursor:pointer;color:#555;">+</button>
+          </form>
+          {{end}}
         </div>
-        {{end}}
         <div class="note-meta">
           <span>{{formatTime .CreatedAt}}</span>
           {{if .RelaysSeen}}
@@ -449,6 +456,7 @@ type HTMLPageData struct {
 	ShowReactions bool     // Whether reactions are being fetched (slow mode)
 	FeedMode      string   // "follows" or "global"
 	ActiveRelays  []string // Relays being used for this request
+	CurrentURL    string   // Current page URL for reaction redirects
 }
 
 type HTMLEventItem struct {
@@ -515,7 +523,7 @@ func processContentToHTML(content string) template.HTML {
 	return template.HTML(result)
 }
 
-func renderHTML(resp TimelineResponse, relays []string, authors []string, kinds []int, limit int, session *BunkerSession, errorMsg, successMsg string, showReactions bool, feedMode string) (string, error) {
+func renderHTML(resp TimelineResponse, relays []string, authors []string, kinds []int, limit int, session *BunkerSession, errorMsg, successMsg string, showReactions bool, feedMode string, currentURL string) (string, error) {
 	// Convert to HTML page data
 	items := make([]HTMLEventItem, len(resp.Items))
 	for i, item := range resp.Items {
@@ -567,6 +575,7 @@ func renderHTML(resp TimelineResponse, relays []string, authors []string, kinds 
 		ShowReactions: showReactions,
 		FeedMode:      feedMode,
 		ActiveRelays:  relays,
+		CurrentURL:    currentURL,
 	}
 
 	// Add session info if logged in
@@ -838,6 +847,17 @@ var htmlThreadTemplate = `<!DOCTYPE html>
           </div>
         </div>
         <div class="note-content">{{.Root.ContentHTML}}</div>
+        {{if .LoggedIn}}
+        <div style="margin:12px 0;padding:8px 0;border-top:1px solid #e1e4e8;">
+          <form method="POST" action="/html/react" style="display:inline;margin:0;">
+            <input type="hidden" name="event_id" value="{{.Root.ID}}">
+            <input type="hidden" name="event_pubkey" value="{{.Root.Pubkey}}">
+            <input type="hidden" name="return_url" value="{{$.CurrentURL}}">
+            <input type="hidden" name="reaction" value="+">
+            <button type="submit" style="background:#f0f0f0;border:none;border-radius:16px;padding:4px 10px;font-size:13px;cursor:pointer;color:#555;">+</button>
+          </form>
+        </div>
+        {{end}}
         <div class="note-meta">
           <span>{{formatTime .Root.CreatedAt}}</span>
           {{if .Root.RelaysSeen}}
@@ -896,6 +916,17 @@ var htmlThreadTemplate = `<!DOCTYPE html>
             </div>
           </div>
           <div class="note-content">{{.ContentHTML}}</div>
+          {{if $.LoggedIn}}
+          <div style="margin:8px 0;">
+            <form method="POST" action="/html/react" style="display:inline;margin:0;">
+              <input type="hidden" name="event_id" value="{{.ID}}">
+              <input type="hidden" name="event_pubkey" value="{{.Pubkey}}">
+              <input type="hidden" name="return_url" value="{{$.CurrentURL}}">
+              <input type="hidden" name="reaction" value="+">
+              <button type="submit" style="background:#f0f0f0;border:none;border-radius:16px;padding:4px 10px;font-size:13px;cursor:pointer;color:#555;">+</button>
+            </form>
+          </div>
+          {{end}}
           <div class="note-meta">
             <span>{{formatTime .CreatedAt}}</span>
             {{if .RelaysSeen}}
@@ -930,6 +961,7 @@ type HTMLThreadData struct {
 	Replies    []HTMLEventItem
 	LoggedIn   bool
 	UserPubKey string
+	CurrentURL string
 }
 
 // extractParentID extracts the parent event ID from the "e" tags
@@ -949,7 +981,7 @@ func extractParentID(tags [][]string) string {
 	return parentID
 }
 
-func renderThreadHTML(resp ThreadResponse, session *BunkerSession) (string, error) {
+func renderThreadHTML(resp ThreadResponse, session *BunkerSession, currentURL string) (string, error) {
 	// Generate npub for root author
 	rootNpub, _ := encodeBech32Pubkey(resp.Root.Pubkey)
 
@@ -990,10 +1022,11 @@ func renderThreadHTML(resp ThreadResponse, session *BunkerSession) (string, erro
 	}
 
 	data := HTMLThreadData{
-		Title:   "Thread",
-		Meta:    &resp.Meta,
-		Root:    root,
-		Replies: replies,
+		Title:      "Thread",
+		Meta:       &resp.Meta,
+		Root:       root,
+		Replies:    replies,
+		CurrentURL: currentURL,
 	}
 
 	// Add session info

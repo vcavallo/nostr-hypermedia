@@ -539,6 +539,81 @@ func htmlReplyHandler(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/html/thread/"+replyTo+"?success=Reply+published", http.StatusSeeOther)
 }
 
+// htmlReactHandler handles adding a reaction to a note
+func htmlReactHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Redirect(w, r, "/html/timeline?kinds=1&limit=20", http.StatusSeeOther)
+		return
+	}
+
+	session := getSessionFromRequest(r)
+	if session == nil || !session.Connected {
+		http.Redirect(w, r, "/html/login?error=Please+login+first", http.StatusSeeOther)
+		return
+	}
+
+	eventID := strings.TrimSpace(r.FormValue("event_id"))
+	eventPubkey := strings.TrimSpace(r.FormValue("event_pubkey"))
+	returnURL := strings.TrimSpace(r.FormValue("return_url"))
+	reaction := strings.TrimSpace(r.FormValue("reaction"))
+
+	if eventID == "" {
+		http.Redirect(w, r, returnURL+"?error=Missing+event+ID", http.StatusSeeOther)
+		return
+	}
+
+	if reaction == "" {
+		reaction = "+"
+	}
+
+	if returnURL == "" {
+		returnURL = "/html/timeline?kinds=1&limit=20"
+	}
+
+	// Build tags for reaction (NIP-25)
+	tags := [][]string{
+		{"e", eventID},
+		{"k", "1"}, // Reacting to kind 1 (note)
+	}
+	if eventPubkey != "" {
+		tags = append(tags, []string{"p", eventPubkey})
+	}
+
+	// Create unsigned event
+	event := UnsignedEvent{
+		Kind:      7,
+		Content:   reaction,
+		Tags:      tags,
+		CreatedAt: time.Now().Unix(),
+	}
+
+	// Sign via bunker
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	signedEvent, err := session.SignEvent(ctx, event)
+	if err != nil {
+		log.Printf("Failed to sign reaction: %v", err)
+		http.Redirect(w, r, returnURL+"?error="+escapeURLParam("Failed to sign: "+err.Error()), http.StatusSeeOther)
+		return
+	}
+
+	// Get relays to publish to
+	relays := []string{
+		"wss://relay.damus.io",
+		"wss://relay.nostr.band",
+		"wss://nos.lol",
+	}
+	if session.UserRelayList != nil && len(session.UserRelayList.Write) > 0 {
+		relays = session.UserRelayList.Write
+	}
+
+	publishEvent(ctx, relays, signedEvent)
+
+	log.Printf("Published reaction %s to event %s", reaction, eventID)
+	http.Redirect(w, r, returnURL, http.StatusSeeOther)
+}
+
 // getSessionFromRequest retrieves the bunker session from the request cookie
 func getSessionFromRequest(r *http.Request) *BunkerSession {
 	cookie, err := r.Cookie(sessionCookieName)
