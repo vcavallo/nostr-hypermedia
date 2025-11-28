@@ -52,6 +52,8 @@ A **pure HTML hypermedia client** that:
 - True REST/HATEOAS over HTML—the original web architecture
 - **NIP-46 authentication** - Login with remote signers (nsec.app, Amber)
 - **Post notes** - Create and publish notes without JavaScript
+- **Reply to threads** - Participate in conversations
+- **Reactions** - React to notes with a single click
 
 Both clients follow the same hypermedia principles: links and actions are discovered from server responses, not hardcoded.
 
@@ -61,6 +63,7 @@ The HTML client supports **zero-trust authentication** via NIP-46 (Nostr Connect
 
 ### How it works
 
+**Option 1: Bunker URL**
 1. Go to `/html/login`
 2. Paste your `bunker://` URL from a remote signer:
    - [nsec.app](https://nsec.app) - Web-based remote signer
@@ -68,6 +71,12 @@ The HTML client supports **zero-trust authentication** via NIP-46 (Nostr Connect
 3. The server connects to your signer via relay
 4. When you post, the server requests a signature from your signer
 5. You approve/reject in your signer app
+
+**Option 2: Nostr Connect (QR code flow)**
+1. Go to `/html/login`
+2. Copy the `nostrconnect://` URI or scan the QR code with your signer app
+3. Approve the connection in your signer
+4. The page auto-refreshes when connected
 
 ### Security model
 
@@ -91,6 +100,10 @@ Fetch aggregated events as server-rendered HTML (zero-JS client).
 
 View a note with its replies as server-rendered HTML.
 
+### `GET /html/profile/{pubkey}`
+
+View a user's profile and their notes. Accepts hex pubkey or `npub1...` format.
+
 ### `GET /html/login`
 
 Login page for NIP-46 authentication. POST with `bunker_url` to connect.
@@ -103,13 +116,23 @@ Logout and clear session.
 
 Post a new note (requires login). Form field: `content`.
 
+### `POST /html/reply`
+
+Reply to a note (requires login). Form fields: `content`, `event_id`, `event_pubkey`.
+
+### `POST /html/react`
+
+React to a note (requires login). Form fields: `event_id`, `event_pubkey`, `return_url`.
+
 **Query Parameters (timeline):**
-- `relays` - Comma-separated relay URLs (default: relay.damus.io, relay.nostr.band)
+- `relays` - Comma-separated relay URLs (default uses user's NIP-65 relays if logged in, otherwise defaults)
 - `authors` - Comma-separated pubkeys to filter by
 - `kinds` - Comma-separated event kinds (e.g., `1` for notes, `7` for reactions)
 - `limit` - Max events to return (default: 50, max: 200)
 - `since` - Unix timestamp for oldest event
 - `until` - Unix timestamp for newest event (used for pagination)
+- `feed` - Feed mode: `follows` (notes from people you follow) or `global` (all notes). Defaults to `follows` when logged in.
+- `fast` - Set to `1` to skip fetching reactions (faster loading)
 
 **Examples:**
 
@@ -245,13 +268,15 @@ curl -H 'If-None-Match: "4bff5e5ea3f03f38"' http://localhost:3000/timeline?kinds
 **Server:**
 - `main.go` - HTTP server and routes
 - `handlers.go` - Timeline endpoint and response building
-- `html_handlers.go` - Server-side HTML rendering for timeline/threads
-- `html_auth.go` - NIP-46 login/logout/post handlers
+- `html_handlers.go` - Server-side HTML rendering for timeline/threads/profiles
+- `html_auth.go` - NIP-46 login/logout/post/reply/react handlers
 - `relay.go` - WebSocket client, fan-out, dedup, EOSE handling
 - `siren.go` - Hypermedia (Siren) format conversion
 - `html.go` - HTML template rendering
 - `nip46.go` - NIP-46 bunker client (remote signing)
 - `nip44.go` - NIP-44 encryption (ChaCha20 + HMAC-SHA256)
+- `nostrconnect.go` - Nostr Connect flow (`nostrconnect://` URI handling)
+- `cache.go` - In-memory caching for events and contacts
 
 **Clients:**
 - `static/index.html` - JS Siren browser entry point
@@ -277,11 +302,18 @@ curl -H 'If-None-Match: "4bff5e5ea3f03f38"' http://localhost:3000/timeline?kinds
 - [x] NIP-44 encryption
 - [x] Note posting via HTML forms
 
-### Phase 3
+### Phase 3 (✅ Complete)
+- [x] Profile pages (`/html/profile/{pubkey}`)
+- [x] Reply to notes (thread participation)
+- [x] Reactions via HTML forms
+- [x] NIP-65 relay list support (use logged-in user's relays)
+- [x] Follows/Global feed toggle
+- [x] Contact list caching
+- [x] Nostr Connect flow (QR code / `nostrconnect://` URI)
+- [x] In-memory event caching for performance
+
+### Phase 4
 - [ ] SSE endpoint for live updates (`/stream/timeline`)
-- [ ] Profile pages (`/html/profile/{pubkey}`)
-- [ ] Reply to notes (thread participation)
-- [ ] Reactions via HTML forms
 - [ ] Search endpoint (NIP-50)
 - [ ] Relay health tracking and scoring
 - [ ] Persistent storage (Redis/Postgres)
@@ -295,6 +327,62 @@ curl -H 'If-None-Match: "4bff5e5ea3f03f38"' http://localhost:3000/timeline?kinds
 ## Environment Variables
 
 - `PORT` - HTTP server port (default: 8080)
+- `DEV_MODE` - Set to `1` to use a persistent server keypair for NIP-46 reconnection
+
+## Deployment
+
+### Build for Linux
+
+```bash
+# AMD64
+GOOS=linux GOARCH=amd64 go build -o nostr-server .
+
+# ARM64 (AWS Graviton, Raspberry Pi)
+GOOS=linux GOARCH=arm64 go build -o nostr-server .
+```
+
+Copy the `nostr-server` binary and `static/` directory to your server.
+
+### Run with Caddy
+
+```caddyfile
+yourdomain.com {
+    reverse_proxy localhost:8080
+}
+```
+
+```bash
+DEV_MODE=1 PORT=8080 ./nostr-server
+```
+
+### Systemd Service
+
+Create `/etc/systemd/system/nostr-server.service`:
+
+```ini
+[Unit]
+Description=Nostr Hypermedia Server
+After=network.target
+
+[Service]
+Type=simple
+User=www-data
+WorkingDirectory=/path/to/nostr-hypermedia
+Environment=DEV_MODE=1
+Environment=PORT=8080
+ExecStart=/path/to/nostr-hypermedia/nostr-server
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable nostr-server
+sudo systemctl start nostr-server
+```
 
 ## License
 
