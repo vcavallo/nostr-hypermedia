@@ -95,11 +95,16 @@ func htmlTimelineHandler(w http.ResponseWriter, r *http.Request) {
 	// Check if we should filter out replies (default to true like JSON handler)
 	noReplies := q.Get("no_replies") != "0"
 
-	// Build filter
+	// Build filter - fetch more events if we're filtering replies, since many events are replies
+	fetchLimit := limit
+	if noReplies {
+		fetchLimit = limit * 5 // Fetch 5x to compensate for reply filtering
+	}
+
 	filter := Filter{
 		Authors: authors,
 		Kinds:   kinds,
-		Limit:   limit,
+		Limit:   fetchLimit,
 		Since:   since,
 		Until:   until,
 	}
@@ -116,16 +121,28 @@ func htmlTimelineHandler(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		events = filtered
+		// Apply original limit after filtering
+		if len(events) > limit {
+			events = events[:limit]
+		}
 	}
 
 	// Collect unique pubkeys and event IDs for enrichment
 	pubkeySet := make(map[string]bool)
 	eventIDs := make([]string, 0, len(events))
+	contents := make([]string, 0, len(events))
 	for _, evt := range events {
 		if evt.Kind == 1 { // Only for notes
 			pubkeySet[evt.PubKey] = true
 			eventIDs = append(eventIDs, evt.ID)
+			contents = append(contents, evt.Content)
 		}
+	}
+
+	// Also collect pubkeys from npub/nprofile mentions in content
+	mentionedPubkeys := ExtractMentionedPubkeys(contents)
+	for _, pk := range mentionedPubkeys {
+		pubkeySet[pk] = true
 	}
 
 	// Always fetch profiles and reply counts, only fetch reactions in full mode
@@ -282,8 +299,16 @@ func htmlThreadHandler(w http.ResponseWriter, r *http.Request) {
 	// Collect pubkeys for profile enrichment
 	pubkeySet := make(map[string]bool)
 	pubkeySet[rootEvent.PubKey] = true
+	contents := []string{rootEvent.Content}
 	for _, reply := range replies {
 		pubkeySet[reply.PubKey] = true
+		contents = append(contents, reply.Content)
+	}
+
+	// Also collect pubkeys from npub/nprofile mentions in content
+	mentionedPubkeys := ExtractMentionedPubkeys(contents)
+	for _, pk := range mentionedPubkeys {
+		pubkeySet[pk] = true
 	}
 
 	// Collect all event IDs for reply count fetching
@@ -369,7 +394,7 @@ func htmlThreadHandler(w http.ResponseWriter, r *http.Request) {
 	currentURL := r.URL.Path
 
 	// Render HTML
-	htmlContent, err := renderThreadHTML(resp, session, currentURL)
+	htmlContent, err := renderThreadHTML(resp, relays, session, currentURL)
 	if err != nil {
 		log.Printf("Error rendering thread HTML: %v", err)
 		http.Error(w, "Error rendering page", http.StatusInternalServerError)
@@ -455,6 +480,17 @@ func htmlProfileHandler(w http.ResponseWriter, r *http.Request) {
 	// Apply limit after filtering
 	if len(topLevelNotes) > limit {
 		topLevelNotes = topLevelNotes[:limit]
+	}
+
+	// Extract and fetch profiles for mentioned pubkeys in content
+	contents := make([]string, len(topLevelNotes))
+	for i, evt := range topLevelNotes {
+		contents[i] = evt.Content
+	}
+	mentionedPubkeys := ExtractMentionedPubkeys(contents)
+	if len(mentionedPubkeys) > 0 {
+		// Fetch mentioned profiles (will be cached for rendering)
+		fetchProfiles(relays, mentionedPubkeys)
 	}
 
 	// Build response items with enrichment

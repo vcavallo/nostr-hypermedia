@@ -349,8 +349,8 @@ func fetchProfiles(relays []string, pubkeys []string) map[string]*ProfileInfo {
 		Limit:   len(missing),
 	}
 
-	// Shorter timeout - return what we have quickly rather than waiting for all
-	events, _ := fetchEventsFromRelaysWithTimeout(relays, filter, 1500*time.Millisecond)
+	// Profile timeout - balance between speed and completeness
+	events, _ := fetchEventsFromRelaysWithTimeout(relays, filter, 2500*time.Millisecond)
 
 	// Parse profile content and build map
 	freshProfiles := make(map[string]*ProfileInfo)
@@ -459,8 +459,9 @@ func fetchReactions(relays []string, eventIDs []string) map[string]*ReactionsSum
 		// Count the reaction
 		summary.Total++
 		reactionType := evt.Content
-		if reactionType == "" {
-			reactionType = "+"
+		// Normalize "+" and empty to "❤️" (like/heart)
+		if reactionType == "" || reactionType == "+" {
+			reactionType = "❤️"
 		}
 		summary.ByType[reactionType]++
 	}

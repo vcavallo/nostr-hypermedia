@@ -29,6 +29,33 @@ func generateQRCodeDataURL(content string) string {
 	return "data:image/png;base64," + base64.StdEncoding.EncodeToString(png)
 }
 
+// prefetchUserProfile fetches and caches the user's profile in the background
+// This should be called after login to ensure the profile is ready for display
+func prefetchUserProfile(pubkeyHex string, relays []string) {
+	go func() {
+		log.Printf("Prefetching profile for logged-in user: %s", pubkeyHex[:16])
+		fetchProfiles(relays, []string{pubkeyHex})
+	}()
+}
+
+// getUserDisplayName returns a display name for a pubkey, checking cache first
+func getUserDisplayName(pubkeyHex string) string {
+	// Check profile cache
+	if profile, ok := profileCache.Get(pubkeyHex); ok && profile != nil {
+		if profile.DisplayName != "" {
+			return "@" + profile.DisplayName
+		}
+		if profile.Name != "" {
+			return "@" + profile.Name
+		}
+	}
+	// Fall back to short npub
+	if npub, err := encodeBech32Pubkey(pubkeyHex); err == nil {
+		return "@" + formatNpubShort(npub)
+	}
+	return "@" + pubkeyHex[:12] + "..."
+}
+
 // htmlLoginHandler shows the login page (GET) or processes login (POST)
 func htmlLoginHandler(w http.ResponseWriter, r *http.Request) {
 	// Handle POST - delegate to submit handler (for bunker:// URLs)
@@ -131,6 +158,10 @@ func htmlLoginSubmitHandler(w http.ResponseWriter, r *http.Request) {
 	})
 
 	log.Printf("User logged in: %s", hex.EncodeToString(session.UserPubKey))
+
+	// Prefetch user profile in background so it's ready for display
+	prefetchUserProfile(hex.EncodeToString(session.UserPubKey), session.Relays)
+
 	http.Redirect(w, r, "/html/timeline?kinds=1&limit=20&success=Logged+in+successfully", http.StatusSeeOther)
 }
 
@@ -162,6 +193,10 @@ func htmlCheckConnectionHandler(w http.ResponseWriter, r *http.Request) {
 	})
 
 	log.Printf("User logged in via nostrconnect: %s", hex.EncodeToString(session.UserPubKey))
+
+	// Prefetch user profile in background so it's ready for display
+	prefetchUserProfile(hex.EncodeToString(session.UserPubKey), session.Relays)
+
 	http.Redirect(w, r, "/html/timeline?kinds=1&limit=20&success=Logged+in+successfully", http.StatusSeeOther)
 }
 
@@ -217,6 +252,10 @@ func htmlReconnectHandler(w http.ResponseWriter, r *http.Request) {
 	})
 
 	log.Printf("User logged in via reconnect: %s", hex.EncodeToString(session.UserPubKey))
+
+	// Prefetch user profile in background so it's ready for display
+	prefetchUserProfile(hex.EncodeToString(session.UserPubKey), session.Relays)
+
 	http.Redirect(w, r, "/html/timeline?kinds=1&limit=20&success=Reconnected+successfully", http.StatusSeeOther)
 }
 
@@ -849,7 +888,6 @@ var htmlLoginTemplate = `<!DOCTYPE html>
 
     <nav>
       <a href="/html/timeline?kinds=1&limit=20&fast=1">Timeline</a>
-      <a href="/">JS Client</a>
     </nav>
 
     <main>

@@ -44,8 +44,7 @@ func main() {
 	StartConnectionListener(defaultNostrConnectRelays)
 
 	log.Printf("Starting server on :%s", port)
-	log.Printf("Open http://localhost:%s in your browser (JS client)", port)
-	log.Printf("Or http://localhost:%s/html/timeline?kinds=1&limit=20 (zero-JS)", port)
+	log.Printf("Open http://localhost:%s in your browser", port)
 	if err := http.ListenAndServe(":"+port, nil); err != nil {
 		log.Fatal(err)
 	}

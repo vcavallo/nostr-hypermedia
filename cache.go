@@ -299,3 +299,89 @@ func (c *ContactCache) Set(pubkey string, contacts []string) {
 		fetchedAt: time.Now(),
 	})
 }
+
+// LinkPreview holds Open Graph metadata for a URL
+type LinkPreview struct {
+	URL         string
+	Title       string
+	Description string
+	Image       string
+	SiteName    string
+	FetchedAt   time.Time
+	Failed      bool // true if we tried but couldn't get OG tags
+}
+
+// LinkPreviewCache stores link previews with long TTL
+type LinkPreviewCache struct {
+	previews sync.Map
+	ttl      time.Duration
+	failTTL  time.Duration // shorter TTL for failed fetches
+}
+
+type cachedLinkPreview struct {
+	preview   *LinkPreview
+	fetchedAt time.Time
+}
+
+// Global link preview cache - 24 hour TTL for success, 1 hour for failures
+var linkPreviewCache = &LinkPreviewCache{
+	ttl:     24 * time.Hour,
+	failTTL: 1 * time.Hour,
+}
+
+// Get retrieves a link preview from cache if not expired
+func (c *LinkPreviewCache) Get(url string) (*LinkPreview, bool) {
+	val, ok := c.previews.Load(url)
+	if !ok {
+		return nil, false
+	}
+
+	cached := val.(*cachedLinkPreview)
+	ttl := c.ttl
+	if cached.preview.Failed {
+		ttl = c.failTTL
+	}
+	if time.Since(cached.fetchedAt) > ttl {
+		c.previews.Delete(url)
+		return nil, false
+	}
+
+	return cached.preview, true
+}
+
+// Set stores a link preview in the cache
+func (c *LinkPreviewCache) Set(url string, preview *LinkPreview) {
+	c.previews.Store(url, &cachedLinkPreview{
+		preview:   preview,
+		fetchedAt: time.Now(),
+	})
+}
+
+// GetMultiple retrieves multiple previews, returning found ones and missing URLs
+func (c *LinkPreviewCache) GetMultiple(urls []string) (found map[string]*LinkPreview, missing []string) {
+	found = make(map[string]*LinkPreview)
+	now := time.Now()
+
+	for _, url := range urls {
+		val, ok := c.previews.Load(url)
+		if !ok {
+			missing = append(missing, url)
+			continue
+		}
+
+		cached := val.(*cachedLinkPreview)
+		ttl := c.ttl
+		if cached.preview.Failed {
+			ttl = c.failTTL
+		}
+		if now.Sub(cached.fetchedAt) > ttl {
+			c.previews.Delete(url)
+			missing = append(missing, url)
+			continue
+		}
+
+		found[url] = cached.preview
+	}
+
+	return found, missing
+}
