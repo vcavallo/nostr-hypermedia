@@ -444,7 +444,6 @@ NEWSLETTER SIGNUP:
 5. For polls/votes, use kind 7 reactions so votes are counted properly
 6. Always include {{$.id}} in e-tags for reactions
 7. Use the "options" style on containers for side-by-side buttons
-8. IMPORTANT: Do NOT use emojis or special Unicode characters - stick to plain ASCII text only
 
 Now generate a UI spec for the user's request. Output ONLY valid JSON, nothing else.`
 
