@@ -352,10 +352,11 @@ Top-level structure:
   "title": "Page Title", // Optional: sets browser title
   "elements": [],        // Required: array of UI elements
   "actions": [],         // Optional: named actions for buttons
+  "state": {},           // Optional: initial state values
   "style": ""            // Optional: custom CSS
 }
 
-=== ELEMENT TYPES ===
+=== BASIC ELEMENT TYPES ===
 
 HEADING - Large title text
   {"type": "heading", "value": "Welcome!"}
@@ -366,7 +367,6 @@ TEXT - Paragraph text
 
 IMAGE - Display an image
   {"type": "image", "src": "https://example.com/image.jpg"}
-  {"type": "image", "value": "https://..."}  // "value" also works
 
 LINK - Clickable hyperlink
   {"type": "link", "href": "https://example.com", "label": "Visit Site"}
@@ -377,7 +377,6 @@ BUTTON - Triggers an action or navigates
 
 INPUT - Text input field
   {"type": "input", "name": "username", "label": "Your name:"}
-  {"type": "input", "name": "email", "label": "Email:", "value": "default@example.com"}
 
 CONTAINER - Groups elements, useful for layouts
   {"type": "container", "children": [...]}
@@ -385,22 +384,87 @@ CONTAINER - Groups elements, useful for layouts
 
 DATA - Displays bound data with optional label
   {"type": "data", "bind": "$.id", "label": "Event ID: "}
-  {"type": "data", "bind": "$.time"}  // No label
 
 HR - Horizontal rule/divider
   {"type": "hr"}
 
-=== DATA BINDINGS ===
+=== ADVANCED ELEMENT TYPES ===
 
-Use "bind" property to display event data:
-  $.id        - Event ID (64 char hex)
+QUERY - Fetch events from Nostr relays
+  {
+    "type": "query",
+    "filter": {"kinds": [1], "limit": 10},  // Standard Nostr filter
+    "as": "notes",                           // Store results in $.notes
+    "timeout": 5000,                         // Optional timeout in ms
+    "children": [...]                        // Elements to render with results
+  }
+  Filter supports: kinds, authors, ids, #e, #p, since, until, limit
+  Results are available as $.notes (or whatever "as" specifies)
+  Each result has: .id, .pubkey, .content, .created_at, .kind, .tags
+
+FOREACH - Iterate over arrays
+  {
+    "type": "foreach",
+    "items": "$.notes",           // Path to array
+    "as": "note",                 // Name for each item (default: "item")
+    "index": "i",                 // Optional index variable
+    "template": {...}             // Single element template
+    // OR "children": [...]       // Multiple elements
+  }
+  Inside template: $.note.content, $.note.pubkey, $.i (index)
+
+IF - Conditional rendering
+  {
+    "type": "if",
+    "condition": "$.notes.length > 0",  // Expression to evaluate
+    "then": [...],                       // Elements if true
+    "else": [...]                        // Elements if false (optional)
+  }
+  Condition supports:
+  - Comparisons: ==, !=, >, <, >=, <=
+  - Arithmetic: +, -, *, /, %
+  - Truthiness: "$.pubkey" (true if exists and not empty)
+  Examples: "$.count > 5", "$.minute % 2 == 0", "$.kind == 1"
+
+EMBED - Embed another Nostr event
+  {
+    "type": "embed",
+    "event": "nevent1..."  // Event ID (hex, nevent, or note format)
+  }
+
+EVAL - Evaluate JavaScript expression
+  {
+    "type": "eval",
+    "expr": "new Date().getMinutes()",  // JS expression
+    "as": "minute",                      // Store result in context (optional)
+    "display": true                      // Show result (default: true if no "as")
+  }
+  Available in expr: Date, Math, JSON, and all context values
+
+SCRIPT - Execute JavaScript code (for complex logic)
+  {
+    "type": "script",
+    "code": "const now = new Date(); emit('<p>' + now.toLocaleString() + '</p>');"
+  }
+  Use emit(html) to output HTML. Available: ctx, Date, Math, JSON, escapeHtml
+
+STATE-VALUE - Display a state variable
+  {"type": "state-value", "key": "count"}
+
+=== CONTEXT VALUES ===
+
+These are automatically available in bindings and expressions:
+  $.id        - Current event ID (64 char hex)
   $.pubkey    - Author's public key (64 char hex)
   $.npub      - Author's npub (bech32 encoded)
   $.content   - Raw event content
   $.time      - Formatted timestamp
   $.kind      - Event kind number
+  $.created_at - Unix timestamp
 
-Example: {"type": "data", "bind": "$.npub", "label": "Author: "}
+NOTE: There are NO built-in date/time values. Use "eval" to compute them:
+  {"type": "eval", "expr": "new Date().getMinutes()", "as": "minute", "display": false}
+Then use $.minute in conditions.
 
 === ACTIONS ===
 
@@ -410,7 +474,7 @@ PUBLISH ACTION - Sign and publish a new Nostr event:
 {
   "id": "vote-yes",
   "publish": {
-    "kind": 7,                              // Event kind (7=reaction, 1=note, 6=repost)
+    "kind": 7,                              // Event kind
     "content": "yes",                       // Event content
     "tags": [["e", "{{$.id}}"]]            // Event tags
   }
@@ -429,45 +493,25 @@ In action content and tags, use {{$.path}} for substitution:
   {{$.pubkey}}          - Current event's author pubkey
   {{input:fieldname}}   - Value from input with name="fieldname"
 
-Example: "content": "User {{input:name}} voted {{input:choice}}"
-
-=== NOSTR EVENT KINDS ===
-
-Common kinds to use in actions:
-  Kind 1  - Short text note (like a tweet)
-  Kind 6  - Repost
-  Kind 7  - Reaction (likes, emoji reactions, poll votes)
-  Kind 30023 - Long-form content
-
-For reactions/polls, use kind 7 with different content values.
-Always tag the event being reacted to: ["e", "{{$.id}}"]
-
 === EXAMPLES ===
 
+LIVE FEED (query + foreach):
+{"layout":"card","elements":[{"type":"heading","value":"Recent Notes"},{"type":"query","filter":{"kinds":[1],"limit":5},"as":"notes","children":[{"type":"if","condition":"$.notes.length > 0","then":[{"type":"foreach","items":"$.notes","as":"note","template":{"type":"container","children":[{"type":"data","bind":"$.note.pubkey","label":"By: "},{"type":"text","bind":"$.note.content"}]}}],"else":[{"type":"text","value":"No notes found"}]}]}]}
+
+TIME-BASED CONDITIONAL (eval + if):
+{"layout":"card","elements":[{"type":"heading","value":"Time-Based UI"},{"type":"eval","expr":"new Date().getMinutes()","as":"minute","display":false},{"type":"data","bind":"$.minute","label":"Current minute: "},{"type":"if","condition":"$.minute % 2 == 0","then":[{"type":"text","value":"Even minute! 🎉"}],"else":[{"type":"text","value":"Odd minute... ⏰"}]}]}
+
 POLL:
-{"layout":"card","elements":[{"type":"heading","value":"What's your favorite season?"},{"type":"text","value":"Cast your vote below!"},{"type":"hr"},{"type":"container","style":"options","children":[{"type":"button","label":"Spring","action":"vote-spring"},{"type":"button","label":"Summer","action":"vote-summer"},{"type":"button","label":"Fall","action":"vote-fall"},{"type":"button","label":"Winter","action":"vote-winter"}]},{"type":"hr"},{"type":"data","bind":"$.time","label":"Poll created: "}],"actions":[{"id":"vote-spring","publish":{"kind":7,"content":"spring","tags":[["e","{{$.id}}"]]}},{"id":"vote-summer","publish":{"kind":7,"content":"summer","tags":[["e","{{$.id}}"]]}},{"id":"vote-fall","publish":{"kind":7,"content":"fall","tags":[["e","{{$.id}}"]]}},{"id":"vote-winter","publish":{"kind":7,"content":"winter","tags":[["e","{{$.id}}"]]}}]}
-
-FEEDBACK FORM:
-{"layout":"card","elements":[{"type":"heading","value":"Send Feedback"},{"type":"text","value":"We'd love to hear from you!"},{"type":"input","name":"name","label":"Your name:"},{"type":"input","name":"feedback","label":"Your message:"},{"type":"hr"},{"type":"button","label":"Submit Feedback","action":"submit"}],"actions":[{"id":"submit","publish":{"kind":1,"content":"Feedback from {{input:name}}: {{input:feedback}}","tags":[["t","feedback"]]}}]}
-
-RSVP:
-{"layout":"card","elements":[{"type":"heading","value":"Party Invitation"},{"type":"text","value":"You're invited to the Nostr meetup!"},{"type":"text","value":"Saturday, 7pm at the usual place."},{"type":"hr"},{"type":"container","style":"options","children":[{"type":"button","label":"I'll be there!","action":"yes"},{"type":"button","label":"Can't make it","action":"no"},{"type":"button","label":"Maybe","action":"maybe"}]}],"actions":[{"id":"yes","publish":{"kind":7,"content":"attending","tags":[["e","{{$.id}}"]]}},{"id":"no","publish":{"kind":7,"content":"not-attending","tags":[["e","{{$.id}}"]]}},{"id":"maybe","publish":{"kind":7,"content":"maybe","tags":[["e","{{$.id}}"]]}}]}
-
-SIMPLE COUNTER (Like button):
-{"layout":"card","elements":[{"type":"heading","value":"Like This!"},{"type":"text","value":"Show your appreciation."},{"type":"button","label":"❤️ Like","action":"like"}],"actions":[{"id":"like","publish":{"kind":7,"content":"+","tags":[["e","{{$.id}}"]]}}]}
-
-NEWSLETTER SIGNUP:
-{"layout":"card","elements":[{"type":"heading","value":"Subscribe to Updates"},{"type":"text","value":"Get notified about new features."},{"type":"input","name":"email","label":"Your email:"},{"type":"button","label":"Subscribe","action":"subscribe"}],"actions":[{"id":"subscribe","publish":{"kind":1,"content":"Newsletter signup: {{input:email}}","tags":[["t","newsletter-signup"]]}}]}
+{"layout":"card","elements":[{"type":"heading","value":"Vote!"},{"type":"container","style":"options","children":[{"type":"button","label":"Option A","action":"vote-a"},{"type":"button","label":"Option B","action":"vote-b"}]}],"actions":[{"id":"vote-a","publish":{"kind":7,"content":"a","tags":[["e","{{$.id}}"]]}},{"id":"vote-b","publish":{"kind":7,"content":"b","tags":[["e","{{$.id}}"]]}}]}
 
 === DESIGN GUIDELINES ===
 
-1. Keep it simple - malleable UIs work best when focused
-2. Use clear labels on buttons
-3. Add context with text elements explaining what the UI does
-4. Use hr elements to visually separate sections
-5. For polls/votes, use kind 7 reactions so votes are counted properly
-6. Always include {{$.id}} in e-tags for reactions
-7. Use the "options" style on containers for side-by-side buttons
+1. Use "eval" with "as" to compute values, then use them in conditions
+2. Always set "display": false on eval elements that just set context values
+3. Use query+foreach to display live Nostr data
+4. Use if/else for conditional rendering based on data or computed values
+5. For time-based logic, use eval with Date/Math functions
+6. Keep UIs focused and simple
 
 Now generate a UI spec for the user's request. Output ONLY valid JSON, nothing else.`
 

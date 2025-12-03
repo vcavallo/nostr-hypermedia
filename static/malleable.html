@@ -510,6 +510,93 @@
       background: #30363d;
       color: #e0e0e0;
     }
+
+    /* New element type styles */
+    .ui-query {
+      margin: 8px 0;
+    }
+
+    .ui-foreach {
+      margin: 8px 0;
+    }
+
+    .ui-foreach > * {
+      margin-bottom: 8px;
+    }
+
+    .ui-embed {
+      border: 1px solid #30363d;
+      border-radius: 8px;
+      padding: 12px;
+      margin: 8px 0;
+      background: #0d1117;
+    }
+
+    .ui-error {
+      background: #f8514922;
+      border: 1px solid #f85149;
+      color: #f85149;
+      padding: 10px 14px;
+      border-radius: 6px;
+      margin: 8px 0;
+      font-size: 13px;
+    }
+
+    .ui-embed-error {
+      color: #8b949e;
+      font-style: italic;
+      padding: 8px;
+    }
+
+    /* State-aware button */
+    .ui-button[data-state-action] {
+      transition: all 0.2s;
+    }
+
+    /* Loading state for query */
+    .ui-query-loading {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      color: #8b949e;
+      padding: 12px;
+    }
+
+    .ui-query-loading::before {
+      content: '';
+      width: 16px;
+      height: 16px;
+      border: 2px solid #30363d;
+      border-top-color: #58a6ff;
+      border-radius: 50%;
+      animation: spin 1s linear infinite;
+    }
+
+    /* Event preview in foreach */
+    .ui-event-preview {
+      background: #161b22;
+      border: 1px solid #30363d;
+      border-radius: 6px;
+      padding: 12px;
+      margin: 6px 0;
+    }
+
+    .ui-event-preview .author {
+      font-family: monospace;
+      font-size: 12px;
+      color: #58a6ff;
+    }
+
+    .ui-event-preview .content {
+      margin-top: 6px;
+      color: #c9d1d9;
+    }
+
+    .ui-event-preview .time {
+      font-size: 11px;
+      color: #6e7681;
+      margin-top: 6px;
+    }
   </style>
 </head>
 <body>
@@ -611,7 +698,11 @@
           <span x-show="!loading">Load Event</span>
           <span x-show="loading">Loading...</span>
         </button>
-        <button class="btn btn-secondary" @click="loadDemo()">Load Demo</button>
+        <button class="btn btn-secondary" @click="loadDemo('poll')">Poll Demo</button>
+        <button class="btn btn-secondary" @click="loadDemo('feed')">Feed Demo</button>
+        <button class="btn btn-secondary" @click="loadDemo('conditional')">If/Else Demo</button>
+        <button class="btn btn-secondary" @click="loadDemo('counter')">Counter Demo</button>
+        <button class="btn btn-secondary" @click="loadDemo('profile')">Profile Demo</button>
         <button class="btn btn-secondary" @click="clear()">Clear</button>
       </div>
     </div>
@@ -878,8 +969,29 @@
       return null;
     }
 
-    function renderUISpec(spec, ctx, actionHandler) {
+    // Global reference to relay pool for queries
+    let _globalPool = null;
+
+    function setGlobalPool(pool) {
+      _globalPool = pool;
+    }
+
+    // Async render that supports query, foreach, if/else, embed, state
+    async function renderUISpec(spec, ctx, actionHandler) {
       let html = '';
+
+      // Initialize state if spec has state definition
+      if (spec.state) {
+        ctx._state = { ...spec.state };
+      }
+
+      // Process computed values
+      if (spec.computed) {
+        ctx._computed = {};
+        for (const [key, expr] of Object.entries(spec.computed)) {
+          ctx._computed[key] = evaluateExpression(expr, ctx);
+        }
+      }
 
       if (spec.style) {
         html += `<style>${escapeHtml(spec.style)}</style>`;
@@ -889,14 +1001,14 @@
       html += `<div class="${layoutClass}">`;
 
       for (const elem of spec.elements || []) {
-        html += renderElement(elem, ctx, spec.actions || [], actionHandler);
+        html += await renderElement(elem, ctx, spec.actions || [], actionHandler, spec);
       }
 
       html += '</div>';
       return html;
     }
 
-    function renderElement(elem, ctx, actions, actionHandler) {
+    async function renderElement(elem, ctx, actions, actionHandler, spec) {
       const value = elem.bind ? resolveBind(elem.bind, ctx) : (elem.value || '');
       const id = elem.id ? ` id="${escapeHtml(elem.id)}"` : '';
 
@@ -928,9 +1040,8 @@
             const action = actions.find(a => a.id === elem.action);
             if (action) {
               const actionId = `action_${Math.random().toString(36).slice(2, 8)}`;
-              // Store action for later execution
               window._malleableActions = window._malleableActions || {};
-              window._malleableActions[actionId] = { action, ctx };
+              window._malleableActions[actionId] = { action, ctx, spec };
               return `<button class="ui-button"${id} onclick="window.executeAction('${actionId}')">${escapeHtml(btnLabel)}</button>`;
             }
           }
@@ -956,7 +1067,7 @@
             : 'ui-container';
           let containerHtml = `<div class="${containerClass}"${id}>`;
           for (const child of elem.children || []) {
-            containerHtml += renderElement(child, ctx, actions, actionHandler);
+            containerHtml += await renderElement(child, ctx, actions, actionHandler, spec);
           }
           containerHtml += '</div>';
           return containerHtml;
@@ -971,33 +1082,452 @@
           }
           return `<span class="ui-data"${id}>${escapeHtml(value)}</span>`;
 
+        // === NEW ELEMENT TYPES ===
+
+        // QUERY: Fetch events from relays
+        case 'query':
+          return await renderQuery(elem, ctx, actions, actionHandler, spec);
+
+        // FOREACH: Iterate over arrays
+        case 'foreach':
+          return await renderForeach(elem, ctx, actions, actionHandler, spec);
+
+        // IF: Conditional rendering
+        case 'if':
+          return await renderIf(elem, ctx, actions, actionHandler, spec);
+
+        // EMBED: Embed another malleable UI by event ID
+        case 'embed':
+          return await renderEmbed(elem, ctx, actions, actionHandler);
+
+        // STATE-DISPLAY: Show current state value
+        case 'state-value':
+          const stateKey = elem.key || elem.bind?.replace('$.state.', '');
+          const stateVal = ctx._state?.[stateKey] ?? '';
+          return `<span class="ui-data"${id}>${escapeHtml(String(stateVal))}</span>`;
+
+        // EVAL: Evaluate JS expression and display result or store in context
+        case 'eval':
+          return renderEval(elem, ctx, actions, actionHandler, spec);
+
+        // SCRIPT: Execute arbitrary JS and optionally render result
+        case 'script':
+          return renderScript(elem, ctx);
+
         default:
           return '';
       }
     }
 
+    // Render QUERY element - fetches events and renders children with results
+    async function renderQuery(elem, ctx, actions, actionHandler, spec) {
+      if (!_globalPool) {
+        return `<div class="ui-error">Query failed: No relay connection</div>`;
+      }
+
+      // Support both 'filter' and 'filters' (first filter in array)
+      let filterObj = elem.filter || (Array.isArray(elem.filters) ? elem.filters[0] : elem.filters);
+      if (!filterObj) {
+        return `<div class="ui-error">Query: No filter specified</div>`;
+      }
+
+      // Resolve any template variables in the filter
+      const filter = resolveFilterTemplates(filterObj, ctx);
+      const varName = elem.as || 'results';
+
+      try {
+        // Fetch events
+        const events = await fetchEvents(_globalPool, filter, elem.timeout || 5000);
+
+        // Store results in context
+        const newCtx = { ...ctx, [varName]: events };
+
+        // Render children with the new context
+        let html = `<div class="ui-query" data-var="${escapeHtml(varName)}">`;
+
+        if (events.length === 0 && elem.empty) {
+          // Render empty state
+          for (const child of elem.empty) {
+            html += await renderElement(child, newCtx, actions, actionHandler, spec);
+          }
+        } else if (elem.children) {
+          for (const child of elem.children) {
+            html += await renderElement(child, newCtx, actions, actionHandler, spec);
+          }
+        } else {
+          // No children - just show count
+          html += `<div class="ui-text">Query returned ${events.length} event(s)</div>`;
+        }
+
+        html += '</div>';
+        return html;
+      } catch (e) {
+        console.error('Query failed:', e);
+        return `<div class="ui-error">Query failed: ${escapeHtml(e.message)}</div>`;
+      }
+    }
+
+    // Render FOREACH element - iterates over array and renders template
+    async function renderForeach(elem, ctx, actions, actionHandler, spec) {
+      const items = resolvePath(elem.items, ctx) || [];
+      const varName = elem.as || 'item';
+      const indexName = elem.index || 'index';
+
+      let html = '<div class="ui-foreach">';
+
+      for (let i = 0; i < items.length; i++) {
+        const item = items[i];
+        // Create new context with item and index
+        const itemCtx = {
+          ...ctx,
+          [varName]: item,
+          [indexName]: i,
+          // Also expose item properties at top level if it's an event
+          ...(item.id ? { _item: item } : {})
+        };
+
+        // Render template for each item
+        if (elem.template) {
+          html += await renderElement(elem.template, itemCtx, actions, actionHandler, spec);
+        } else if (elem.children) {
+          for (const child of elem.children) {
+            html += await renderElement(child, itemCtx, actions, actionHandler, spec);
+          }
+        }
+      }
+
+      html += '</div>';
+      return html;
+    }
+
+    // Render IF element - conditional rendering
+    async function renderIf(elem, ctx, actions, actionHandler, spec) {
+      const condition = evaluateCondition(elem.condition, ctx);
+
+      let html = '';
+      if (condition) {
+        if (elem.then) {
+          if (Array.isArray(elem.then)) {
+            for (const child of elem.then) {
+              html += await renderElement(child, ctx, actions, actionHandler, spec);
+            }
+          } else {
+            html += await renderElement(elem.then, ctx, actions, actionHandler, spec);
+          }
+        }
+      } else {
+        if (elem.else) {
+          if (Array.isArray(elem.else)) {
+            for (const child of elem.else) {
+              html += await renderElement(child, ctx, actions, actionHandler, spec);
+            }
+          } else {
+            html += await renderElement(elem.else, ctx, actions, actionHandler, spec);
+          }
+        }
+      }
+
+      return html;
+    }
+
+    // Render EVAL element - evaluate a JS expression and optionally store/display
+    function renderEval(elem, ctx, actions, actionHandler, spec) {
+      const expr = elem.expr || elem.expression || elem.code;
+      if (!expr) {
+        return `<div class="ui-error">Eval: No expression provided</div>`;
+      }
+
+      try {
+        // Create a sandboxed function with context available
+        // The expression can access: ctx, Date, Math, JSON, Array, Object, String, Number, Boolean
+        const fn = new Function('ctx', 'Date', 'Math', 'JSON', `
+          with (ctx) {
+            return (${expr});
+          }
+        `);
+        const result = fn(ctx, Date, Math, JSON);
+
+        // Store result in context if 'as' is specified
+        if (elem.as) {
+          ctx[elem.as] = result;
+        }
+
+        // Display result if 'display' is true or not specified
+        if (elem.display !== false && !elem.as) {
+          return `<span class="ui-data">${escapeHtml(String(result))}</span>`;
+        }
+
+        return '';
+      } catch (e) {
+        console.error('Eval failed:', e);
+        return `<div class="ui-error">Eval error: ${escapeHtml(e.message)}</div>`;
+      }
+    }
+
+    // Render SCRIPT element - execute arbitrary JS, can produce HTML
+    function renderScript(elem, ctx) {
+      const code = elem.code || elem.script;
+      if (!code) {
+        return `<div class="ui-error">Script: No code provided</div>`;
+      }
+
+      try {
+        // Create a sandboxed function that can return HTML
+        // Available: ctx, Date, Math, JSON, escapeHtml
+        const fn = new Function('ctx', 'Date', 'Math', 'JSON', 'escapeHtml', `
+          let html = '';
+          const emit = (s) => { html += s; };
+          ${code}
+          return html;
+        `);
+        return fn(ctx, Date, Math, JSON, escapeHtml);
+      } catch (e) {
+        console.error('Script failed:', e);
+        return `<div class="ui-error">Script error: ${escapeHtml(e.message)}</div>`;
+      }
+    }
+
+    // Render EMBED element - embed another malleable UI
+    async function renderEmbed(elem, ctx, actions, actionHandler) {
+      if (!_globalPool) {
+        return `<div class="ui-error">Embed failed: No relay connection</div>`;
+      }
+
+      const eventRef = elem.event || elem.id;
+      if (!eventRef) {
+        return `<div class="ui-error">Embed: No event specified</div>`;
+      }
+
+      try {
+        // Parse the event reference (could be nevent, note, or hex id)
+        const parsed = parseNostrId(eventRef);
+        let filter = {};
+
+        if (parsed.type === 'hex' || parsed.type === 'note' || parsed.type === 'nevent') {
+          filter = { ids: [parsed.id], limit: 1 };
+        } else {
+          return `<div class="ui-error">Embed: Invalid event reference</div>`;
+        }
+
+        const event = await _globalPool.fetchEvent(filter);
+        if (!event) {
+          return `<div class="ui-embed-error">Embedded event not found</div>`;
+        }
+
+        // Try to parse as UI spec
+        const embeddedSpec = parseUISpec(event.content);
+        if (embeddedSpec) {
+          const embeddedCtx = {
+            id: event.id,
+            pubkey: event.pubkey,
+            created_at: event.created_at,
+            kind: event.kind,
+            content: event.content
+          };
+          const embeddedHtml = await renderUISpec(embeddedSpec, embeddedCtx);
+          return `<div class="ui-embed">${embeddedHtml}</div>`;
+        } else {
+          // Not a UI spec, just show content
+          return `<div class="ui-embed"><p class="ui-text">${escapeHtml(event.content)}</p></div>`;
+        }
+      } catch (e) {
+        console.error('Embed failed:', e);
+        return `<div class="ui-error">Embed failed: ${escapeHtml(e.message)}</div>`;
+      }
+    }
+
+    // Fetch multiple events from relays
+    async function fetchEvents(pool, filter, timeout = 5000) {
+      return new Promise((resolve) => {
+        const events = [];
+        let timer;
+
+        const subId = pool.subscribe(filter, {
+          onEvent: (event) => {
+            events.push(event);
+          },
+          onEose: () => {
+            clearTimeout(timer);
+            pool.unsubscribe(subId);
+            // Sort by created_at descending
+            events.sort((a, b) => b.created_at - a.created_at);
+            resolve(events);
+          }
+        });
+
+        timer = setTimeout(() => {
+          pool.unsubscribe(subId);
+          events.sort((a, b) => b.created_at - a.created_at);
+          resolve(events);
+        }, timeout);
+      });
+    }
+
+    // Resolve path like "$.results" or "$.item.content" from context
+    function resolvePath(path, ctx) {
+      if (!path || !ctx) return null;
+
+      // Remove leading $. if present
+      const cleanPath = path.replace(/^\$\.?/, '');
+      const parts = cleanPath.split('.');
+
+      let value = ctx;
+      for (const part of parts) {
+        if (value === null || value === undefined) return null;
+        value = value[part];
+      }
+
+      return value;
+    }
+
+    // Resolve template variables in filter object
+    function resolveFilterTemplates(filter, ctx) {
+      if (!filter) return {};
+
+      const resolved = {};
+      for (const [key, value] of Object.entries(filter)) {
+        if (typeof value === 'string' && value.includes('{{')) {
+          resolved[key] = resolveTemplate(value, ctx);
+        } else if (Array.isArray(value)) {
+          resolved[key] = value.map(v =>
+            typeof v === 'string' && v.includes('{{') ? resolveTemplate(v, ctx) : v
+          );
+        } else {
+          resolved[key] = value;
+        }
+      }
+      return resolved;
+    }
+
+    // Evaluate a condition expression
+    function evaluateCondition(condition, ctx) {
+      if (typeof condition === 'boolean') return condition;
+      if (typeof condition !== 'string') return !!condition;
+
+      // Simple comparisons: "$.count > 0", "$.items.length > 5", "$.status == 'active'"
+      const comparisonMatch = condition.match(/^(.+?)\s*(==|!=|>|<|>=|<=)\s*(.+)$/);
+      if (comparisonMatch) {
+        const [, left, op, right] = comparisonMatch;
+        const leftVal = evaluateExpression(left.trim(), ctx);
+        const rightVal = evaluateExpression(right.trim(), ctx);
+
+        switch (op) {
+          case '==': return leftVal == rightVal;
+          case '!=': return leftVal != rightVal;
+          case '>': return Number(leftVal) > Number(rightVal);
+          case '<': return Number(leftVal) < Number(rightVal);
+          case '>=': return Number(leftVal) >= Number(rightVal);
+          case '<=': return Number(leftVal) <= Number(rightVal);
+        }
+      }
+
+      // Simple existence check: "$.items" returns truthy if items exist
+      const value = evaluateExpression(condition, ctx);
+      return !!value;
+    }
+
+    // Evaluate an expression (path, literal, or simple math)
+    function evaluateExpression(expr, ctx) {
+      if (typeof expr !== 'string') return expr;
+      expr = expr.trim();
+
+      // Number literal
+      if (/^-?\d+(\.\d+)?$/.test(expr)) {
+        return parseFloat(expr);
+      }
+
+      // String literal (single or double quoted)
+      if ((expr.startsWith("'") && expr.endsWith("'")) ||
+          (expr.startsWith('"') && expr.endsWith('"'))) {
+        return expr.slice(1, -1);
+      }
+
+      // Arithmetic expressions: "$.minute % 2", "$.count + 1", etc.
+      const arithmeticMatch = expr.match(/^(.+?)\s*([+\-*/%])\s*(.+)$/);
+      if (arithmeticMatch) {
+        const [, left, op, right] = arithmeticMatch;
+        const leftVal = Number(evaluateExpression(left.trim(), ctx));
+        const rightVal = Number(evaluateExpression(right.trim(), ctx));
+
+        switch (op) {
+          case '+': return leftVal + rightVal;
+          case '-': return leftVal - rightVal;
+          case '*': return leftVal * rightVal;
+          case '/': return rightVal !== 0 ? leftVal / rightVal : 0;
+          case '%': return leftVal % rightVal;
+        }
+      }
+
+      // Path like $.foo.bar or $.foo.length
+      if (expr.startsWith('$')) {
+        const path = expr.replace(/^\$\.?/, '');
+        const parts = path.split('.');
+
+        let value = ctx;
+        for (const part of parts) {
+          if (value === null || value === undefined) return null;
+          if (part === 'length' && Array.isArray(value)) {
+            return value.length;
+          }
+          value = value[part];
+        }
+        return value;
+      }
+
+      // State reference
+      if (expr.startsWith('state.')) {
+        const key = expr.replace('state.', '');
+        return ctx._state?.[key];
+      }
+
+      // Computed reference
+      if (expr.startsWith('computed.')) {
+        const key = expr.replace('computed.', '');
+        return ctx._computed?.[key];
+      }
+
+      return expr;
+    }
+
     function resolveBind(bind, ctx) {
       if (!ctx) return '';
+
+      // Handle nested paths like $.item.content or $.results[0].id
+      if (bind.includes('.') && !['$.id', '$.pubkey', '$.npub', '$.content', '$.time', '$.kind'].includes(bind.toLowerCase().replace('createdat', 'time').replace('created_at', 'time'))) {
+        const value = resolvePath(bind, ctx);
+        if (value !== null && value !== undefined) {
+          return String(value);
+        }
+      }
 
       const path = bind.replace(/^\$\.?/, '').toLowerCase();
 
       switch (path) {
-        case 'id': return ctx.id || '';
-        case 'pubkey': return ctx.pubkey || '';
-        case 'npub': return ctx.npub || ctx.pubkey || '';
-        case 'content': return ctx.content || '';
+        case 'id': return ctx.id || ctx._item?.id || '';
+        case 'pubkey': return ctx.pubkey || ctx._item?.pubkey || '';
+        case 'npub': return ctx.npub || ctx.pubkey || ctx._item?.pubkey || '';
+        case 'content': return ctx.content || ctx._item?.content || '';
         case 'time':
         case 'createdat':
         case 'created_at':
-          return ctx.created_at ? new Date(ctx.created_at * 1000).toLocaleString() : '';
-        case 'kind': return String(ctx.kind || '');
-        default: return '';
+          const ts = ctx.created_at || ctx._item?.created_at;
+          return ts ? new Date(ts * 1000).toLocaleString() : '';
+        case 'kind': return String(ctx.kind || ctx._item?.kind || '');
+        default:
+          // Try to resolve as a path
+          const resolved = resolvePath(bind, ctx);
+          return resolved !== null && resolved !== undefined ? String(resolved) : '';
       }
     }
 
     function resolveTemplate(tmpl, ctx) {
-      return tmpl.replace(/\{\{\s*\$\.?(\w+)\s*\}\}/g, (match, path) => {
-        return resolveBind(path, ctx);
+      return tmpl.replace(/\{\{\s*\$\.?([^\}]+)\s*\}\}/g, (match, path) => {
+        // Handle complex paths like $.item.pubkey
+        const value = resolvePath('$.' + path, ctx);
+        if (value !== null && value !== undefined) {
+          return String(value);
+        }
+        return resolveBind('$.' + path, ctx);
       });
     }
 
@@ -1225,6 +1755,7 @@
     // ===========================================
 
     const DEMO_SPECS = {
+      // Basic poll demo (original)
       poll: {
         layout: 'card',
         title: 'Community Poll',
@@ -1249,6 +1780,185 @@
           { id: 'vote-server', publish: { kind: 7, content: 'server-rendered', tags: [['e', '{{$.id}}']] }},
           { id: 'vote-client', publish: { kind: 7, content: 'client-js', tags: [['e', '{{$.id}}']] }},
           { id: 'vote-hybrid', publish: { kind: 7, content: 'hybrid', tags: [['e', '{{$.id}}']] }}
+        ]
+      },
+
+      // QUERY + FOREACH demo: Fetch recent notes and display them
+      feed: {
+        layout: 'card',
+        title: 'Recent Notes Feed',
+        elements: [
+          { type: 'heading', value: 'Recent Nostr Notes' },
+          { type: 'text', value: 'This demo uses QUERY to fetch kind:1 notes from relays, then FOREACH to render each one.' },
+          { type: 'hr' },
+          {
+            type: 'query',
+            filter: { kinds: [1], limit: 5 },
+            as: 'notes',
+            timeout: 5000,
+            children: [
+              {
+                type: 'if',
+                condition: '$.notes.length > 0',
+                then: [
+                  { type: 'text', value: 'Found notes:' },
+                  {
+                    type: 'foreach',
+                    items: '$.notes',
+                    as: 'note',
+                    template: {
+                      type: 'container',
+                      style: 'ui-event-preview',
+                      children: [
+                        { type: 'data', bind: '$.note.pubkey', label: 'By: ' },
+                        { type: 'text', bind: '$.note.content' },
+                        { type: 'data', bind: '$.note.created_at', label: 'At: ' }
+                      ]
+                    }
+                  }
+                ],
+                else: [
+                  { type: 'text', value: 'No notes found. Try refreshing!' }
+                ]
+              }
+            ],
+            empty: [
+              { type: 'text', value: 'Loading notes from relays...' }
+            ]
+          }
+        ]
+      },
+
+      // IF/ELSE demo: Conditional rendering
+      conditional: {
+        layout: 'card',
+        title: 'Conditional Rendering Demo',
+        state: {
+          loggedIn: false,
+          count: 3
+        },
+        elements: [
+          { type: 'heading', value: 'If/Else Conditional Rendering' },
+          { type: 'text', value: 'UI can show different content based on conditions.' },
+          { type: 'hr' },
+          { type: 'heading', value: 'State-based condition:' },
+          {
+            type: 'if',
+            condition: '$.pubkey',
+            then: [
+              { type: 'text', value: 'You are connected! Your pubkey:' },
+              { type: 'data', bind: '$.pubkey' }
+            ],
+            else: [
+              { type: 'text', value: 'You are not connected. Connect with NIP-07 to see your pubkey.' }
+            ]
+          },
+          { type: 'hr' },
+          { type: 'heading', value: 'Comparison condition:' },
+          {
+            type: 'if',
+            condition: '$.kind == 1',
+            then: [
+              { type: 'text', value: 'This is a kind:1 event (note)' }
+            ],
+            else: [
+              { type: 'text', value: 'This is not a kind:1 event (kind: ' },
+              { type: 'data', bind: '$.kind' },
+              { type: 'text', value: ')' }
+            ]
+          }
+        ]
+      },
+
+      // EMBED demo: Embed another malleable UI
+      embed: {
+        layout: 'card',
+        title: 'Embed Demo',
+        elements: [
+          { type: 'heading', value: 'Embedding Other Content' },
+          { type: 'text', value: 'The EMBED element can include another Nostr event inside this UI.' },
+          { type: 'hr' },
+          { type: 'text', value: 'To test this, paste an event ID below (or use query+foreach to dynamically embed content).' },
+          { type: 'hr' },
+          { type: 'heading', value: 'How it works:' },
+          { type: 'text', value: '1. Use {"type": "embed", "event": "nevent1..."} in your spec' },
+          { type: 'text', value: '2. The client fetches that event from relays' },
+          { type: 'text', value: '3. If it\'s a UI spec, it renders as embedded UI' },
+          { type: 'text', value: '4. If it\'s plain text, it shows the content' }
+        ]
+      },
+
+      // STATE + COMPUTED demo
+      counter: {
+        layout: 'card',
+        title: 'State & Computed Demo',
+        state: {
+          likes: 0
+        },
+        computed: {
+          message: "$.state.likes > 0 ? 'Thanks for the likes!' : 'No likes yet'"
+        },
+        elements: [
+          { type: 'heading', value: 'Local State Demo' },
+          { type: 'text', value: 'This demo shows local state that can be modified.' },
+          { type: 'hr' },
+          { type: 'text', value: 'Current like count (from spec state):' },
+          { type: 'state-value', key: 'likes' },
+          { type: 'hr' },
+          { type: 'text', value: 'Click to react (publishes kind:7):' },
+          { type: 'button', label: '❤️ Like', action: 'like' }
+        ],
+        actions: [
+          { id: 'like', publish: { kind: 7, content: '+', tags: [['e', '{{$.id}}']] }}
+        ]
+      },
+
+      // Advanced: Profile viewer using query
+      profile: {
+        layout: 'card',
+        title: 'Profile Viewer',
+        elements: [
+          { type: 'heading', value: 'Profile Lookup' },
+          { type: 'text', value: 'This demonstrates querying for a specific user\'s profile (kind:0).' },
+          { type: 'hr' },
+          {
+            type: 'if',
+            condition: '$.pubkey',
+            then: [
+              { type: 'text', value: 'Looking up your profile...' },
+              {
+                type: 'query',
+                filter: { kinds: [0], authors: ['{{$.pubkey}}'], limit: 1 },
+                as: 'profiles',
+                children: [
+                  {
+                    type: 'if',
+                    condition: '$.profiles.length > 0',
+                    then: [
+                      { type: 'heading', value: 'Your Profile:' },
+                      {
+                        type: 'foreach',
+                        items: '$.profiles',
+                        as: 'profile',
+                        template: {
+                          type: 'container',
+                          children: [
+                            { type: 'text', bind: '$.profile.content' }
+                          ]
+                        }
+                      }
+                    ],
+                    else: [
+                      { type: 'text', value: 'No profile found for your pubkey.' }
+                    ]
+                  }
+                ]
+              }
+            ],
+            else: [
+              { type: 'text', value: 'Connect with NIP-07 to view your profile.' }
+            ]
+          }
         ]
       }
     };
@@ -1292,6 +2002,9 @@
 
         async init() {
           this.pool = new RelayPool();
+
+          // Set global pool for query elements
+          setGlobalPool(this.pool);
 
           // Check for NIP-07
           if (window.nostr) {
@@ -1427,7 +2140,7 @@
                   kind: replyEvent.kind,
                   content: replyEvent.content
                 };
-                this.renderedHtml = renderUISpec(this.uiSpec, ctx);
+                this.renderedHtml = await renderUISpec(this.uiSpec, ctx);
               } else {
                 // Not a UI spec - show raw content
                 this.error = 'Bot replied but response is not a UI spec';
@@ -1470,7 +2183,7 @@
                 kind: 0,
                 content: input
               };
-              this.renderedHtml = renderUISpec(spec, ctx);
+              this.renderedHtml = await renderUISpec(spec, ctx);
               return;
             } else {
               this.error = 'Invalid UI spec JSON';
@@ -1519,7 +2232,7 @@
                 kind: event.kind,
                 content: event.content
               };
-              this.renderedHtml = renderUISpec(this.uiSpec, ctx);
+              this.renderedHtml = await renderUISpec(this.uiSpec, ctx);
             }
 
           } catch (e) {
@@ -1529,7 +2242,7 @@
           this.loading = false;
         },
 
-        loadDemo(name = 'poll') {
+        async loadDemo(name = 'poll') {
           this.error = null;
           this.event = null;
           this.isDirectSpec = true;
@@ -1545,7 +2258,7 @@
             content: JSON.stringify(spec)
           };
 
-          this.renderedHtml = renderUISpec(spec, ctx);
+          this.renderedHtml = await renderUISpec(spec, ctx);
           this.eventInput = JSON.stringify(spec, null, 2);
         },
 
