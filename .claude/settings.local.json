@@ -3,7 +3,9 @@
     "allow": [
       "Bash(go build:*)",
       "Bash(nak --version:*)",
-      "Bash(nak key generate:*)"
+      "Bash(nak key generate:*)",
+      "Bash(NSEC=\"edc90d06fee17615229c8526dc005d959e4af3bdc0b48c5776c951bcafedec85\" nak event:*)",
+      "Bash(go test:*)"
     ]
   },
   "enableAllProjectMcpServers": true,
