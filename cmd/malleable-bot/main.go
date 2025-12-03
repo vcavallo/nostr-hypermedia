@@ -34,6 +34,12 @@ var (
 	claudeModel     = "claude-sonnet-4-20250514"
 )
 
+// NIP-90 DVM kinds for malleable UI generation
+const (
+	KindJobRequest = 5666 // Malleable UI generation request
+	KindJobResult  = 6666 // Malleable UI generation result
+)
+
 // Nostr event structure
 type Event struct {
 	ID        string     `json:"id"`
@@ -182,11 +188,10 @@ func (b *Bot) connectRelay(ctx context.Context, relayURL string) error {
 
 	log.Printf("[%s] Connected", relayURL)
 
-	// Subscribe to mentions of our pubkey
-	subID := "mentions"
+	// Subscribe to DVM job requests (kind:5666)
+	subID := "dvm-requests"
 	filter := map[string]interface{}{
-		"kinds": []int{1},
-		"#p":    []string{b.publicKey},
+		"kinds": []int{KindJobRequest},
 		"since": time.Now().Unix() - 60, // Last minute on startup, then live
 		"limit": 10,
 	}
@@ -198,7 +203,7 @@ func (b *Bot) connectRelay(ctx context.Context, relayURL string) error {
 		return fmt.Errorf("subscribe failed: %w", err)
 	}
 
-	log.Printf("[%s] Subscribed to mentions", relayURL)
+	log.Printf("[%s] Subscribed to DVM job requests (kind:%d)", relayURL, KindJobRequest)
 
 	// Read messages
 	for {
@@ -242,6 +247,11 @@ func (b *Bot) handleMessage(ctx context.Context, relay string, message []byte) {
 			return
 		}
 
+		// Only process DVM job requests
+		if event.Kind != KindJobRequest {
+			return
+		}
+
 		// Check if we've already processed this event
 		b.seenMu.Lock()
 		if b.seen[event.ID] {
@@ -256,10 +266,10 @@ func (b *Bot) handleMessage(ctx context.Context, relay string, message []byte) {
 			return
 		}
 
-		log.Printf("[%s] Received mention from %s: %s", relay, event.PubKey[:8], truncate(event.Content, 100))
+		log.Printf("[%s] Received DVM job request (kind:%d) from %s", relay, event.Kind, event.PubKey[:8])
 
 		// Process in background
-		go b.handleMention(ctx, event)
+		go b.handleJobRequest(ctx, event)
 
 	case "EOSE":
 		log.Printf("[%s] End of stored events", relay)
@@ -283,35 +293,49 @@ func (b *Bot) handleMessage(ctx context.Context, relay string, message []byte) {
 	}
 }
 
-func (b *Bot) handleMention(ctx context.Context, event Event) {
-	log.Printf("Processing request from %s...", event.PubKey[:8])
+func (b *Bot) handleJobRequest(ctx context.Context, event Event) {
+	log.Printf("Processing DVM job request from %s...", event.PubKey[:8])
 
-	// Extract the request (remove any @mentions from content)
-	request := cleanMentions(event.Content)
+	// Extract input from NIP-90 tags
+	// Look for ["i", "<data>", "<input-type>", ...]
+	var request string
+	for _, tag := range event.Tags {
+		if len(tag) >= 3 && tag[0] == "i" && tag[2] == "text" {
+			request = tag[1]
+			break
+		}
+	}
+
+	// Fallback to content if no "i" tag found
+	if request == "" {
+		request = event.Content
+	}
+
 	if strings.TrimSpace(request) == "" {
 		log.Printf("Empty request, ignoring")
 		return
 	}
 
+	log.Printf("Job input: %s", truncate(request, 100))
+
 	// Generate UI spec using Claude
 	uiSpec, err := b.generateUISpec(ctx, request)
 	if err != nil {
 		log.Printf("Failed to generate UI spec: %v", err)
-		// Reply with error message
-		b.replyWithError(ctx, event, err.Error())
+		b.publishJobError(ctx, event, err.Error())
 		return
 	}
 
 	log.Printf("Generated UI spec: %s", truncate(uiSpec, 200))
 	log.Printf("UI spec byte length: %d, rune count: %d", len(uiSpec), len([]rune(uiSpec)))
 
-	// Create reply event
-	reply := b.createReply(event, uiSpec)
+	// Create job result event (kind:6666)
+	result := b.createJobResult(event, uiSpec)
 
 	// Publish to all relays
-	b.publish(reply)
+	b.publish(result)
 
-	log.Printf("Published reply: %s", reply.ID[:8])
+	log.Printf("Published job result (kind:%d): %s", KindJobResult, result.ID[:8])
 }
 
 func (b *Bot) generateUISpec(ctx context.Context, request string) (string, error) {
@@ -515,21 +539,34 @@ Now generate a UI spec for the user's request. Output ONLY valid JSON, nothing e
 	return uiSpec, nil
 }
 
-func (b *Bot) createReply(original Event, content string) *Event {
+// createJobResult creates a NIP-90 job result event (kind:6666)
+func (b *Bot) createJobResult(request Event, uiSpec string) *Event {
 	now := time.Now().Unix()
 
-	// Build tags: reply to original event and mention original author
+	// Stringify the original request for the "request" tag
+	requestJSON, _ := json.Marshal(request)
+
+	// Build NIP-90 job result tags
 	tags := [][]string{
-		{"e", original.ID, "", "reply"},
-		{"p", original.PubKey},
+		{"request", string(requestJSON)},       // Original request as JSON
+		{"e", request.ID},                      // Reference to job request
+		{"p", request.PubKey},                  // Customer's pubkey
+		{"alt", "Malleable UI specification"},  // NIP-31 alt tag for unknown event handling
+	}
+
+	// Copy input tags from request
+	for _, tag := range request.Tags {
+		if len(tag) >= 1 && tag[0] == "i" {
+			tags = append(tags, tag)
+		}
 	}
 
 	event := &Event{
 		PubKey:    b.publicKey,
 		CreatedAt: now,
-		Kind:      1,
+		Kind:      KindJobResult,
 		Tags:      tags,
-		Content:   content,
+		Content:   uiSpec, // UI spec goes in content
 	}
 
 	// Compute event ID
@@ -554,11 +591,29 @@ func (b *Bot) createReply(original Event, content string) *Event {
 	return event
 }
 
-func (b *Bot) replyWithError(ctx context.Context, original Event, errMsg string) {
-	content := fmt.Sprintf("Sorry, I couldn't generate that UI: %s\n\nTry describing what you want more specifically, like:\n- \"make a poll about favorite pizza toppings\"\n- \"create a feedback form\"\n- \"build a simple counter app\"", errMsg)
+// publishJobError publishes a NIP-90 job feedback event with error status
+func (b *Bot) publishJobError(ctx context.Context, request Event, errMsg string) {
+	now := time.Now().Unix()
 
-	reply := b.createReply(original, content)
-	b.publish(reply)
+	tags := [][]string{
+		{"status", "error", errMsg},
+		{"e", request.ID},
+		{"p", request.PubKey},
+	}
+
+	event := &Event{
+		PubKey:    b.publicKey,
+		CreatedAt: now,
+		Kind:      7000, // NIP-90 job feedback
+		Tags:      tags,
+		Content:   fmt.Sprintf("Failed to generate UI: %s", errMsg),
+	}
+
+	event.ID = computeEventID(event)
+	event.Sig = b.signEvent(event.ID)
+
+	b.publish(event)
+	log.Printf("Published job error feedback: %s", event.ID[:8])
 }
 
 func (b *Bot) publish(event *Event) {
@@ -719,22 +774,6 @@ func bech32Polymod(values []int) int {
 		}
 	}
 	return chk
-}
-
-func cleanMentions(content string) string {
-	// Remove nostr:npub... mentions
-	words := strings.Fields(content)
-	var cleaned []string
-	for _, word := range words {
-		if strings.HasPrefix(word, "nostr:npub") {
-			continue
-		}
-		if strings.HasPrefix(word, "@npub") {
-			continue
-		}
-		cleaned = append(cleaned, word)
-	}
-	return strings.Join(cleaned, " ")
 }
 
 func truncate(s string, n int) string {

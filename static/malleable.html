@@ -487,16 +487,16 @@
       </div>
     </div>
 
-    <!-- Bot Configuration -->
+    <!-- DVM Service Provider Configuration -->
     <div class="bot-config" x-show="mode === 'request'">
-      <label for="bot-npub">Bot NPub</label>
+      <label for="bot-npub">DVM Service Provider (NPub)</label>
       <input
         type="text"
         id="bot-npub"
         x-model="botNpub"
         placeholder="npub1..."
       >
-      <div class="hint">The malleable-bot that generates UI specs. Default: npub1h00x5r5gglsumv46tmqzrny5n6euauf9hqcy5ay0uywqgpuepmkq5x62ut</div>
+      <div class="hint">NIP-90 Data Vending Machine that generates UI specs (kind:5666/6666). Default: npub1h00x5r5gglsumv46tmqzrny5n6euauf9hqcy5ay0uywqgpuepmkq5x62ut</div>
     </div>
 
     <!-- Request Mode -->
@@ -536,9 +536,9 @@
     <!-- Waiting for response -->
     <div class="waiting-box" x-show="waiting">
       <span class="spinner"></span>
-      <span>Waiting for bot response...</span>
+      <span>Waiting for DVM job result (kind:6666)...</span>
       <div style="margin-top: 10px; font-size: 12px; color: #8b949e;">
-        Request sent: <span x-text="sentRequestId ? sentRequestId.slice(0, 8) + '...' : ''"></span>
+        Job request (kind:5666): <span x-text="sentRequestId ? sentRequestId.slice(0, 8) + '...' : ''"></span>
       </div>
     </div>
 
@@ -618,6 +618,10 @@
 
     // Default malleable-bot npub
     const DEFAULT_BOT_NPUB = 'npub1h00x5r5gglsumv46tmqzrny5n6euauf9hqcy5ay0uywqgpuepmkq5x62ut';
+
+    // NIP-90 DVM kinds for malleable UI generation
+    const KIND_JOB_REQUEST = 5666;
+    const KIND_JOB_RESULT = 6666;
 
     class RelayPool {
       constructor(relays = DEFAULT_RELAYS) {
@@ -1204,12 +1208,14 @@
           }
 
           try {
-            // Create the request event (kind 1, tagging the bot)
+            // Create NIP-90 DVM job request (kind:5666)
             const requestEvent = {
-              kind: 1,
-              content: this.requestText.trim(),
+              kind: KIND_JOB_REQUEST,
+              content: '',  // NIP-90: input goes in tags, not content
               tags: [
-                ['p', botPubkey]
+                ['i', this.requestText.trim(), 'text'],  // NIP-90 input tag
+                ['output', 'application/json'],          // Expected output format
+                ['p', botPubkey]                         // Preferred service provider
               ],
               created_at: Math.floor(Date.now() / 1000)
             };
@@ -1220,14 +1226,14 @@
 
             // Publish to relays
             await this.pool.publish(signedEvent);
-            console.log('Published request:', signedEvent.id);
+            console.log('Published DVM job request:', signedEvent.id);
 
             // Now wait for the bot's reply
             this.waiting = true;
 
-            // Subscribe for replies from the bot that tag our event
+            // Subscribe for job results (kind:6666) that reference our request
             const replyFilter = {
-              kinds: [1],
+              kinds: [KIND_JOB_RESULT],
               authors: [botPubkey],
               '#e': [signedEvent.id],
               since: signedEvent.created_at
