@@ -597,6 +597,15 @@
       color: #6e7681;
       margin-top: 6px;
     }
+
+    /* Component styles */
+    .ui-component {
+      margin: 8px 0;
+    }
+
+    .ui-component > .ui-card {
+      border-left: 3px solid #238636;
+    }
   </style>
 </head>
 <body>
@@ -731,6 +740,11 @@
       <dl>
         <dt>Event ID</dt>
         <dd x-text="event?.id"></dd>
+        <dt>nevent (for components)</dt>
+        <dd style="display: flex; align-items: center; gap: 8px;">
+          <span x-text="event ? encodeNevent(event.id, [], event.pubkey, event.kind) : ''" style="word-break: break-all;"></span>
+          <button class="copy-btn" style="flex-shrink: 0; padding: 4px 8px; font-size: 11px;" @click="copyEventNevent()">Copy</button>
+        </dd>
         <dt>Author</dt>
         <dd x-text="event?.pubkey"></dd>
         <dt>Kind</dt>
@@ -1100,6 +1114,10 @@
         case 'embed':
           return await renderEmbed(elem, ctx, actions, actionHandler);
 
+        // COMPONENT: Use another malleable UI as a component with props
+        case 'component':
+          return await renderComponent(elem, ctx, actions, actionHandler, spec);
+
         // STATE-DISPLAY: Show current state value
         case 'state-value':
           const stateKey = elem.key || elem.bind?.replace('$.state.', '');
@@ -1113,6 +1131,10 @@
         // SCRIPT: Execute arbitrary JS and optionally render result
         case 'script':
           return renderScript(elem, ctx);
+
+        // SLOT: Placeholder for children passed to a component
+        case 'slot':
+          return await renderSlot(elem, ctx, actions, actionHandler, spec);
 
         default:
           return '';
@@ -1285,6 +1307,116 @@
         console.error('Script failed:', e);
         return `<div class="ui-error">Script error: ${escapeHtml(e.message)}</div>`;
       }
+    }
+
+    // Render COMPONENT element - use another malleable UI as a component with props
+    async function renderComponent(elem, ctx, actions, actionHandler, spec) {
+      if (!_globalPool) {
+        return `<div class="ui-error">Component failed: No relay connection</div>`;
+      }
+
+      // Component can be referenced by:
+      // 1. "ref": event ID (hex, nevent, note)
+      // 2. "query": filter to find the component (e.g., by tag)
+      let componentSpec = null;
+      let componentEvent = null;
+
+      if (elem.ref) {
+        // Direct reference to an event
+        const parsed = parseNostrId(elem.ref);
+        let filter = {};
+
+        if (parsed.type === 'hex' || parsed.type === 'note' || parsed.type === 'nevent') {
+          filter = { ids: [parsed.id], limit: 1 };
+        } else {
+          return `<div class="ui-error">Component: Invalid reference</div>`;
+        }
+
+        componentEvent = await _globalPool.fetchEvent(filter);
+      } else if (elem.query) {
+        // Query for a component (e.g., find by #t tag)
+        const filter = resolveFilterTemplates(elem.query, ctx);
+        componentEvent = await _globalPool.fetchEvent(filter);
+      } else {
+        return `<div class="ui-error">Component: No ref or query specified</div>`;
+      }
+
+      if (!componentEvent) {
+        return `<div class="ui-error">Component not found</div>`;
+      }
+
+      // Parse the component's UI spec
+      componentSpec = parseUISpec(componentEvent.content);
+      if (!componentSpec) {
+        return `<div class="ui-error">Component: Invalid UI spec</div>`;
+      }
+
+      // Build component context:
+      // 1. Start with current context
+      // 2. Add "props" passed to the component
+      // 3. Add reference to parent context as $parent
+      // 4. Add children for slot rendering
+      const componentCtx = {
+        // Component's own event data
+        id: componentEvent.id,
+        pubkey: componentEvent.pubkey,
+        created_at: componentEvent.created_at,
+        kind: componentEvent.kind,
+        // Props passed to component
+        props: elem.props || {},
+        // Parent context for accessing outer data
+        $parent: ctx,
+        // Children to be rendered in slots
+        _slotChildren: elem.children || [],
+        _slotActions: actions,
+        _slotActionHandler: actionHandler,
+        _slotSpec: spec
+      };
+
+      // Spread props into context for easy access
+      if (elem.props) {
+        for (const [key, value] of Object.entries(elem.props)) {
+          // Resolve any bindings in prop values
+          if (typeof value === 'string' && value.startsWith('$.')) {
+            componentCtx[key] = resolvePath(value, ctx);
+          } else {
+            componentCtx[key] = value;
+          }
+        }
+      }
+
+      // Render the component
+      const html = await renderUISpec(componentSpec, componentCtx, actionHandler);
+      return `<div class="ui-component" data-ref="${escapeHtml(componentEvent.id)}">${html}</div>`;
+    }
+
+    // Render SLOT element - placeholder for children passed to component
+    async function renderSlot(elem, ctx, actions, actionHandler, spec) {
+      const slotChildren = ctx._slotChildren || [];
+      const slotActions = ctx._slotActions || actions;
+      const slotActionHandler = ctx._slotActionHandler || actionHandler;
+      const slotSpec = ctx._slotSpec || spec;
+
+      if (slotChildren.length === 0) {
+        // Render default content if no children provided
+        if (elem.default || elem.children) {
+          let html = '';
+          for (const child of (elem.default || elem.children)) {
+            html += await renderElement(child, ctx, actions, actionHandler, spec);
+          }
+          return html;
+        }
+        return '';
+      }
+
+      // Render the passed children
+      let html = '';
+      for (const child of slotChildren) {
+        // Use parent context ($parent) for slot children
+        const slotCtx = ctx.$parent || ctx;
+        html += await renderElement(child, slotCtx, slotActions, slotActionHandler, slotSpec);
+      }
+      return html;
     }
 
     // Render EMBED element - embed another malleable UI
@@ -2349,6 +2481,24 @@
               await navigator.clipboard.writeText(this.successNevent);
               // Brief feedback
               const btn = document.querySelector('.success-box .copy-btn');
+              if (btn) {
+                const original = btn.textContent;
+                btn.textContent = 'Copied!';
+                setTimeout(() => btn.textContent = original, 1500);
+              }
+            } catch (e) {
+              console.error('Failed to copy:', e);
+            }
+          }
+        },
+
+        async copyEventNevent() {
+          if (this.event) {
+            try {
+              const nevent = encodeNevent(this.event.id, [], this.event.pubkey, this.event.kind);
+              await navigator.clipboard.writeText(nevent);
+              // Brief feedback
+              const btn = document.querySelector('.event-meta .copy-btn');
               if (btn) {
                 const original = btn.textContent;
                 btn.textContent = 'Copied!';

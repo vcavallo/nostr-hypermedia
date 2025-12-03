@@ -329,6 +329,30 @@ func (b *Bot) handleJobRequest(ctx context.Context, event Event) {
 	log.Printf("Generated UI spec: %s", truncate(uiSpec, 200))
 	log.Printf("UI spec byte length: %d, rune count: %d", len(uiSpec), len([]rune(uiSpec)))
 
+	// Debug: check for unusual bytes in the content
+	hasUnusual := false
+	for i, b := range []byte(uiSpec) {
+		// Log any non-printable ASCII or unusual control characters
+		if b < 32 && b != '\n' && b != '\r' && b != '\t' {
+			log.Printf("WARNING: Unusual byte at position %d: 0x%02x", i, b)
+			hasUnusual = true
+		}
+	}
+
+	// Also check for Unicode BOM or other problematic sequences
+	if len(uiSpec) >= 3 {
+		if uiSpec[0] == 0xEF && uiSpec[1] == 0xBB && uiSpec[2] == 0xBF {
+			log.Printf("WARNING: UTF-8 BOM detected at start of content!")
+			hasUnusual = true
+		}
+	}
+
+	// Log first and last 50 bytes in hex for debugging
+	if !hasUnusual {
+		log.Printf("Content starts with (hex): % x", []byte(uiSpec[:min(50, len(uiSpec))]))
+		log.Printf("Content ends with (hex): % x", []byte(uiSpec[max(0, len(uiSpec)-50):]))
+	}
+
 	// Create job result event (kind:6666)
 	result := b.createJobResult(event, uiSpec)
 
@@ -504,6 +528,47 @@ TIME-BASED CONDITIONAL (eval + if):
 POLL:
 {"layout":"card","elements":[{"type":"heading","value":"Vote!"},{"type":"container","style":"options","children":[{"type":"button","label":"Option A","action":"vote-a"},{"type":"button","label":"Option B","action":"vote-b"}]}],"actions":[{"id":"vote-a","publish":{"kind":7,"content":"a","tags":[["e","{{$.id}}"]]}},{"id":"vote-b","publish":{"kind":7,"content":"b","tags":[["e","{{$.id}}"]]}}]}
 
+=== COMPOSITION (REUSABLE COMPONENTS) ===
+
+UIs can be composed from other malleable UI events (kind:6666).
+
+To make a UI reusable as a component:
+1. Add "name": "MyComponent" to the spec
+2. Add "tags": ["reusable", "category"] for discoverability
+3. Use {"type": "slot"} where parent content should go
+4. Access passed props via $.props.propName or directly as $.propName
+
+Example reusable card component:
+{
+  "name": "NoteCard",
+  "tags": ["reusable", "card", "note"],
+  "layout": "card",
+  "elements": [
+    {"type": "data", "bind": "$.author", "label": "By: "},
+    {"type": "text", "bind": "$.content"},
+    {"type": "slot", "default": [{"type": "text", "value": "No actions"}]}
+  ]
+}
+
+To USE a component in another UI:
+{
+  "type": "component",
+  "ref": "nevent1...",           // Direct reference to component event
+  // OR "query": {"#t": ["component:notecard"], "kinds": [6666], "limit": 1}
+  "props": {                     // Props passed to component
+    "author": "$.note.pubkey",   // Bindings resolved from parent context
+    "content": "$.note.content"
+  },
+  "children": [                  // Rendered in component's <slot>
+    {"type": "button", "label": "Like", "action": "like"}
+  ]
+}
+
+Discovering components:
+- Query kind:6666 with #t filter: {"kinds": [6666], "#t": ["component:notecard"]}
+- All malleable UIs are tagged with "malleable-ui"
+- Named components tagged "component:name"
+
 === DESIGN GUIDELINES ===
 
 1. Use "eval" with "as" to compute values, then use them in conditions
@@ -512,6 +577,8 @@ POLL:
 4. Use if/else for conditional rendering based on data or computed values
 5. For time-based logic, use eval with Date/Math functions
 6. Keep UIs focused and simple
+7. For reusable components, add "name" and "tags" fields
+8. Use "slot" to allow parent UIs to inject content
 
 Now generate a UI spec for the user's request. Output ONLY valid JSON, nothing else.`
 
@@ -596,6 +663,28 @@ func (b *Bot) createJobResult(request Event, uiSpec string) *Event {
 		{"e", request.ID},                      // Reference to job request
 		{"p", request.PubKey},                  // Customer's pubkey
 		{"alt", "Malleable UI specification"},  // NIP-31 alt tag for unknown event handling
+		{"t", "malleable-ui"},                  // Tag for discoverability
+	}
+
+	// Extract component name/type from the spec for tagging
+	var specObj map[string]interface{}
+	if err := json.Unmarshal([]byte(uiSpec), &specObj); err == nil {
+		// If spec has a "name" field, use it as a component tag
+		if name, ok := specObj["name"].(string); ok && name != "" {
+			tags = append(tags, []string{"t", "component:" + strings.ToLower(name)})
+		}
+		// If spec has a "tags" array, add those
+		if specTags, ok := specObj["tags"].([]interface{}); ok {
+			for _, t := range specTags {
+				if tagStr, ok := t.(string); ok {
+					tags = append(tags, []string{"t", tagStr})
+				}
+			}
+		}
+		// Add layout type as a tag
+		if layout, ok := specObj["layout"].(string); ok {
+			tags = append(tags, []string{"t", "layout:" + layout})
+		}
 	}
 
 	// Copy input tags from request
@@ -661,11 +750,31 @@ func (b *Bot) publishJobError(ctx context.Context, request Event, errMsg string)
 }
 
 func (b *Bot) publish(event *Event) {
-	eventJSON, _ := json.Marshal(event)
+	// Use encoder with SetEscapeHTML(false) to avoid escaping <, >, &
+	// which would cause ID mismatch when relay re-computes the hash
+	var buf bytes.Buffer
+	encoder := json.NewEncoder(&buf)
+	encoder.SetEscapeHTML(false)
+	encoder.Encode(event)
+	eventJSON := bytes.TrimSuffix(buf.Bytes(), []byte("\n"))
+
 	msg := fmt.Sprintf(`["EVENT",%s]`, eventJSON)
+
+	// Debug: Write the full event to a file for analysis
+	os.WriteFile("/tmp/last_published_event.json", eventJSON, 0644)
+	log.Printf("Full event JSON saved to /tmp/last_published_event.json")
 
 	// Debug: log the full event being published
 	log.Printf("Publishing event JSON (first 1000 chars): %s", truncate(string(eventJSON), 1000))
+
+	// Debug: compute what a relay would compute and compare
+	var replayEvent Event
+	json.Unmarshal(eventJSON, &replayEvent)
+	replayID := computeEventID(&replayEvent)
+	if replayID != event.ID {
+		log.Printf("ERROR: Replay ID mismatch! event.ID=%s, replay=%s", event.ID, replayID)
+		log.Printf("Event JSON length: %d", len(eventJSON))
+	}
 
 	// Verify the event before publishing
 	computedID := computeEventID(event)
@@ -719,7 +828,9 @@ func computeEventID(event *Event) string {
 	// Nostr event ID is SHA256 of the canonical JSON serialization:
 	// [0, pubkey, created_at, kind, tags, content]
 	//
-	// Use json.Marshal on the whole array to ensure consistency
+	// IMPORTANT: We must NOT escape HTML characters (<, >, &) because
+	// Nostr relays expect unescaped JSON. Go's json.Marshal escapes these
+	// by default, so we use json.Encoder with SetEscapeHTML(false).
 	serialized := []interface{}{
 		0,
 		event.PubKey,
@@ -729,7 +840,14 @@ func computeEventID(event *Event) string {
 		event.Content,
 	}
 
-	jsonBytes, _ := json.Marshal(serialized)
+	var buf bytes.Buffer
+	encoder := json.NewEncoder(&buf)
+	encoder.SetEscapeHTML(false)
+	encoder.Encode(serialized)
+
+	// Encoder.Encode adds a trailing newline, remove it
+	jsonBytes := bytes.TrimSuffix(buf.Bytes(), []byte("\n"))
+
 	hash := sha256.Sum256(jsonBytes)
 	return hex.EncodeToString(hash[:])
 }

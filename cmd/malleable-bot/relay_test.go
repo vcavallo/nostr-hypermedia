@@ -1,0 +1,210 @@
+package main
+
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"testing"
+	"time"
+
+	"github.com/btcsuite/btcd/btcec/v2"
+	"github.com/btcsuite/btcd/btcec/v2/schnorr"
+	"github.com/gorilla/websocket"
+)
+
+func TestPublishToRelay(t *testing.T) {
+	// This test actually publishes an event to a relay to verify our ID/sig computation
+
+	// Use a fixed key for testing
+	nsecHex := "edc90d06fee17615229c8526dc005d959e4af3bdc0b48c5776c951bcafedec85"
+	privKeyBytes, _ := hex.DecodeString(nsecHex)
+	privKey, _ := btcec.PrivKeyFromBytes(privKeyBytes)
+	pubKeyBytes := privKey.PubKey().SerializeCompressed()
+	pubKey := hex.EncodeToString(pubKeyBytes[1:])
+
+	t.Logf("Public key: %s", pubKey)
+
+	// Create a simple test event
+	event := &Event{
+		PubKey:    pubKey,
+		CreatedAt: time.Now().Unix(),
+		Kind:      1,
+		Tags:      [][]string{},
+		Content:   `{"test":"relay publish test"}`,
+	}
+
+	// Compute event ID
+	serialized := []interface{}{
+		0,
+		event.PubKey,
+		event.CreatedAt,
+		event.Kind,
+		event.Tags,
+		event.Content,
+	}
+	jsonBytes, _ := json.Marshal(serialized)
+	t.Logf("Serialization: %s", string(jsonBytes))
+
+	hash := sha256.Sum256(jsonBytes)
+	event.ID = hex.EncodeToString(hash[:])
+	t.Logf("Event ID: %s", event.ID)
+
+	// Sign the event
+	idBytes, _ := hex.DecodeString(event.ID)
+	sig, _ := schnorr.Sign(privKey, idBytes)
+	event.Sig = hex.EncodeToString(sig.Serialize())
+	t.Logf("Signature: %s", event.Sig)
+
+	// Connect to relay
+	relay := "wss://relay.damus.io"
+	conn, _, err := websocket.DefaultDialer.Dial(relay, nil)
+	if err != nil {
+		t.Fatalf("Failed to connect to relay: %v", err)
+	}
+	defer conn.Close()
+
+	// Send the event
+	eventJSON, _ := json.Marshal(event)
+	msg := fmt.Sprintf(`["EVENT",%s]`, eventJSON)
+	t.Logf("Sending: %s", msg)
+
+	if err := conn.WriteMessage(websocket.TextMessage, []byte(msg)); err != nil {
+		t.Fatalf("Failed to send event: %v", err)
+	}
+
+	// Read response
+	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	_, response, err := conn.ReadMessage()
+	if err != nil {
+		t.Fatalf("Failed to read response: %v", err)
+	}
+	t.Logf("Response: %s", string(response))
+
+	// Check if OK or rejected
+	var resp []interface{}
+	if err := json.Unmarshal(response, &resp); err != nil {
+		t.Fatalf("Failed to parse response: %v", err)
+	}
+
+	if len(resp) < 2 {
+		t.Fatalf("Unexpected response format")
+	}
+
+	if resp[0] == "OK" && len(resp) >= 3 {
+		success := resp[2].(bool)
+		if success {
+			t.Log("Event accepted!")
+		} else {
+			reason := ""
+			if len(resp) >= 4 {
+				reason = resp[3].(string)
+			}
+			t.Errorf("Event rejected: %s", reason)
+		}
+	}
+}
+
+func TestPublishDVMEventToRelay(t *testing.T) {
+	// Test publishing a kind:6666 DVM event with request tag
+
+	nsecHex := "edc90d06fee17615229c8526dc005d959e4af3bdc0b48c5776c951bcafedec85"
+	privKeyBytes, _ := hex.DecodeString(nsecHex)
+	privKey, _ := btcec.PrivKeyFromBytes(privKeyBytes)
+	pubKeyBytes := privKey.PubKey().SerializeCompressed()
+	pubKey := hex.EncodeToString(pubKeyBytes[1:])
+
+	// Create a fake request event
+	requestEvent := &Event{
+		ID:        "abc123def456abc123def456abc123def456abc123def456abc123def456abc1",
+		PubKey:    "def456abc123def456abc123def456abc123def456abc123def456abc123def4",
+		CreatedAt: 1700000000,
+		Kind:      5666,
+		Tags:      [][]string{{"i", "test", "text"}},
+		Content:   "",
+		Sig:       "0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+	}
+	requestJSON, _ := json.Marshal(requestEvent)
+
+	// Create the DVM response event
+	event := &Event{
+		PubKey:    pubKey,
+		CreatedAt: time.Now().Unix(),
+		Kind:      6666,
+		Tags: [][]string{
+			{"request", string(requestJSON)},
+			{"e", requestEvent.ID},
+			{"p", requestEvent.PubKey},
+			{"alt", "Malleable UI specification"},
+			{"t", "malleable-ui"},
+		},
+		Content: `{"layout":"card","elements":[{"type":"text","value":"Test"}]}`,
+	}
+
+	// Compute event ID
+	serialized := []interface{}{
+		0,
+		event.PubKey,
+		event.CreatedAt,
+		event.Kind,
+		event.Tags,
+		event.Content,
+	}
+	jsonBytes, _ := json.Marshal(serialized)
+	t.Logf("Serialization (first 500): %s", truncate(string(jsonBytes), 500))
+
+	hash := sha256.Sum256(jsonBytes)
+	event.ID = hex.EncodeToString(hash[:])
+	t.Logf("Event ID: %s", event.ID)
+
+	// Sign the event
+	idBytes, _ := hex.DecodeString(event.ID)
+	sig, _ := schnorr.Sign(privKey, idBytes)
+	event.Sig = hex.EncodeToString(sig.Serialize())
+
+	// Connect to relay
+	relay := "wss://relay.damus.io"
+	conn, _, err := websocket.DefaultDialer.Dial(relay, nil)
+	if err != nil {
+		t.Fatalf("Failed to connect to relay: %v", err)
+	}
+	defer conn.Close()
+
+	// Send the event
+	eventJSON, _ := json.Marshal(event)
+	msg := fmt.Sprintf(`["EVENT",%s]`, eventJSON)
+	t.Logf("Sending (first 500): %s", truncate(msg, 500))
+
+	if err := conn.WriteMessage(websocket.TextMessage, []byte(msg)); err != nil {
+		t.Fatalf("Failed to send event: %v", err)
+	}
+
+	// Read response
+	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	_, response, err := conn.ReadMessage()
+	if err != nil {
+		t.Fatalf("Failed to read response: %v", err)
+	}
+	t.Logf("Response: %s", string(response))
+
+	// Check if OK or rejected
+	var resp []interface{}
+	if err := json.Unmarshal(response, &resp); err != nil {
+		t.Fatalf("Failed to parse response: %v", err)
+	}
+
+	if len(resp) >= 1 && resp[0] == "OK" {
+		if len(resp) >= 3 {
+			success := resp[2].(bool)
+			if success {
+				t.Log("DVM Event accepted!")
+			} else {
+				reason := ""
+				if len(resp) >= 4 {
+					reason = resp[3].(string)
+				}
+				t.Errorf("DVM Event rejected: %s", reason)
+			}
+		}
+	}
+}
