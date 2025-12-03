@@ -1,0 +1,11 @@
+{
+  "enableAllProjectMcpServers": true,
+  "enabledMcpjsonServers": [
+    "nostr"
+  ],
+  "permissions": {
+    "allow": [
+      "Bash(go build:*)"
+    ]
+  }
+}

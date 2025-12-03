@@ -38,6 +38,8 @@ func main() {
 	http.HandleFunc("/html/react", htmlReactHandler)
 	http.HandleFunc("/html/check-connection", htmlCheckConnectionHandler)
 	http.HandleFunc("/html/reconnect", htmlReconnectHandler)
+	http.HandleFunc("/html/malleable", htmlMalleableHandler)
+	http.HandleFunc("/html/malleable-action", htmlMalleableActionHandler)
 	http.HandleFunc("/health", healthHandler)
 
 	// Start NIP-46 connection listener for nostrconnect:// flow
