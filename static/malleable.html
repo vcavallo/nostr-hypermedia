@@ -1,0 +1,1110 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Malleable UI - Client-Side Nostr Hypermedia</title>
+
+  <!-- Alpine.js for reactivity -->
+  <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
+
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      line-height: 1.6;
+      color: #e0e0e0;
+      background: #0d1117;
+      min-height: 100vh;
+    }
+
+    .app {
+      max-width: 900px;
+      margin: 0 auto;
+      padding: 20px;
+    }
+
+    header {
+      background: linear-gradient(135deg, #238636 0%, #1f6feb 100%);
+      color: white;
+      padding: 24px;
+      border-radius: 8px;
+      margin-bottom: 20px;
+      text-align: center;
+    }
+
+    header h1 { font-size: 24px; margin-bottom: 4px; }
+    header .subtitle { opacity: 0.9; font-size: 14px; }
+
+    .controls {
+      background: #161b22;
+      border: 1px solid #30363d;
+      border-radius: 8px;
+      padding: 16px;
+      margin-bottom: 20px;
+    }
+
+    .controls label {
+      display: block;
+      font-size: 13px;
+      color: #8b949e;
+      margin-bottom: 6px;
+    }
+
+    .controls input {
+      width: 100%;
+      padding: 10px 12px;
+      background: #0d1117;
+      border: 1px solid #30363d;
+      border-radius: 6px;
+      color: #e0e0e0;
+      font-size: 14px;
+      font-family: monospace;
+    }
+
+    .controls input:focus {
+      outline: none;
+      border-color: #238636;
+    }
+
+    .controls .actions {
+      margin-top: 12px;
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+
+    .btn {
+      padding: 8px 16px;
+      border: none;
+      border-radius: 6px;
+      font-size: 14px;
+      cursor: pointer;
+      transition: background 0.2s;
+    }
+
+    .btn-primary {
+      background: #238636;
+      color: white;
+    }
+    .btn-primary:hover { background: #2ea043; }
+    .btn-primary:disabled { background: #21262d; color: #484f58; cursor: not-allowed; }
+
+    .btn-secondary {
+      background: #21262d;
+      color: #c9d1d9;
+      border: 1px solid #30363d;
+    }
+    .btn-secondary:hover { background: #30363d; }
+
+    .status {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 13px;
+      color: #8b949e;
+      margin-top: 12px;
+    }
+
+    .status-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: #484f58;
+    }
+    .status-dot.connected { background: #238636; }
+    .status-dot.loading { background: #f0883e; animation: pulse 1s infinite; }
+    .status-dot.error { background: #f85149; }
+
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.5; }
+    }
+
+    .error-box {
+      background: #f8514922;
+      border: 1px solid #f85149;
+      color: #f85149;
+      padding: 12px 16px;
+      border-radius: 6px;
+      margin-bottom: 20px;
+      font-size: 14px;
+    }
+
+    .event-meta {
+      background: #161b22;
+      border: 1px solid #30363d;
+      border-radius: 8px;
+      padding: 16px;
+      margin-bottom: 20px;
+      font-size: 13px;
+    }
+
+    .event-meta dt {
+      color: #8b949e;
+      font-weight: 500;
+    }
+
+    .event-meta dd {
+      color: #c9d1d9;
+      font-family: monospace;
+      margin-bottom: 8px;
+      word-break: break-all;
+    }
+
+    .raw-json {
+      background: #0d1117;
+      border: 1px solid #30363d;
+      border-radius: 6px;
+      padding: 12px;
+      font-family: monospace;
+      font-size: 12px;
+      color: #8b949e;
+      white-space: pre-wrap;
+      overflow-x: auto;
+      max-height: 200px;
+      overflow-y: auto;
+    }
+
+    /* Rendered UI styles */
+    .rendered-ui {
+      background: #161b22;
+      border: 1px solid #30363d;
+      border-radius: 8px;
+      padding: 20px;
+    }
+
+    .ui-card {
+      background: #0d1117;
+      border: 1px solid #30363d;
+      border-radius: 8px;
+      padding: 20px;
+    }
+
+    .ui-heading {
+      font-size: 22px;
+      font-weight: 600;
+      color: #e0e0e0;
+      margin: 16px 0 8px 0;
+    }
+    .ui-heading:first-child { margin-top: 0; }
+
+    .ui-text {
+      color: #8b949e;
+      margin: 8px 0;
+    }
+
+    .ui-image {
+      max-width: 100%;
+      border-radius: 8px;
+      margin: 12px 0;
+    }
+
+    .ui-link {
+      color: #58a6ff;
+      text-decoration: none;
+    }
+    .ui-link:hover { text-decoration: underline; }
+
+    .ui-container {
+      margin: 12px 0;
+    }
+    .ui-container.options {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+
+    .ui-button {
+      background: #238636;
+      color: white;
+      border: none;
+      padding: 10px 20px;
+      border-radius: 6px;
+      cursor: pointer;
+      font-size: 14px;
+    }
+    .ui-button:hover { background: #2ea043; }
+    .ui-button:disabled { background: #21262d; color: #484f58; cursor: wait; }
+
+    .ui-input {
+      background: #0d1117;
+      border: 1px solid #30363d;
+      color: #e0e0e0;
+      padding: 10px 12px;
+      border-radius: 6px;
+      width: 100%;
+      margin: 8px 0;
+    }
+
+    .ui-label {
+      display: block;
+      color: #8b949e;
+      font-size: 13px;
+      margin: 8px 0 4px 0;
+    }
+
+    .ui-hr {
+      border: none;
+      border-top: 1px solid #30363d;
+      margin: 16px 0;
+    }
+
+    .ui-data {
+      background: #0d1117;
+      padding: 6px 10px;
+      border-radius: 4px;
+      font-family: monospace;
+      font-size: 13px;
+      color: #58a6ff;
+      display: inline-block;
+      margin: 4px 0;
+    }
+
+    .ui-data-label {
+      color: #8b949e;
+      margin-right: 6px;
+    }
+
+    .user-info {
+      background: #161b22;
+      border: 1px solid #30363d;
+      border-radius: 8px;
+      padding: 12px 16px;
+      margin-bottom: 20px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      font-size: 13px;
+    }
+
+    .user-info .pubkey {
+      font-family: monospace;
+      color: #58a6ff;
+    }
+
+    .demo-specs {
+      margin-top: 20px;
+      padding-top: 20px;
+      border-top: 1px solid #30363d;
+    }
+
+    .demo-specs h3 {
+      font-size: 14px;
+      color: #8b949e;
+      margin-bottom: 10px;
+    }
+
+    .demo-specs .examples {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+  </style>
+</head>
+<body>
+  <div class="app" x-data="malleableApp()">
+    <header>
+      <h1>Malleable UI</h1>
+      <div class="subtitle">Client-side Nostr hypermedia - no server required</div>
+    </header>
+
+    <!-- User connection status -->
+    <div class="user-info" x-show="userPubkey">
+      <span>Connected as: <span class="pubkey" x-text="userPubkey ? userPubkey.slice(0, 8) + '...' + userPubkey.slice(-4) : ''"></span></span>
+      <button class="btn btn-secondary" @click="disconnect()">Disconnect</button>
+    </div>
+
+    <div class="user-info" x-show="!userPubkey">
+      <span>Not connected - actions require NIP-07 extension</span>
+      <button class="btn btn-primary" @click="connect()">Connect</button>
+    </div>
+
+    <!-- Controls -->
+    <div class="controls">
+      <label for="event-id">Event ID, nevent, naddr, or note (or paste a UI spec JSON)</label>
+      <input
+        type="text"
+        id="event-id"
+        x-model="eventInput"
+        @keydown.enter="loadEvent()"
+        placeholder="paste event id, nevent1..., or JSON UI spec"
+      >
+      <div class="actions">
+        <button class="btn btn-primary" @click="loadEvent()" :disabled="loading">
+          <span x-show="!loading">Load Event</span>
+          <span x-show="loading">Loading...</span>
+        </button>
+        <button class="btn btn-secondary" @click="loadDemo()">Load Demo</button>
+        <button class="btn btn-secondary" @click="clear()">Clear</button>
+      </div>
+
+      <div class="status">
+        <span class="status-dot" :class="{'connected': relayStatus === 'connected', 'loading': relayStatus === 'connecting', 'error': relayStatus === 'error'}"></span>
+        <span x-text="statusMessage"></span>
+      </div>
+
+      <div class="demo-specs">
+        <h3>Try these demos:</h3>
+        <div class="examples">
+          <button class="btn btn-secondary" @click="loadDemo('poll')">Poll</button>
+          <button class="btn btn-secondary" @click="loadDemo('profile')">Profile Card</button>
+          <button class="btn btn-secondary" @click="loadDemo('form')">Form</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Error display -->
+    <div class="error-box" x-show="error" x-text="error"></div>
+
+    <!-- Event metadata -->
+    <div class="event-meta" x-show="event && !isDirectSpec">
+      <dl>
+        <dt>Event ID</dt>
+        <dd x-text="event?.id"></dd>
+        <dt>Author</dt>
+        <dd x-text="event?.pubkey"></dd>
+        <dt>Kind</dt>
+        <dd x-text="event?.kind"></dd>
+        <dt>Created</dt>
+        <dd x-text="event ? new Date(event.created_at * 1000).toLocaleString() : ''"></dd>
+      </dl>
+    </div>
+
+    <!-- Rendered UI -->
+    <div class="rendered-ui" x-show="uiSpec">
+      <div x-html="renderedHtml"></div>
+    </div>
+
+    <!-- Raw content (if not a UI spec) -->
+    <div x-show="event && !uiSpec && !isDirectSpec">
+      <h3 style="color: #8b949e; font-size: 14px; margin-bottom: 10px;">Raw Content (not a UI spec)</h3>
+      <div class="raw-json" x-text="event?.content"></div>
+    </div>
+
+    <!-- Raw spec display -->
+    <details x-show="uiSpec" style="margin-top: 20px;">
+      <summary style="color: #8b949e; cursor: pointer; font-size: 13px;">View raw UI spec</summary>
+      <div class="raw-json" style="margin-top: 10px;" x-text="JSON.stringify(uiSpec, null, 2)"></div>
+    </details>
+  </div>
+
+  <script>
+    // ===========================================
+    // Vanilla JS: Relay connection & note fetching
+    // ===========================================
+
+    const DEFAULT_RELAYS = [
+      'wss://relay.damus.io',
+      'wss://relay.nostr.band',
+      'wss://nos.lol',
+      'wss://relay.primal.net'
+    ];
+
+    class RelayPool {
+      constructor(relays = DEFAULT_RELAYS) {
+        this.relays = relays;
+        this.sockets = new Map();
+        this.subscriptions = new Map();
+        this.subCounter = 0;
+      }
+
+      async connect() {
+        const promises = this.relays.map(url => this.connectRelay(url));
+        await Promise.allSettled(promises);
+        return this.sockets.size > 0;
+      }
+
+      connectRelay(url) {
+        return new Promise((resolve, reject) => {
+          if (this.sockets.has(url)) {
+            resolve(this.sockets.get(url));
+            return;
+          }
+
+          const ws = new WebSocket(url);
+          const timeout = setTimeout(() => {
+            ws.close();
+            reject(new Error(`Timeout connecting to ${url}`));
+          }, 5000);
+
+          ws.onopen = () => {
+            clearTimeout(timeout);
+            this.sockets.set(url, ws);
+            resolve(ws);
+          };
+
+          ws.onerror = (err) => {
+            clearTimeout(timeout);
+            reject(err);
+          };
+
+          ws.onclose = () => {
+            this.sockets.delete(url);
+          };
+
+          ws.onmessage = (msg) => {
+            try {
+              const data = JSON.parse(msg.data);
+              this.handleMessage(url, data);
+            } catch (e) {
+              console.error('Failed to parse message:', e);
+            }
+          };
+        });
+      }
+
+      handleMessage(relay, data) {
+        const [type, subId, ...rest] = data;
+
+        if (type === 'EVENT') {
+          const event = rest[0];
+          const sub = this.subscriptions.get(subId);
+          if (sub && sub.onEvent) {
+            sub.onEvent(event, relay);
+          }
+        } else if (type === 'EOSE') {
+          const sub = this.subscriptions.get(subId);
+          if (sub) {
+            sub.eoseCount = (sub.eoseCount || 0) + 1;
+            if (sub.eoseCount >= this.sockets.size && sub.onEose) {
+              sub.onEose();
+            }
+          }
+        }
+      }
+
+      subscribe(filter, { onEvent, onEose }) {
+        const subId = `sub_${++this.subCounter}`;
+        this.subscriptions.set(subId, { filter, onEvent, onEose, eoseCount: 0 });
+
+        const req = JSON.stringify(['REQ', subId, filter]);
+        this.sockets.forEach(ws => {
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.send(req);
+          }
+        });
+
+        return subId;
+      }
+
+      unsubscribe(subId) {
+        const close = JSON.stringify(['CLOSE', subId]);
+        this.sockets.forEach(ws => {
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.send(close);
+          }
+        });
+        this.subscriptions.delete(subId);
+      }
+
+      async fetchEvent(filter, timeout = 5000) {
+        return new Promise((resolve) => {
+          let event = null;
+          let timer;
+
+          const subId = this.subscribe(filter, {
+            onEvent: (e) => {
+              if (!event || e.created_at > event.created_at) {
+                event = e;
+              }
+            },
+            onEose: () => {
+              clearTimeout(timer);
+              this.unsubscribe(subId);
+              resolve(event);
+            }
+          });
+
+          timer = setTimeout(() => {
+            this.unsubscribe(subId);
+            resolve(event);
+          }, timeout);
+        });
+      }
+
+      async publish(event) {
+        const msg = JSON.stringify(['EVENT', event]);
+        const results = [];
+
+        this.sockets.forEach((ws, url) => {
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.send(msg);
+            results.push(url);
+          }
+        });
+
+        return results;
+      }
+
+      close() {
+        this.sockets.forEach(ws => ws.close());
+        this.sockets.clear();
+        this.subscriptions.clear();
+      }
+    }
+
+    // ===========================================
+    // Vanilla JS: UI Spec Interpreter
+    // ===========================================
+
+    function parseUISpec(content) {
+      if (typeof content !== 'string') return null;
+      content = content.trim();
+      if (!content.startsWith('{')) return null;
+
+      try {
+        // Try wrapped format {"ui": {...}}
+        const parsed = JSON.parse(content);
+        if (parsed.ui && parsed.ui.elements) {
+          return parsed.ui;
+        }
+        // Try direct format {elements: [...]}
+        if (parsed.elements && Array.isArray(parsed.elements)) {
+          return parsed;
+        }
+      } catch (e) {
+        console.log('Not valid JSON:', e.message);
+      }
+
+      return null;
+    }
+
+    function renderUISpec(spec, ctx, actionHandler) {
+      let html = '';
+
+      if (spec.style) {
+        html += `<style>${escapeHtml(spec.style)}</style>`;
+      }
+
+      const layoutClass = spec.layout ? `ui-${spec.layout}` : 'ui-card';
+      html += `<div class="${layoutClass}">`;
+
+      for (const elem of spec.elements || []) {
+        html += renderElement(elem, ctx, spec.actions || [], actionHandler);
+      }
+
+      html += '</div>';
+      return html;
+    }
+
+    function renderElement(elem, ctx, actions, actionHandler) {
+      const value = elem.bind ? resolveBind(elem.bind, ctx) : (elem.value || '');
+      const id = elem.id ? ` id="${escapeHtml(elem.id)}"` : '';
+
+      switch (elem.type) {
+        case 'heading':
+        case 'h1':
+        case 'h2':
+        case 'h3':
+          return `<h2 class="ui-heading"${id}>${escapeHtml(value)}</h2>`;
+
+        case 'text':
+        case 'p':
+          return `<p class="ui-text"${id}>${escapeHtml(value)}</p>`;
+
+        case 'image':
+        case 'img':
+          const src = elem.src || value;
+          return `<img class="ui-image"${id} src="${escapeHtml(src)}" alt="">`;
+
+        case 'link':
+        case 'a':
+          const href = elem.href || value;
+          const label = elem.label || value;
+          return `<a class="ui-link"${id} href="${escapeHtml(href)}">${escapeHtml(label)}</a>`;
+
+        case 'button':
+          const btnLabel = elem.label || value;
+          if (elem.action) {
+            const action = actions.find(a => a.id === elem.action);
+            if (action) {
+              const actionId = `action_${Math.random().toString(36).slice(2, 8)}`;
+              // Store action for later execution
+              window._malleableActions = window._malleableActions || {};
+              window._malleableActions[actionId] = { action, ctx };
+              return `<button class="ui-button"${id} onclick="window.executeAction('${actionId}')">${escapeHtml(btnLabel)}</button>`;
+            }
+          }
+          if (elem.href) {
+            return `<a class="ui-button"${id} href="${escapeHtml(elem.href)}">${escapeHtml(btnLabel)}</a>`;
+          }
+          return `<button class="ui-button"${id}>${escapeHtml(btnLabel)}</button>`;
+
+        case 'input':
+          const inputLabel = elem.label;
+          const name = elem.name || elem.id || '';
+          let inputHtml = '';
+          if (inputLabel) {
+            inputHtml += `<label class="ui-label" for="${escapeHtml(name)}">${escapeHtml(inputLabel)}</label>`;
+          }
+          inputHtml += `<input class="ui-input"${id} name="${escapeHtml(name)}" type="text" value="${escapeHtml(value)}">`;
+          return inputHtml;
+
+        case 'container':
+        case 'div':
+          const containerClass = elem.style && !elem.style.includes(':')
+            ? `ui-container ${elem.style}`
+            : 'ui-container';
+          let containerHtml = `<div class="${containerClass}"${id}>`;
+          for (const child of elem.children || []) {
+            containerHtml += renderElement(child, ctx, actions, actionHandler);
+          }
+          containerHtml += '</div>';
+          return containerHtml;
+
+        case 'hr':
+          return '<hr class="ui-hr">';
+
+        case 'data':
+          const dataLabel = elem.label;
+          if (dataLabel) {
+            return `<span class="ui-data"${id}><span class="ui-data-label">${escapeHtml(dataLabel)}</span>${escapeHtml(value)}</span>`;
+          }
+          return `<span class="ui-data"${id}>${escapeHtml(value)}</span>`;
+
+        default:
+          return '';
+      }
+    }
+
+    function resolveBind(bind, ctx) {
+      if (!ctx) return '';
+
+      const path = bind.replace(/^\$\.?/, '').toLowerCase();
+
+      switch (path) {
+        case 'id': return ctx.id || '';
+        case 'pubkey': return ctx.pubkey || '';
+        case 'npub': return ctx.npub || ctx.pubkey || '';
+        case 'content': return ctx.content || '';
+        case 'time':
+        case 'createdat':
+        case 'created_at':
+          return ctx.created_at ? new Date(ctx.created_at * 1000).toLocaleString() : '';
+        case 'kind': return String(ctx.kind || '');
+        default: return '';
+      }
+    }
+
+    function resolveTemplate(tmpl, ctx) {
+      return tmpl.replace(/\{\{\s*\$\.?(\w+)\s*\}\}/g, (match, path) => {
+        return resolveBind(path, ctx);
+      });
+    }
+
+    function escapeHtml(str) {
+      if (!str) return '';
+      return String(str)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+    }
+
+    // ===========================================
+    // Bech32 decoding for nevent/note/naddr
+    // ===========================================
+
+    const BECH32_CHARSET = 'qpzry9x8gf2tvdw0s3jn54khce6mua7l';
+
+    function bech32Decode(str) {
+      str = str.toLowerCase();
+      const pos = str.lastIndexOf('1');
+      if (pos < 1 || pos + 7 > str.length) throw new Error('Invalid bech32');
+
+      const hrp = str.slice(0, pos);
+      const data = [];
+
+      for (let i = pos + 1; i < str.length; i++) {
+        const idx = BECH32_CHARSET.indexOf(str[i]);
+        if (idx === -1) throw new Error('Invalid character');
+        data.push(idx);
+      }
+
+      // Remove checksum (last 6 chars)
+      const payload = data.slice(0, -6);
+
+      // Convert 5-bit to 8-bit
+      let acc = 0, bits = 0;
+      const bytes = [];
+      for (const val of payload) {
+        acc = (acc << 5) | val;
+        bits += 5;
+        while (bits >= 8) {
+          bits -= 8;
+          bytes.push((acc >> bits) & 0xff);
+        }
+      }
+
+      return { hrp, bytes: new Uint8Array(bytes) };
+    }
+
+    function parseNostrId(input) {
+      input = input.trim();
+
+      // Already hex?
+      if (/^[0-9a-f]{64}$/i.test(input)) {
+        return { type: 'hex', id: input.toLowerCase() };
+      }
+
+      // note1... (just the event id)
+      if (input.startsWith('note1')) {
+        const { bytes } = bech32Decode(input);
+        const hex = Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
+        return { type: 'note', id: hex };
+      }
+
+      // nevent1... (TLV encoded)
+      if (input.startsWith('nevent1')) {
+        const { bytes } = bech32Decode(input);
+        return parseTLV(bytes, 'nevent');
+      }
+
+      // naddr1... (TLV encoded)
+      if (input.startsWith('naddr1')) {
+        const { bytes } = bech32Decode(input);
+        return parseTLV(bytes, 'naddr');
+      }
+
+      return { type: 'unknown', raw: input };
+    }
+
+    function parseTLV(bytes, type) {
+      const result = { type };
+      let i = 0;
+
+      while (i < bytes.length) {
+        const t = bytes[i++];
+        const l = bytes[i++];
+        const v = bytes.slice(i, i + l);
+        i += l;
+
+        if (t === 0) { // special (event id for nevent, identifier for naddr)
+          result.id = Array.from(v).map(b => b.toString(16).padStart(2, '0')).join('');
+        } else if (t === 1) { // relay
+          result.relay = new TextDecoder().decode(v);
+        } else if (t === 2) { // author
+          result.author = Array.from(v).map(b => b.toString(16).padStart(2, '0')).join('');
+        } else if (t === 3) { // kind
+          result.kind = v.reduce((acc, b) => acc * 256 + b, 0);
+        }
+      }
+
+      return result;
+    }
+
+    // ===========================================
+    // Demo UI Specs
+    // ===========================================
+
+    const DEMO_SPECS = {
+      poll: {
+        layout: 'card',
+        title: 'Community Poll',
+        elements: [
+          { type: 'heading', value: "What's the best approach to malleable UI?" },
+          { type: 'text', value: 'This entire UI is defined in JSON. The browser interprets it and renders HTML - no server required!' },
+          { type: 'hr' },
+          { type: 'text', value: 'Vote for your preferred approach:' },
+          { type: 'container', style: 'options', children: [
+            { type: 'button', label: 'Server-rendered', action: 'vote-server' },
+            { type: 'button', label: 'Client JS', action: 'vote-client' },
+            { type: 'button', label: 'Hybrid', action: 'vote-hybrid' }
+          ]},
+          { type: 'hr' },
+          { type: 'heading', value: 'Event Data Bindings' },
+          { type: 'text', value: 'UI specs can bind to event data:' },
+          { type: 'data', bind: '$.id', label: 'Event ID: ' },
+          { type: 'data', bind: '$.pubkey', label: 'Author: ' },
+          { type: 'data', bind: '$.time', label: 'Created: ' }
+        ],
+        actions: [
+          { id: 'vote-server', publish: { kind: 7, content: 'server-rendered', tags: [['e', '{{$.id}}']] }},
+          { id: 'vote-client', publish: { kind: 7, content: 'client-js', tags: [['e', '{{$.id}}']] }},
+          { id: 'vote-hybrid', publish: { kind: 7, content: 'hybrid', tags: [['e', '{{$.id}}']] }}
+        ]
+      },
+
+      profile: {
+        layout: 'card',
+        title: 'Profile Card',
+        elements: [
+          { type: 'heading', value: 'User Profile' },
+          { type: 'data', bind: '$.pubkey', label: 'Pubkey: ' },
+          { type: 'data', bind: '$.time', label: 'Last seen: ' },
+          { type: 'hr' },
+          { type: 'container', style: 'options', children: [
+            { type: 'button', label: 'Follow', action: 'follow' },
+            { type: 'button', label: 'Message', action: 'message' }
+          ]}
+        ],
+        actions: [
+          { id: 'follow', publish: { kind: 3, content: '', tags: [['p', '{{$.pubkey}}']] }},
+          { id: 'message', link: '/html/messages/{{$.pubkey}}' }
+        ]
+      },
+
+      form: {
+        layout: 'card',
+        title: 'Feedback Form',
+        elements: [
+          { type: 'heading', value: 'Send Feedback' },
+          { type: 'text', value: 'Your feedback helps improve this project.' },
+          { type: 'input', name: 'feedback', label: 'Your message:', id: 'feedback-input' },
+          { type: 'hr' },
+          { type: 'button', label: 'Submit Feedback', action: 'submit' }
+        ],
+        actions: [
+          { id: 'submit', publish: { kind: 1, content: 'Feedback: {{input:feedback}}', tags: [['t', 'feedback']] }}
+        ]
+      }
+    };
+
+    // ===========================================
+    // Alpine.js App
+    // ===========================================
+
+    function malleableApp() {
+      return {
+        // State
+        eventInput: '',
+        event: null,
+        uiSpec: null,
+        renderedHtml: '',
+        error: null,
+        loading: false,
+        relayStatus: 'disconnected',
+        statusMessage: 'Not connected',
+        userPubkey: null,
+        isDirectSpec: false,
+
+        // Relay pool
+        pool: null,
+
+        async init() {
+          this.pool = new RelayPool();
+
+          // Check for NIP-07
+          if (window.nostr) {
+            try {
+              this.userPubkey = await window.nostr.getPublicKey();
+            } catch (e) {
+              console.log('NIP-07 available but not connected');
+            }
+          }
+
+          // Connect to relays
+          this.relayStatus = 'connecting';
+          this.statusMessage = 'Connecting to relays...';
+
+          try {
+            await this.pool.connect();
+            this.relayStatus = 'connected';
+            this.statusMessage = `Connected to ${this.pool.sockets.size} relays`;
+          } catch (e) {
+            this.relayStatus = 'error';
+            this.statusMessage = 'Failed to connect to relays';
+          }
+
+          // Set up action executor
+          window.executeAction = async (actionId) => {
+            const { action, ctx } = window._malleableActions[actionId] || {};
+            if (!action) return;
+
+            await this.executeAction(action, ctx);
+          };
+        },
+
+        async connect() {
+          if (!window.nostr) {
+            this.error = 'No NIP-07 extension found. Install Alby, nos2x, or similar.';
+            return;
+          }
+
+          try {
+            this.userPubkey = await window.nostr.getPublicKey();
+          } catch (e) {
+            this.error = 'Failed to connect: ' + e.message;
+          }
+        },
+
+        disconnect() {
+          this.userPubkey = null;
+        },
+
+        async loadEvent() {
+          this.error = null;
+          this.event = null;
+          this.uiSpec = null;
+          this.renderedHtml = '';
+          this.isDirectSpec = false;
+
+          const input = this.eventInput.trim();
+          if (!input) {
+            this.error = 'Please enter an event ID or UI spec';
+            return;
+          }
+
+          // Check if it's direct JSON
+          if (input.startsWith('{')) {
+            const spec = parseUISpec(input);
+            if (spec) {
+              this.isDirectSpec = true;
+              this.uiSpec = spec;
+              const ctx = {
+                id: 'direct-spec',
+                pubkey: this.userPubkey || 'not-connected',
+                created_at: Math.floor(Date.now() / 1000),
+                kind: 0,
+                content: input
+              };
+              this.renderedHtml = renderUISpec(spec, ctx);
+              return;
+            } else {
+              this.error = 'Invalid UI spec JSON';
+              return;
+            }
+          }
+
+          // Parse as Nostr identifier
+          this.loading = true;
+
+          try {
+            const parsed = parseNostrId(input);
+
+            let filter = {};
+            if (parsed.type === 'hex' || parsed.type === 'note' || parsed.type === 'nevent') {
+              filter = { ids: [parsed.id], limit: 1 };
+            } else if (parsed.type === 'naddr') {
+              filter = {
+                kinds: [parsed.kind],
+                authors: [parsed.author],
+                '#d': [parsed.id],
+                limit: 1
+              };
+            } else {
+              this.error = 'Unrecognized identifier format';
+              this.loading = false;
+              return;
+            }
+
+            const event = await this.pool.fetchEvent(filter);
+
+            if (!event) {
+              this.error = 'Event not found';
+              this.loading = false;
+              return;
+            }
+
+            this.event = event;
+            this.uiSpec = parseUISpec(event.content);
+
+            if (this.uiSpec) {
+              const ctx = {
+                id: event.id,
+                pubkey: event.pubkey,
+                created_at: event.created_at,
+                kind: event.kind,
+                content: event.content
+              };
+              this.renderedHtml = renderUISpec(this.uiSpec, ctx);
+            }
+
+          } catch (e) {
+            this.error = 'Failed to load event: ' + e.message;
+          }
+
+          this.loading = false;
+        },
+
+        loadDemo(name = 'poll') {
+          this.error = null;
+          this.event = null;
+          this.isDirectSpec = true;
+
+          const spec = DEMO_SPECS[name] || DEMO_SPECS.poll;
+          this.uiSpec = spec;
+
+          const ctx = {
+            id: 'demo-' + name,
+            pubkey: this.userPubkey || 'demo-pubkey',
+            created_at: Math.floor(Date.now() / 1000),
+            kind: 1,
+            content: JSON.stringify(spec)
+          };
+
+          this.renderedHtml = renderUISpec(spec, ctx);
+          this.eventInput = JSON.stringify(spec, null, 2);
+        },
+
+        clear() {
+          this.eventInput = '';
+          this.event = null;
+          this.uiSpec = null;
+          this.renderedHtml = '';
+          this.error = null;
+          this.isDirectSpec = false;
+        },
+
+        async executeAction(action, ctx) {
+          if (action.link) {
+            const url = resolveTemplate(action.link, ctx);
+            window.location.href = url;
+            return;
+          }
+
+          if (action.publish) {
+            if (!window.nostr) {
+              this.error = 'NIP-07 extension required to publish events';
+              return;
+            }
+
+            if (!this.userPubkey) {
+              this.error = 'Please connect your NIP-07 extension first';
+              return;
+            }
+
+            try {
+              // Resolve template in content
+              let content = resolveTemplate(action.publish.content, ctx);
+
+              // Check for input bindings like {{input:fieldname}}
+              content = content.replace(/\{\{input:(\w+)\}\}/g, (match, fieldName) => {
+                const input = document.querySelector(`[name="${fieldName}"]`);
+                return input ? input.value : '';
+              });
+
+              // Resolve template in tags
+              const tags = (action.publish.tags || []).map(tag =>
+                tag.map(v => resolveTemplate(v, ctx))
+              );
+
+              const event = {
+                kind: action.publish.kind,
+                content: content,
+                tags: tags,
+                created_at: Math.floor(Date.now() / 1000)
+              };
+
+              // Sign with NIP-07
+              const signedEvent = await window.nostr.signEvent(event);
+
+              // Publish to relays
+              const relays = await this.pool.publish(signedEvent);
+
+              this.error = null;
+              alert(`Published to ${relays.length} relays!\n\nEvent ID: ${signedEvent.id}`);
+
+            } catch (e) {
+              this.error = 'Failed to publish: ' + e.message;
+            }
+          }
+        }
+      };
+    }
+  </script>
+</body>
+</html>

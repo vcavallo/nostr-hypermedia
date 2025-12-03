@@ -1,11 +1,13 @@
 {
+  "permissions": {
+    "allow": [
+      "Bash(go build:*)",
+      "Bash(nak --version:*)",
+      "Bash(nak key generate:*)"
+    ]
+  },
   "enableAllProjectMcpServers": true,
   "enabledMcpjsonServers": [
     "nostr"
-  ],
-  "permissions": {
-    "allow": [
-      "Bash(go build:*)"
-    ]
-  }
+  ]
 }
