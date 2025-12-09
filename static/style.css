@@ -98,26 +98,6 @@ main {
   padding: 0;
 }
 
-.entity-header {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  margin-bottom: 12px;
-  font-weight: 600;
-  color: #667eea;
-  font-size: 14px;
-  text-transform: uppercase;
-  letter-spacing: 0.5px;
-}
-
-.entity-class {
-  display: inline-block;
-  background: #e7eaff;
-  padding: 2px 8px;
-  border-radius: 3px;
-  font-size: 11px;
-}
-
 /* Properties */
 .properties {
   margin: 12px 0;
@@ -179,6 +159,7 @@ main {
   border-radius: 50%;
   object-fit: cover;
   border: 2px solid #e1e4e8;
+  background: #e1e4e8;
 }
 
 .author-info {

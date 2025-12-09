@@ -19,20 +19,53 @@ import (
 	"github.com/gorilla/websocket"
 )
 
+// Rate limiting constants for NIP-46 operations
+const (
+	signRateLimit    = 10              // Max sign requests per window
+	signRateWindow   = 1 * time.Minute // Rate limit window
+)
+
 // BunkerSession represents an active NIP-46 connection to a remote signer
 type BunkerSession struct {
-	ID                string    // Session ID (for cookies)
-	ClientPrivKey     []byte    // Disposable client private key
-	ClientPubKey      []byte    // Client public key (hex)
-	RemoteSignerPubKey []byte   // Remote signer's pubkey
-	UserPubKey        []byte    // User's actual pubkey (from get_public_key)
-	Relays            []string  // Relays to communicate through
-	Secret            string    // Optional connection secret
-	ConversationKey   []byte    // Cached conversation key
-	Connected         bool
-	CreatedAt         time.Time
-	UserRelayList     *RelayList // User's NIP-65 relay list
-	mu                sync.Mutex
+	ID                 string    // Session ID (for cookies)
+	ClientPrivKey      []byte    // Disposable client private key
+	ClientPubKey       []byte    // Client public key (hex)
+	RemoteSignerPubKey []byte    // Remote signer's pubkey
+	UserPubKey         []byte    // User's actual pubkey (from get_public_key)
+	Relays             []string  // Relays to communicate through
+	Secret             string    // Optional connection secret
+	ConversationKey    []byte    // Cached conversation key
+	Connected          bool
+	CreatedAt          time.Time
+	UserRelayList      *RelayList // User's NIP-65 relay list
+	FollowingPubkeys   []string   // Cached list of followed pubkeys (from kind 3)
+	// Rate limiting for sign operations
+	signRequestTimes []time.Time
+	mu               sync.Mutex
+}
+
+// checkSignRateLimit returns an error if the session has exceeded the sign rate limit
+func (s *BunkerSession) checkSignRateLimit() error {
+	now := time.Now()
+	cutoff := now.Add(-signRateWindow)
+
+	// Remove old entries
+	validTimes := make([]time.Time, 0, len(s.signRequestTimes))
+	for _, t := range s.signRequestTimes {
+		if t.After(cutoff) {
+			validTimes = append(validTimes, t)
+		}
+	}
+	s.signRequestTimes = validTimes
+
+	// Check if we're over the limit
+	if len(s.signRequestTimes) >= signRateLimit {
+		return errors.New("rate limit exceeded: too many sign requests")
+	}
+
+	// Record this request
+	s.signRequestTimes = append(s.signRequestTimes, now)
+	return nil
 }
 
 // BunkerSessionStore manages active bunker sessions
@@ -44,6 +77,20 @@ type BunkerSessionStore struct {
 // Global session store
 var bunkerSessions = &BunkerSessionStore{
 	sessions: make(map[string]*BunkerSession),
+}
+
+// Session cleanup interval
+const sessionCleanupInterval = 10 * time.Minute
+
+func init() {
+	// Start session cleanup goroutine
+	// Uses sessionMaxAge from html_auth.go (24 hours)
+	go func() {
+		ticker := time.NewTicker(sessionCleanupInterval)
+		for range ticker.C {
+			bunkerSessions.CleanupExpired(sessionMaxAge)
+		}
+	}()
 }
 
 // NIP46Request is a JSON-RPC request to the remote signer
@@ -133,7 +180,10 @@ func ParseBunkerURL(bunkerURL string) (*BunkerSession, error) {
 
 func generateSessionID() string {
 	b := make([]byte, 16)
-	rand.Read(b)
+	if _, err := rand.Read(b); err != nil {
+		// Fallback: use timestamp-based ID (less random but functional)
+		return fmt.Sprintf("%x", time.Now().UnixNano())
+	}
 	return hex.EncodeToString(b)
 }
 
@@ -195,6 +245,11 @@ func (s *BunkerSession) SignEvent(ctx context.Context, event UnsignedEvent) (*Ev
 		return nil, errors.New("not connected to bunker")
 	}
 
+	// Check rate limit
+	if err := s.checkSignRateLimit(); err != nil {
+		return nil, err
+	}
+
 	// Serialize event for signing
 	eventJSON, err := json.Marshal(event)
 	if err != nil {
@@ -219,7 +274,9 @@ func (s *BunkerSession) SignEvent(ctx context.Context, event UnsignedEvent) (*Ev
 func (s *BunkerSession) sendRequest(ctx context.Context, method string, params []string) (string, error) {
 	// Generate request ID
 	reqIDBytes := make([]byte, 8)
-	rand.Read(reqIDBytes)
+	if _, err := rand.Read(reqIDBytes); err != nil {
+		return "", fmt.Errorf("failed to generate request ID: %v", err)
+	}
 	reqID := hex.EncodeToString(reqIDBytes)
 
 	// Build request
@@ -397,8 +454,22 @@ func calculateEventID(event *Event) string {
 }
 
 func signEvent(privKeyBytes []byte, eventID string) string {
+	if len(privKeyBytes) == 0 {
+		log.Printf("Failed to sign event: empty private key")
+		return ""
+	}
+
 	privKey, _ := btcec.PrivKeyFromBytes(privKeyBytes)
-	eventIDBytes, _ := hex.DecodeString(eventID)
+	if privKey == nil {
+		log.Printf("Failed to sign event: invalid private key")
+		return ""
+	}
+
+	eventIDBytes, err := hex.DecodeString(eventID)
+	if err != nil {
+		log.Printf("Failed to sign event: invalid event ID hex: %v", err)
+		return ""
+	}
 
 	sig, err := schnorr.Sign(privKey, eventIDBytes)
 	if err != nil {
@@ -415,7 +486,11 @@ func mustJSON(v interface{}) string {
 }
 
 func escapeJSON(s string) string {
-	b, _ := json.Marshal(s)
+	b, err := json.Marshal(s)
+	if err != nil || len(b) < 2 {
+		// Fallback: return original string (shouldn't happen for valid strings)
+		return s
+	}
 	// Remove surrounding quotes
 	return string(b[1 : len(b)-1])
 }

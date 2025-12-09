@@ -302,7 +302,10 @@ func fetchUserPubKey(pending *PendingConnection, remoteSignerPubKeyHex string) {
 
 	// Send get_public_key request
 	reqIDBytes := make([]byte, 8)
-	rand.Read(reqIDBytes)
+	if _, err := rand.Read(reqIDBytes); err != nil {
+		log.Printf("NIP-46: Failed to generate request ID: %v", err)
+		return
+	}
 	reqID := hex.EncodeToString(reqIDBytes)
 
 	request := NIP46Request{
@@ -492,7 +495,9 @@ func TryReconnectToSigner(signerPubKeyHex string, relays []string) (*BunkerSessi
 	defer cancel()
 
 	reqIDBytes := make([]byte, 8)
-	rand.Read(reqIDBytes)
+	if _, err := rand.Read(reqIDBytes); err != nil {
+		return nil, fmt.Errorf("failed to generate request ID: %v", err)
+	}
 	reqID := hex.EncodeToString(reqIDBytes)
 
 	request := NIP46Request{

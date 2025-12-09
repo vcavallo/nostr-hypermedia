@@ -1,9 +1,14 @@
 package main
 
 import (
+	"context"
+	"errors"
+	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
+	"net/url"
 	"regexp"
 	"strings"
 	"sync"
@@ -27,25 +32,171 @@ var (
 	metaDescRegexAlt = regexp.MustCompile(`(?i)<meta[^>]*content=["']([^"']+)["'][^>]*name=["']description["']`)
 )
 
+// ssrfSafeDialer creates connections only to public IPs, preventing DNS rebinding attacks
+// by validating the IP at connection time rather than before the request.
+var ssrfSafeDialer = &net.Dialer{
+	Timeout:   5 * time.Second,
+	KeepAlive: 30 * time.Second,
+}
+
+// ssrfSafeDialContext resolves DNS and validates the IP is public before connecting.
+// This prevents DNS rebinding attacks by checking the IP at connection time.
+func ssrfSafeDialContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return nil, fmt.Errorf("invalid address: %w", err)
+	}
+
+	// Block localhost variations before DNS lookup
+	if host == "localhost" || host == "127.0.0.1" || host == "::1" {
+		return nil, errors.New("connection to localhost blocked")
+	}
+
+	// Block obvious internal names
+	if strings.HasSuffix(host, ".local") || strings.HasSuffix(host, ".internal") {
+		return nil, errors.New("connection to internal host blocked")
+	}
+
+	// Resolve DNS
+	ips, err := net.LookupIP(host)
+	if err != nil {
+		return nil, fmt.Errorf("DNS lookup failed: %w", err)
+	}
+
+	if len(ips) == 0 {
+		return nil, errors.New("no IP addresses found")
+	}
+
+	// Find a public IP to connect to
+	for _, ip := range ips {
+		if isPublicIP(ip) {
+			// Connect using the validated IP directly (no second DNS lookup)
+			return ssrfSafeDialer.DialContext(ctx, network, net.JoinHostPort(ip.String(), port))
+		}
+	}
+
+	return nil, errors.New("all resolved IPs are private/internal")
+}
+
 // HTTP client with timeout for fetching previews
+// Uses custom DialContext to prevent SSRF via DNS rebinding
 var previewHTTPClient = &http.Client{
 	Timeout: 5 * time.Second,
+	Transport: &http.Transport{
+		DialContext:           ssrfSafeDialContext,
+		MaxIdleConns:          10,
+		IdleConnTimeout:       30 * time.Second,
+		TLSHandshakeTimeout:   5 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+	},
 	CheckRedirect: func(req *http.Request, via []*http.Request) error {
 		if len(via) >= 3 {
 			return http.ErrUseLastResponse
 		}
+		// Note: redirect targets will be validated by ssrfSafeDialContext
+		// when the new connection is established
 		return nil
 	},
 }
 
+// isURLSafeForSSRF checks if a URL is safe to fetch (not pointing to private/internal IPs)
+func isURLSafeForSSRF(rawURL string) bool {
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return false
+	}
+
+	// Only allow http and https
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return false
+	}
+
+	host := parsed.Hostname()
+	if host == "" {
+		return false
+	}
+
+	// Block localhost variations
+	if host == "localhost" || host == "127.0.0.1" || host == "::1" {
+		return false
+	}
+
+	// Resolve the hostname to check actual IPs
+	ips, err := net.LookupIP(host)
+	if err != nil {
+		// If we can't resolve, allow it (might be valid external host)
+		// but block obvious internal names
+		if strings.HasSuffix(host, ".local") || strings.HasSuffix(host, ".internal") {
+			return false
+		}
+		return true
+	}
+
+	for _, ip := range ips {
+		if !isPublicIP(ip) {
+			return false
+		}
+	}
+
+	return true
+}
+
+// isPublicIP returns true if the IP is a public (non-private, non-reserved) address
+func isPublicIP(ip net.IP) bool {
+	if ip == nil {
+		return false
+	}
+
+	// Check for loopback
+	if ip.IsLoopback() {
+		return false
+	}
+
+	// Check for private networks
+	if ip.IsPrivate() {
+		return false
+	}
+
+	// Check for link-local (169.254.x.x for IPv4, fe80::/10 for IPv6)
+	if ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
+		return false
+	}
+
+	// Check for unspecified (0.0.0.0 or ::)
+	if ip.IsUnspecified() {
+		return false
+	}
+
+	// Block cloud metadata IPs explicitly
+	// AWS/GCP/Azure metadata: 169.254.169.254
+	metadataIP := net.ParseIP("169.254.169.254")
+	if ip.Equal(metadataIP) {
+		return false
+	}
+
+	// Block multicast
+	if ip.IsMulticast() {
+		return false
+	}
+
+	return true
+}
+
 // FetchLinkPreview fetches OG metadata from a URL
-func FetchLinkPreview(url string) *LinkPreview {
+func FetchLinkPreview(targetURL string) *LinkPreview {
 	preview := &LinkPreview{
-		URL:       url,
+		URL:       targetURL,
 		FetchedAt: time.Now(),
 	}
 
-	req, err := http.NewRequest("GET", url, nil)
+	// SSRF protection: validate URL before fetching
+	if !isURLSafeForSSRF(targetURL) {
+		log.Printf("Link preview blocked for SSRF risk: %s", targetURL)
+		preview.Failed = true
+		return preview
+	}
+
+	req, err := http.NewRequest("GET", targetURL, nil)
 	if err != nil {
 		preview.Failed = true
 		return preview
@@ -57,14 +208,14 @@ func FetchLinkPreview(url string) *LinkPreview {
 
 	resp, err := previewHTTPClient.Do(req)
 	if err != nil {
-		log.Printf("Link preview fetch failed for %s: %v", url, err)
+		log.Printf("Link preview fetch failed for %s: %v", targetURL, err)
 		preview.Failed = true
 		return preview
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		log.Printf("Link preview got status %d for %s", resp.StatusCode, url)
+		log.Printf("Link preview got status %d for %s", resp.StatusCode, targetURL)
 		preview.Failed = true
 		return preview
 	}

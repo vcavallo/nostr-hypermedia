@@ -254,3 +254,41 @@ func decodeNProfileTLV(data []byte) (*NProfile, error) {
 
 	return n, nil
 }
+
+// EncodeNAddr encodes an naddr from kind, pubkey (hex), and d-tag
+func EncodeNAddr(kind uint32, pubkeyHex string, dTag string) (string, error) {
+	pubkeyBytes, err := hex.DecodeString(pubkeyHex)
+	if err != nil {
+		return "", err
+	}
+	if len(pubkeyBytes) != 32 {
+		return "", errors.New("invalid pubkey length")
+	}
+
+	// Build TLV data
+	// NIP-19 specifies: Type 0 = d-tag, Type 2 = author, Type 3 = kind
+	var tlvData []byte
+
+	// D-tag (type 0/special): variable length - must be first per spec
+	dTagBytes := []byte(dTag)
+	tlvData = append(tlvData, tlvTypeSpecial, byte(len(dTagBytes)))
+	tlvData = append(tlvData, dTagBytes...)
+
+	// Author pubkey (type 2): 32 bytes
+	tlvData = append(tlvData, tlvTypeAuthor, 32)
+	tlvData = append(tlvData, pubkeyBytes...)
+
+	// Kind (type 3): 4 bytes big-endian
+	kindBytes := make([]byte, 4)
+	binary.BigEndian.PutUint32(kindBytes, kind)
+	tlvData = append(tlvData, tlvTypeKind, 4)
+	tlvData = append(tlvData, kindBytes...)
+
+	// Convert to 5-bit groups for bech32
+	data5bit, err := bech32ConvertBits(tlvData, 8, 5, true)
+	if err != nil {
+		return "", err
+	}
+
+	return bech32Encode("naddr", data5bit)
+}

@@ -2,21 +2,48 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"log"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
-	"github.com/gorilla/websocket"
+	"github.com/btcsuite/btcd/btcec/v2/schnorr"
 )
 
+// isCustomEmojiShortcode checks if a reaction is a custom emoji shortcode (:name:)
+// Custom emoji shortcodes can't be rendered as they require image URLs from emoji tags
+func isCustomEmojiShortcode(reaction string) bool {
+	return len(reaction) >= 3 && strings.HasPrefix(reaction, ":") && strings.HasSuffix(reaction, ":")
+}
+
+// shortID safely truncates an ID/pubkey for logging (returns first 12 chars or full string if shorter)
+func shortID(id string) string {
+	if len(id) >= 12 {
+		return id[:12]
+	}
+	return id
+}
+
+// truncateString truncates a string to maxLen characters to prevent memory abuse
+func truncateString(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	return s[:maxLen]
+}
+
 type Filter struct {
+	IDs     []string // Event IDs to fetch
 	Authors []string
 	Kinds   []int
 	Limit   int
 	Since   *int64
 	Until   *int64
+	PTags   []string // Filter by p-tag (events mentioning these pubkeys)
 }
 
 type Event struct {
@@ -31,6 +58,106 @@ type Event struct {
 }
 
 type NostrMessage []interface{}
+
+// parseEventFromInterface converts a map[string]interface{} to an Event struct
+// This avoids the Marshal/Unmarshal round-trip when parsing events from websocket messages
+func parseEventFromInterface(data interface{}) (Event, bool) {
+	m, ok := data.(map[string]interface{})
+	if !ok {
+		return Event{}, false
+	}
+
+	evt := Event{}
+
+	if id, ok := m["id"].(string); ok {
+		evt.ID = id
+	}
+	if pk, ok := m["pubkey"].(string); ok {
+		evt.PubKey = pk
+	}
+	if createdAt, ok := m["created_at"].(float64); ok {
+		evt.CreatedAt = int64(createdAt)
+	}
+	if kind, ok := m["kind"].(float64); ok {
+		evt.Kind = int(kind)
+	}
+	if content, ok := m["content"].(string); ok {
+		evt.Content = content
+	}
+	if sig, ok := m["sig"].(string); ok {
+		evt.Sig = sig
+	}
+
+	// Parse tags
+	if tags, ok := m["tags"].([]interface{}); ok {
+		evt.Tags = make([][]string, 0, len(tags))
+		for _, tag := range tags {
+			if tagArr, ok := tag.([]interface{}); ok {
+				strTag := make([]string, 0, len(tagArr))
+				for _, elem := range tagArr {
+					if s, ok := elem.(string); ok {
+						strTag = append(strTag, s)
+					}
+				}
+				evt.Tags = append(evt.Tags, strTag)
+			}
+		}
+	}
+
+	// Validate signature if present
+	if evt.Sig != "" && !validateEventSignature(&evt) {
+		log.Printf("Event signature validation failed for event %s", shortID(evt.ID))
+		return Event{}, false
+	}
+
+	return evt, evt.ID != ""
+}
+
+// validateEventSignature verifies that the event signature is valid for the pubkey
+func validateEventSignature(evt *Event) bool {
+	// Signature must be 128 hex characters (64 bytes)
+	if len(evt.Sig) != 128 {
+		return false
+	}
+
+	// Pubkey must be 64 hex characters (32 bytes)
+	if len(evt.PubKey) != 64 {
+		return false
+	}
+
+	// Decode the signature
+	sigBytes, err := hex.DecodeString(evt.Sig)
+	if err != nil {
+		return false
+	}
+
+	// Decode the pubkey
+	pubKeyBytes, err := hex.DecodeString(evt.PubKey)
+	if err != nil {
+		return false
+	}
+
+	// Decode the event ID (message that was signed)
+	idBytes, err := hex.DecodeString(evt.ID)
+	if err != nil {
+		return false
+	}
+
+	// Parse the Schnorr signature
+	sig, err := schnorr.ParseSignature(sigBytes)
+	if err != nil {
+		return false
+	}
+
+	// Parse the public key (x-only format for Schnorr)
+	pubKey, err := schnorr.ParsePubKey(pubKeyBytes)
+	if err != nil {
+		return false
+	}
+
+	// Verify the signature
+	return sig.Verify(idBytes, pubKey)
+}
 
 func fetchEventsFromRelays(relays []string, filter Filter) ([]Event, bool) {
 	return fetchEventsFromRelaysWithTimeout(relays, filter, 1500*time.Millisecond)
@@ -77,12 +204,21 @@ func fetchEventsFromRelaysWithTimeout(relays []string, filter Filter, timeout ti
 		close(eoseChan)
 	}()
 
-	// Collect events and dedupe - return early if we have enough
+	// Collect events and dedupe
+	// Wait for at least 2 relays to EOSE before considering timeout
 	seenIDs := make(map[string]bool)
 	events := []Event{}
 	targetCount := filter.Limit * 2 // Collect 2x limit to allow for deduplication
+	eoseCount := 0
+	minEOSE := 2
+	if len(relays) < minEOSE {
+		minEOSE = len(relays)
+	}
 
-	collectLoop:
+	// Grace period after we have enough EOSEs - collect remaining events briefly
+	var graceTimer <-chan time.Time
+
+collectLoop:
 	for {
 		select {
 		case evt, ok := <-eventChan:
@@ -99,27 +235,27 @@ func fetchEventsFromRelaysWithTimeout(relays []string, filter Filter, timeout ti
 					break collectLoop
 				}
 			}
+		case <-eoseChan:
+			eoseCount++
+			log.Printf("EOSE count: %d/%d relays", eoseCount, len(relays))
+			// Once we have enough EOSEs, start a short grace period
+			if eoseCount >= minEOSE && graceTimer == nil {
+				graceTimer = time.After(500 * time.Millisecond)
+			}
+			// If all relays sent EOSE, we're done
+			if eoseCount >= len(relays) {
+				log.Printf("All %d relays sent EOSE, got %d events", len(relays), len(events))
+				break collectLoop
+			}
+		case <-graceTimer:
+			log.Printf("Grace period ended after %d EOSEs, got %d events", eoseCount, len(events))
+			break collectLoop
 		case <-ctx.Done():
-			log.Printf("Context timeout, got %d events", len(events))
+			log.Printf("Context timeout, got %d events (EOSE from %d relays)", len(events), eoseCount)
 			break collectLoop
 		}
 	}
 
-	// Check if all relays sent EOSE (non-blocking drain)
-	eoseCount := 0
-	for {
-		select {
-		case _, ok := <-eoseChan:
-			if !ok {
-				goto sortEvents
-			}
-			eoseCount++
-		default:
-			goto sortEvents
-		}
-	}
-
-sortEvents:
 	allEOSE := eoseCount == len(relays)
 
 	// Sort by created_at DESC, then by ID DESC for tie-break
@@ -139,19 +275,13 @@ sortEvents:
 }
 
 func fetchFromRelay(ctx context.Context, relayURL string, filter Filter, eventChan chan<- Event, eoseChan chan<- bool) {
-	log.Printf("Connecting to relay: %s", relayURL)
-	conn, _, err := websocket.DefaultDialer.DialContext(ctx, relayURL, nil)
-	if err != nil {
-		log.Printf("Failed to connect to %s: %v", relayURL, err)
-		return
-	}
-	defer conn.Close()
-	log.Printf("Connected to relay: %s", relayURL)
-
-	// Build NIP-01 REQ message
+	// Build filter
 	subID := "sub-" + randomString(8)
 	reqFilter := map[string]interface{}{
 		"limit": filter.Limit,
+	}
+	if len(filter.IDs) > 0 {
+		reqFilter["ids"] = filter.IDs
 	}
 	if len(filter.Authors) > 0 {
 		reqFilter["authors"] = filter.Authors
@@ -165,57 +295,35 @@ func fetchFromRelay(ctx context.Context, relayURL string, filter Filter, eventCh
 	if filter.Until != nil {
 		reqFilter["until"] = *filter.Until
 	}
+	if len(filter.PTags) > 0 {
+		reqFilter["#p"] = filter.PTags
+	}
 
-	req := []interface{}{"REQ", subID, reqFilter}
-	if err := conn.WriteJSON(req); err != nil {
-		log.Printf("Failed to send REQ to %s: %v", relayURL, err)
+	// Subscribe using the pool
+	sub, err := relayPool.Subscribe(ctx, relayURL, subID, reqFilter)
+	if err != nil {
+		log.Printf("Failed to subscribe to %s: %v", relayURL, err)
 		return
 	}
+	defer relayPool.Unsubscribe(relayURL, sub)
 
 	// Read events until EOSE or context timeout
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		default:
-			var msg NostrMessage
-			if err := conn.ReadJSON(&msg); err != nil {
+		case <-sub.Done:
+			return
+		case evt := <-sub.EventChan:
+			select {
+			case eventChan <- evt:
+			case <-ctx.Done():
 				return
 			}
-
-			if len(msg) < 2 {
-				continue
-			}
-
-			msgType, ok := msg[0].(string)
-			if !ok {
-				continue
-			}
-
-			switch msgType {
-			case "EVENT":
-				if len(msg) >= 3 {
-					eventData, err := json.Marshal(msg[2])
-					if err != nil {
-						continue
-					}
-					var evt Event
-					if err := json.Unmarshal(eventData, &evt); err != nil {
-						continue
-					}
-					evt.RelaysSeen = []string{relayURL}
-
-					select {
-					case eventChan <- evt:
-					case <-ctx.Done():
-						return
-					}
-				}
-			case "EOSE":
-				log.Printf("Received EOSE from %s", relayURL)
-				eoseChan <- true
-				return
-			}
+		case <-sub.EOSEChan:
+			log.Printf("Received EOSE from %s", relayURL)
+			eoseChan <- true
+			return
 		}
 	}
 }
@@ -223,8 +331,16 @@ func fetchFromRelay(ctx context.Context, relayURL string, filter Filter, eventCh
 func randomString(n int) string {
 	const chars = "abcdefghijklmnopqrstuvwxyz0123456789"
 	b := make([]byte, n)
+	randomBytes := make([]byte, n)
+	if _, err := rand.Read(randomBytes); err != nil {
+		// Fallback to less random but functional string
+		for i := range b {
+			b[i] = chars[i%len(chars)]
+		}
+		return string(b)
+	}
 	for i := range b {
-		b[i] = chars[time.Now().UnixNano()%int64(len(chars))]
+		b[i] = chars[int(randomBytes[i])%len(chars)]
 	}
 	return string(b)
 }
@@ -265,70 +381,42 @@ func fetchEventByID(relays []string, eventID string) []Event {
 }
 
 func fetchSingleEvent(ctx context.Context, relayURL string, eventID string, eventChan chan<- Event) {
-	conn, _, err := websocket.DefaultDialer.DialContext(ctx, relayURL, nil)
-	if err != nil {
-		return
-	}
-	defer conn.Close()
-
-	subID := "sub-" + randomString(8)
+	subID := "single-" + randomString(8)
 	reqFilter := map[string]interface{}{
 		"ids":   []string{eventID},
 		"limit": 1,
 	}
 
-	req := []interface{}{"REQ", subID, reqFilter}
-	if err := conn.WriteJSON(req); err != nil {
+	sub, err := relayPool.Subscribe(ctx, relayURL, subID, reqFilter)
+	if err != nil {
 		return
 	}
+	defer relayPool.Unsubscribe(relayURL, sub)
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		default:
-			var msg NostrMessage
-			if err := conn.ReadJSON(&msg); err != nil {
+		case <-sub.Done:
+			return
+		case evt := <-sub.EventChan:
+			select {
+			case eventChan <- evt:
+			case <-ctx.Done():
 				return
 			}
-
-			if len(msg) < 2 {
-				continue
-			}
-
-			msgType, ok := msg[0].(string)
-			if !ok {
-				continue
-			}
-
-			switch msgType {
-			case "EVENT":
-				if len(msg) >= 3 {
-					eventData, err := json.Marshal(msg[2])
-					if err != nil {
-						continue
-					}
-					var evt Event
-					if err := json.Unmarshal(eventData, &evt); err != nil {
-						continue
-					}
-					evt.RelaysSeen = []string{relayURL}
-
-					select {
-					case eventChan <- evt:
-					case <-ctx.Done():
-						return
-					}
-				}
-			case "EOSE":
-				return
-			}
+		case <-sub.EOSEChan:
+			return
 		}
 	}
 }
 
+// Specialized relay for profile lookups - has better coverage for kind 0 events
+const profileRelay = "wss://purplepag.es"
+
 // fetchProfiles fetches kind 0 (profile metadata) events for the given pubkeys
 // Uses the global profileCache to avoid redundant relay queries
+// Tries purplepag.es first for faster lookups, falls back to provided relays
 func fetchProfiles(relays []string, pubkeys []string) map[string]*ProfileInfo {
 	if len(pubkeys) == 0 {
 		return nil
@@ -342,15 +430,46 @@ func fetchProfiles(relays []string, pubkeys []string) map[string]*ProfileInfo {
 	}
 	log.Printf("Profile cache: %d hits, %d misses", len(cached), len(missing))
 
-	// Fetch only missing profiles from relays
+	// Build filter for missing profiles
 	filter := Filter{
 		Authors: missing,
 		Kinds:   []int{0},
 		Limit:   len(missing),
 	}
 
-	// Profile timeout - balance between speed and completeness
-	events, _ := fetchEventsFromRelaysWithTimeout(relays, filter, 2500*time.Millisecond)
+	// Try purplepag.es first with a short timeout (specialized profile relay)
+	var events []Event
+	purpleEvents, _ := fetchEventsFromRelaysWithTimeout([]string{profileRelay}, filter, 1500*time.Millisecond)
+	events = append(events, purpleEvents...)
+
+	// Check which pubkeys we still need
+	foundPubkeys := make(map[string]bool)
+	for _, evt := range events {
+		if evt.Kind == 0 {
+			foundPubkeys[evt.PubKey] = true
+		}
+	}
+
+	// Fall back to other relays for any still-missing profiles
+	var stillMissing []string
+	for _, pk := range missing {
+		if !foundPubkeys[pk] {
+			stillMissing = append(stillMissing, pk)
+		}
+	}
+
+	if len(stillMissing) > 0 {
+		log.Printf("purplepag.es found %d/%d profiles, falling back to relays for %d", len(foundPubkeys), len(missing), len(stillMissing))
+		fallbackFilter := Filter{
+			Authors: stillMissing,
+			Kinds:   []int{0},
+			Limit:   len(stillMissing),
+		}
+		fallbackEvents, _ := fetchEventsFromRelaysWithTimeout(relays, fallbackFilter, 2000*time.Millisecond)
+		events = append(events, fallbackEvents...)
+	} else {
+		log.Printf("purplepag.es found all %d profiles", len(missing))
+	}
 
 	// Parse profile content and build map
 	freshProfiles := make(map[string]*ProfileInfo)
@@ -370,19 +489,19 @@ func fetchProfiles(relays []string, pubkeys []string) map[string]*ProfileInfo {
 
 		profile := &ProfileInfo{}
 		if name, ok := profileData["name"].(string); ok {
-			profile.Name = name
+			profile.Name = truncateString(name, 100)
 		}
 		if displayName, ok := profileData["display_name"].(string); ok {
-			profile.DisplayName = displayName
+			profile.DisplayName = truncateString(displayName, 100)
 		}
 		if picture, ok := profileData["picture"].(string); ok {
-			profile.Picture = picture
+			profile.Picture = truncateString(picture, 500)
 		}
 		if nip05, ok := profileData["nip05"].(string); ok {
-			profile.Nip05 = nip05
+			profile.Nip05 = truncateString(nip05, 200)
 		}
 		if about, ok := profileData["about"].(string); ok {
-			profile.About = about
+			profile.About = truncateString(about, 1000)
 		}
 
 		freshProfiles[evt.PubKey] = profile
@@ -412,6 +531,12 @@ func fetchReactions(relays []string, eventIDs []string) map[string]*ReactionsSum
 		return nil
 	}
 
+	// Build a set for O(1) lookup instead of O(n) array scan
+	eventIDSet := make(map[string]bool, len(eventIDs))
+	for _, id := range eventIDs {
+		eventIDSet[id] = true
+	}
+
 	// Fetch reactions referencing the event IDs via #e tag filter
 	events, _ := fetchEventsFromRelaysWithETags(relays, eventIDs)
 
@@ -434,15 +559,8 @@ func fetchReactions(relays []string, eventIDs []string) map[string]*ReactionsSum
 			continue
 		}
 
-		// Check if this event ID is in our list
-		found := false
-		for _, id := range eventIDs {
-			if id == targetEventID {
-				found = true
-				break
-			}
-		}
-		if !found {
+		// Check if this event ID is in our set (O(1) lookup)
+		if !eventIDSet[targetEventID] {
 			continue
 		}
 
@@ -462,6 +580,10 @@ func fetchReactions(relays []string, eventIDs []string) map[string]*ReactionsSum
 		// Normalize "+" and empty to "❤️" (like/heart)
 		if reactionType == "" || reactionType == "+" {
 			reactionType = "❤️"
+		}
+		// Skip custom emoji shortcodes (e.g., :amy:, :turtlehappy_sm:) that can't be rendered
+		if isCustomEmojiShortcode(reactionType) {
+			continue
 		}
 		summary.ByType[reactionType]++
 	}
@@ -514,88 +636,44 @@ collectLoop:
 		}
 	}
 
-	// Non-blocking drain of eoseChan
-	eoseCount := 0
-	for {
-		select {
-		case _, ok := <-eoseChan:
-			if !ok {
-				goto returnResults
-			}
-			eoseCount++
-		default:
-			goto returnResults
-		}
-	}
+	// Drain eoseChan - count how many relays sent EOSE
+	// Use len() to get buffered count since channel is buffered
+	eoseCount := len(eoseChan)
 
-returnResults:
 	return events, eoseCount == len(relays)
 }
 
 func fetchReactionsFromRelay(ctx context.Context, relayURL string, eventIDs []string, eventChan chan<- Event, eoseChan chan<- bool) {
-	conn, _, err := websocket.DefaultDialer.DialContext(ctx, relayURL, nil)
-	if err != nil {
-		log.Printf("Failed to connect to %s: %v", relayURL, err)
-		return
-	}
-	defer conn.Close()
-
-	subID := "sub-" + randomString(8)
+	subID := "react-" + randomString(8)
 	reqFilter := map[string]interface{}{
 		"kinds": []int{7},
 		"#e":    eventIDs,
 		"limit": 500,
 	}
 
-	req := []interface{}{"REQ", subID, reqFilter}
-	if err := conn.WriteJSON(req); err != nil {
-		log.Printf("Failed to send REQ to %s: %v", relayURL, err)
+	sub, err := relayPool.Subscribe(ctx, relayURL, subID, reqFilter)
+	if err != nil {
+		log.Printf("Failed to subscribe to %s for reactions: %v", relayURL, err)
 		return
 	}
+	defer relayPool.Unsubscribe(relayURL, sub)
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		default:
-			var msg NostrMessage
-			if err := conn.ReadJSON(&msg); err != nil {
+		case <-sub.Done:
+			return
+		case evt := <-sub.EventChan:
+			select {
+			case eventChan <- evt:
+			case <-ctx.Done():
 				return
 			}
-
-			if len(msg) < 2 {
-				continue
-			}
-
-			msgType, ok := msg[0].(string)
-			if !ok {
-				continue
-			}
-
-			switch msgType {
-			case "EVENT":
-				if len(msg) >= 3 {
-					eventData, err := json.Marshal(msg[2])
-					if err != nil {
-						continue
-					}
-					var evt Event
-					if err := json.Unmarshal(eventData, &evt); err != nil {
-						continue
-					}
-					evt.RelaysSeen = []string{relayURL}
-
-					select {
-					case eventChan <- evt:
-					case <-ctx.Done():
-						return
-					}
-				}
-			case "EOSE":
-				log.Printf("Received EOSE from %s", relayURL)
-				eoseChan <- true
-				return
-			}
+		case <-sub.EOSEChan:
+			log.Printf("Received EOSE from %s", relayURL)
+			eoseChan <- true
+			return
 		}
 	}
 }
@@ -650,13 +728,6 @@ collectLoop:
 }
 
 func fetchRepliesFromRelay(ctx context.Context, relayURL string, eventIDs []string, eventChan chan<- Event) {
-	conn, _, err := websocket.DefaultDialer.DialContext(ctx, relayURL, nil)
-	if err != nil {
-		log.Printf("Failed to connect to %s for replies: %v", relayURL, err)
-		return
-	}
-	defer conn.Close()
-
 	subID := "replies-" + randomString(8)
 	reqFilter := map[string]interface{}{
 		"kinds": []int{1}, // Kind 1 = notes/replies
@@ -664,55 +735,28 @@ func fetchRepliesFromRelay(ctx context.Context, relayURL string, eventIDs []stri
 		"limit": 100,
 	}
 
-	req := []interface{}{"REQ", subID, reqFilter}
-	if err := conn.WriteJSON(req); err != nil {
-		log.Printf("Failed to send REQ to %s: %v", relayURL, err)
+	sub, err := relayPool.Subscribe(ctx, relayURL, subID, reqFilter)
+	if err != nil {
+		log.Printf("Failed to subscribe to %s for replies: %v", relayURL, err)
 		return
 	}
+	defer relayPool.Unsubscribe(relayURL, sub)
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		default:
-			conn.SetReadDeadline(time.Now().Add(3 * time.Second))
-			var msg NostrMessage
-			if err := conn.ReadJSON(&msg); err != nil {
+		case <-sub.Done:
+			return
+		case evt := <-sub.EventChan:
+			select {
+			case eventChan <- evt:
+			case <-ctx.Done():
 				return
 			}
-
-			if len(msg) < 2 {
-				continue
-			}
-
-			msgType, ok := msg[0].(string)
-			if !ok {
-				continue
-			}
-
-			switch msgType {
-			case "EVENT":
-				if len(msg) >= 3 {
-					eventData, err := json.Marshal(msg[2])
-					if err != nil {
-						continue
-					}
-					var evt Event
-					if err := json.Unmarshal(eventData, &evt); err != nil {
-						continue
-					}
-					evt.RelaysSeen = []string{relayURL}
-
-					select {
-					case eventChan <- evt:
-					case <-ctx.Done():
-						return
-					}
-				}
-			case "EOSE":
-				log.Printf("Received EOSE for replies from %s", relayURL)
-				return
-			}
+		case <-sub.EOSEChan:
+			log.Printf("Received EOSE for replies from %s", relayURL)
+			return
 		}
 	}
 }
@@ -782,7 +826,18 @@ type RelayList struct {
 }
 
 // fetchRelayList fetches a user's kind:10002 relay list metadata
+// Uses global cache to avoid repeated lookups
 func fetchRelayList(pubkey string) *RelayList {
+	// Check cache first
+	if relayList, notFound, ok := relayListCache.Get(pubkey); ok {
+		if notFound {
+			log.Printf("Relay list cache hit (not found) for %s", shortID(pubkey))
+			return nil
+		}
+		log.Printf("Relay list cache hit for %s", shortID(pubkey))
+		return relayList
+	}
+
 	// Use well-known indexer relays to find relay lists
 	indexerRelays := []string{
 		"wss://purplepag.es",
@@ -798,7 +853,9 @@ func fetchRelayList(pubkey string) *RelayList {
 
 	events, _ := fetchEventsFromRelaysWithTimeout(indexerRelays, filter, 2*time.Second)
 	if len(events) == 0 {
-		log.Printf("No relay list found for %s", pubkey[:12])
+		log.Printf("No relay list found for %s", shortID(pubkey))
+		// Cache the "not found" result
+		relayListCache.Set(pubkey, nil)
 		return nil
 	}
 
@@ -831,7 +888,11 @@ func fetchRelayList(pubkey string) *RelayList {
 		}
 	}
 
-	log.Printf("Found relay list for %s: %d read, %d write relays", pubkey[:12], len(relayList.Read), len(relayList.Write))
+	log.Printf("Found relay list for %s: %d read, %d write relays", shortID(pubkey), len(relayList.Read), len(relayList.Write))
+
+	// Cache the result
+	relayListCache.Set(pubkey, relayList)
+
 	return relayList
 }
 
@@ -845,7 +906,7 @@ func fetchContactList(relays []string, pubkey string) []string {
 
 	events, _ := fetchEventsFromRelaysWithTimeout(relays, filter, 3*time.Second)
 	if len(events) == 0 {
-		log.Printf("No contact list found for %s", pubkey[:12])
+		log.Printf("No contact list found for %s", shortID(pubkey))
 		return nil
 	}
 
@@ -857,6 +918,131 @@ func fetchContactList(relays []string, pubkey string) []string {
 		}
 	}
 
-	log.Printf("Found %d contacts for %s", len(contacts), pubkey[:12])
+	log.Printf("Found %d contacts for %s", len(contacts), shortID(pubkey))
 	return contacts
+}
+
+// NotificationType indicates what kind of notification this is
+type NotificationType string
+
+const (
+	NotificationMention NotificationType = "mention"
+	NotificationReply   NotificationType = "reply"
+	NotificationReaction NotificationType = "reaction"
+	NotificationRepost  NotificationType = "repost"
+)
+
+// Notification represents a notification event with its type
+type Notification struct {
+	Event   Event
+	Type    NotificationType
+	// For reactions/reposts, this is the event being reacted to/reposted
+	TargetEventID string
+}
+
+// fetchNotifications fetches notifications for a user (events where they are p-tagged)
+// Returns mentions (kind 1), replies (kind 1 with e-tag), reactions (kind 7), and reposts (kind 6)
+// If until is provided, only fetches events before that timestamp (for pagination)
+func fetchNotifications(relays []string, userPubkey string, limit int, until *int64) []Notification {
+	// Fetch events where user is p-tagged
+	// kinds: 1 (mentions/replies), 6 (reposts), 7 (reactions)
+	filter := Filter{
+		PTags: []string{userPubkey},
+		Kinds: []int{1, 6, 7},
+		Limit: limit * 2, // Fetch more to filter out self-notifications
+		Until: until,
+	}
+
+	events, _ := fetchEventsFromRelaysWithTimeout(relays, filter, 3*time.Second)
+
+	// Convert to notifications, filtering out self-notifications
+	notifications := make([]Notification, 0, len(events))
+	for _, evt := range events {
+		// Skip events from the user themselves
+		if evt.PubKey == userPubkey {
+			continue
+		}
+
+		notif := Notification{
+			Event: evt,
+		}
+
+		switch evt.Kind {
+		case 1:
+			// Check if it's a reply (has e-tag) or a mention
+			hasETag := false
+			for _, tag := range evt.Tags {
+				if len(tag) >= 2 && tag[0] == "e" {
+					hasETag = true
+					notif.TargetEventID = tag[1]
+					break
+				}
+			}
+			if hasETag {
+				notif.Type = NotificationReply
+			} else {
+				notif.Type = NotificationMention
+			}
+
+		case 6:
+			notif.Type = NotificationRepost
+			// Get the reposted event ID from e-tag
+			for _, tag := range evt.Tags {
+				if len(tag) >= 2 && tag[0] == "e" {
+					notif.TargetEventID = tag[1]
+					break
+				}
+			}
+
+		case 7:
+			notif.Type = NotificationReaction
+			// Get the reacted event ID from e-tag
+			for _, tag := range evt.Tags {
+				if len(tag) >= 2 && tag[0] == "e" {
+					notif.TargetEventID = tag[1]
+					break
+				}
+			}
+		}
+
+		notifications = append(notifications, notif)
+	}
+
+	// Apply limit after filtering
+	if len(notifications) > limit {
+		notifications = notifications[:limit]
+	}
+
+	log.Printf("Fetched %d notifications for %s", len(notifications), shortID(userPubkey))
+	return notifications
+}
+
+// hasUnreadNotifications checks if there are any notifications newer than the lastSeen timestamp
+// This does a quick check by fetching just a few recent events
+func hasUnreadNotifications(relays []string, userPubkey string, lastSeen int64) bool {
+	// If lastSeen is 0, there are unread notifications (user hasn't visited yet)
+	if lastSeen == 0 {
+		return true
+	}
+
+	filter := Filter{
+		PTags: []string{userPubkey},
+		Kinds: []int{1, 6, 7}, // Notes, reposts, reactions
+		Limit: 5,              // Just check a few recent events
+	}
+
+	events, _ := fetchEventsFromRelaysWithTimeout(relays, filter, 2*time.Second)
+
+	for _, ev := range events {
+		// Skip self-notifications
+		if ev.PubKey == userPubkey {
+			continue
+		}
+		// If any event is newer than lastSeen, we have unread notifications
+		if ev.CreatedAt > lastSeen {
+			return true
+		}
+	}
+
+	return false
 }

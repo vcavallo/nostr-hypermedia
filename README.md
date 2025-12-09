@@ -13,6 +13,13 @@ Maintains long-lived WebSocket connections to Nostr relays and exposes events ov
   - **Zero-JS HTML client** - Pure server-rendered HTML, works without JavaScript
 - **Zero-trust authentication** - NIP-46 remote signing (your keys never touch the server)
 - **Thread views** - View notes with their replies
+- **Profile pages** - View user profiles with follow/unfollow
+- **Profile editing** - Update your display name, about, avatar, and banner
+- **Notifications** - View mentions, replies, reactions, reposts, and zaps
+- **Social actions** - React, reply, repost, quote, bookmark, and follow
+- **Multiple content types** - Notes, photos, longform articles, highlights, and livestreams
+- **Link previews** - Rich Open Graph previews for shared URLs
+- **Theme switching** - Light and dark mode support
 - **Profile enrichment** - Author names/pictures fetched and cached
 - **Reactions & reply counts** - See engagement on notes
 - **Multiple response formats** - JSON, Siren (HATEOAS), or HTML based on Accept header
@@ -53,7 +60,15 @@ A **pure HTML hypermedia client** that:
 - **NIP-46 authentication** - Login with remote signers (nsec.app, Amber)
 - **Post notes** - Create and publish notes without JavaScript
 - **Reply to threads** - Participate in conversations
-- **Reactions** - React to notes with a single click
+- **Reactions** - React to notes with '+' button
+- **Reposts & quotes** - Share notes with optional commentary
+- **Bookmarks** - Save notes for later (kind 10003)
+- **Follow/unfollow** - Manage your social graph
+- **Profile editing** - Update display name, about, avatar, banner
+- **Notifications** - View mentions, replies, reactions, reposts, zaps
+- **Content filtering** - Filter by notes, photos, longform, highlights, livestreams
+- **Theme switching** - Toggle between light and dark modes
+- **Link previews** - Rich previews for shared URLs
 
 Both clients follow the same hypermedia principles: links and actions are discovered from server responses, not hardcoded.
 
@@ -123,6 +138,42 @@ Reply to a note (requires login). Form fields: `content`, `event_id`, `event_pub
 ### `POST /html/react`
 
 React to a note (requires login). Form fields: `event_id`, `event_pubkey`, `return_url`.
+
+### `POST /html/bookmark`
+
+Bookmark a note (requires login). Form fields: `event_id`, `return_url`.
+
+### `POST /html/repost`
+
+Repost a note (requires login). Form fields: `event_id`, `event_pubkey`, `return_url`.
+
+### `GET /html/quote/{eventId}`
+
+Quote form for composing a quote post. Shows original note with compose area.
+
+### `POST /html/follow`
+
+Follow or unfollow a user (requires login). Form fields: `pubkey`, `action` (follow/unfollow), `return_url`.
+
+### `GET /html/profile/edit`
+
+Edit your profile (requires login). Form to update display name, about, avatar URL, and banner URL.
+
+### `GET /html/notifications`
+
+View your notifications (requires login). Shows mentions, replies, reactions, reposts, and zaps.
+
+### `GET /html/theme`
+
+Toggle between light and dark themes. Stores preference in cookie.
+
+### `GET /html/check-connection`
+
+Check NIP-46 connection status. Returns connection health info.
+
+### `GET /html/reconnect`
+
+Attempt to reconnect NIP-46 session if disconnected.
 
 **Query Parameters (timeline):**
 - `relays` - Comma-separated relay URLs (default uses user's NIP-65 relays if logged in, otherwise defaults)
@@ -268,15 +319,17 @@ curl -H 'If-None-Match: "4bff5e5ea3f03f38"' http://localhost:3000/timeline?kinds
 **Server:**
 - `main.go` - HTTP server and routes
 - `handlers.go` - Timeline endpoint and response building
-- `html_handlers.go` - Server-side HTML rendering for timeline/threads/profiles
-- `html_auth.go` - NIP-46 login/logout/post/reply/react handlers
+- `html_handlers.go` - Server-side HTML rendering for timeline/threads/profiles/notifications
+- `html_auth.go` - NIP-46 login/logout/post/reply/react/bookmark/repost/follow handlers
 - `relay.go` - WebSocket client, fan-out, dedup, EOSE handling
 - `siren.go` - Hypermedia (Siren) format conversion
-- `html.go` - HTML template rendering
+- `html.go` - HTML template rendering with embedded CSS
 - `nip46.go` - NIP-46 bunker client (remote signing)
 - `nip44.go` - NIP-44 encryption (ChaCha20 + HMAC-SHA256)
 - `nostrconnect.go` - Nostr Connect flow (`nostrconnect://` URI handling)
-- `cache.go` - In-memory caching for events and contacts
+- `cache.go` - In-memory caching for events, contacts, profiles, relay lists, link previews
+- `link_preview.go` - Open Graph metadata fetching for link previews
+- `bech32.go` - Bech32 encoding/decoding (npub, naddr, etc.)
 
 **Clients:**
 - `static/index.html` - JS Siren browser entry point
@@ -312,7 +365,18 @@ curl -H 'If-None-Match: "4bff5e5ea3f03f38"' http://localhost:3000/timeline?kinds
 - [x] Nostr Connect flow (QR code / `nostrconnect://` URI)
 - [x] In-memory event caching for performance
 
-### Phase 4
+### Phase 4 (In Progress)
+- [x] Follow/unfollow users
+- [x] Bookmarks (kind 10003)
+- [x] Reposts (kind 6)
+- [x] Quote posts (kind 1 with q tag)
+- [x] Profile editing (kind 0)
+- [x] Notifications page (mentions, replies, reactions, reposts, zaps)
+- [x] Content type filtering (notes, photos, longform, highlights, livestreams)
+- [x] Livestream support (kind 30311)
+- [x] Theme switching (light/dark mode)
+- [x] Link previews (Open Graph metadata)
+- [x] Connection health monitoring
 - [ ] SSE endpoint for live updates (`/stream/timeline`)
 - [ ] Search endpoint (NIP-50)
 - [ ] Relay health tracking and scoring

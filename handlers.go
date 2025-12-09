@@ -39,6 +39,9 @@ type ProfileInfo struct {
 	Picture     string `json:"picture,omitempty"`
 	Nip05       string `json:"nip05,omitempty"`
 	About       string `json:"about,omitempty"`
+	Banner      string `json:"banner,omitempty"`
+	Lud16       string `json:"lud16,omitempty"`
+	Website     string `json:"website,omitempty"`
 }
 
 type ReactionsSummary struct {
@@ -122,10 +125,11 @@ func timelineHandler(w http.ResponseWriter, r *http.Request) {
 	log.Printf("Fetched %d events in %v (eose=%v)", len(events), time.Since(start), eose)
 
 	// Filter out replies (events with e tags) from main timeline
+	// Note: kind 6 (reposts) use e tags to reference the reposted event, not as replies
 	if noReplies {
 		filtered := make([]Event, 0, len(events))
 		for _, evt := range events {
-			if !isReply(evt) {
+			if !isReply(evt) || evt.Kind == 6 {
 				filtered = append(filtered, evt)
 			}
 		}
@@ -133,14 +137,37 @@ func timelineHandler(w http.ResponseWriter, r *http.Request) {
 		log.Printf("After filtering replies: %d events", len(events))
 	}
 
+	// Filter out kind 30311 (live events) that don't have a streaming or recording URL
+	// These are non-video "live activities" like game presence, not actual streams to watch
+	{
+		filtered := make([]Event, 0, len(events))
+		for _, evt := range events {
+			if evt.Kind == 30311 {
+				hasStreamingURL := false
+				for _, tag := range evt.Tags {
+					if len(tag) >= 2 && (tag[0] == "streaming" || tag[0] == "recording") && tag[1] != "" {
+						hasStreamingURL = true
+						break
+					}
+				}
+				if !hasStreamingURL {
+					continue // Skip non-streaming live events
+				}
+			}
+			filtered = append(filtered, evt)
+		}
+		if len(filtered) != len(events) {
+			log.Printf("After filtering non-streaming live events: %d events (removed %d)", len(filtered), len(events)-len(filtered))
+		}
+		events = filtered
+	}
+
 	// Collect unique pubkeys and event IDs for enrichment
 	pubkeySet := make(map[string]bool)
 	eventIDs := make([]string, 0, len(events))
 	for _, evt := range events {
-		if evt.Kind == 1 { // Only for notes
-			pubkeySet[evt.PubKey] = true
-			eventIDs = append(eventIDs, evt.ID)
-		}
+		pubkeySet[evt.PubKey] = true
+		eventIDs = append(eventIDs, evt.ID)
 	}
 
 	profiles := make(map[string]*ProfileInfo)

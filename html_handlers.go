@@ -5,11 +5,37 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 )
+
+// getNotificationsLastSeen gets the notifications_last_seen timestamp from cookie
+func getNotificationsLastSeen(r *http.Request) int64 {
+	cookie, err := r.Cookie("notifications_last_seen")
+	if err != nil {
+		return 0
+	}
+	ts, err := strconv.ParseInt(cookie.Value, 10, 64)
+	if err != nil {
+		return 0
+	}
+	return ts
+}
+
+// checkUnreadNotifications checks if a logged-in user has unread notifications
+// Returns false if user is not logged in
+func checkUnreadNotifications(r *http.Request, session *BunkerSession, relays []string) bool {
+	if session == nil || !session.Connected || session.UserPubKey == nil {
+		return false
+	}
+	pubkeyHex := hex.EncodeToString(session.UserPubKey)
+	lastSeen := getNotificationsLastSeen(r)
+	return hasUnreadNotifications(relays, pubkeyHex, lastSeen)
+}
 
 func htmlTimelineHandler(w http.ResponseWriter, r *http.Request) {
 	// Parse query parameters (same as JSON handler)
@@ -20,7 +46,7 @@ func htmlTimelineHandler(w http.ResponseWriter, r *http.Request) {
 
 	relays := parseStringList(q.Get("relays"))
 	if len(relays) == 0 {
-		// Use user's write relays if logged in and have a relay list (NIP-65)
+		// Use user's read relays if logged in and have a relay list (NIP-65)
 		if session != nil && session.Connected {
 			// If relay list not fetched yet, try to fetch it now
 			if session.UserRelayList == nil && session.UserPubKey != nil {
@@ -34,9 +60,9 @@ func htmlTimelineHandler(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 
-			if session.UserRelayList != nil && len(session.UserRelayList.Write) > 0 {
-				relays = session.UserRelayList.Write
-				log.Printf("Using user's %d write relays from NIP-65", len(relays))
+			if session.UserRelayList != nil && len(session.UserRelayList.Read) > 0 {
+				relays = session.UserRelayList.Read
+				log.Printf("Using user's %d read relays from NIP-65", len(relays))
 			}
 		}
 
@@ -92,6 +118,33 @@ func htmlTimelineHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// If feed=me, show only the user's own notes
+	if feedMode == "me" && session != nil && session.Connected && len(authors) == 0 {
+		pubkeyHex := hex.EncodeToString(session.UserPubKey)
+		authors = []string{pubkeyHex}
+		log.Printf("Showing notes for user %s", pubkeyHex[:12])
+	}
+
+	// Special handling for bookmarks (kind 10003)
+	// When kinds=10003, we need to fetch the user's bookmark list and then fetch the bookmarked events
+	var bookmarkedEventIDs []string
+	isBookmarksView := len(kinds) == 1 && kinds[0] == 10003
+	if isBookmarksView && session != nil && session.Connected {
+		pubkeyHex := hex.EncodeToString(session.UserPubKey)
+		bookmarkEvents := fetchKind10003(relays, pubkeyHex)
+		if len(bookmarkEvents) > 0 {
+			// Extract event IDs from e tags
+			for _, tag := range bookmarkEvents[0].Tags {
+				if len(tag) >= 2 && tag[0] == "e" {
+					bookmarkedEventIDs = append(bookmarkedEventIDs, tag[1])
+				}
+			}
+			log.Printf("Found %d bookmarked events for user %s", len(bookmarkedEventIDs), pubkeyHex[:12])
+		}
+		// Clear the kinds filter - we'll fetch the actual events by ID
+		kinds = nil
+	}
+
 	// Check if we should filter out replies (default to true like JSON handler)
 	noReplies := q.Get("no_replies") != "0"
 
@@ -101,22 +154,38 @@ func htmlTimelineHandler(w http.ResponseWriter, r *http.Request) {
 		fetchLimit = limit * 5 // Fetch 5x to compensate for reply filtering
 	}
 
-	filter := Filter{
-		Authors: authors,
-		Kinds:   kinds,
-		Limit:   fetchLimit,
-		Since:   since,
-		Until:   until,
+	var events []Event
+	var eose bool
+
+	// Special case: fetch bookmarked events by ID
+	if isBookmarksView && len(bookmarkedEventIDs) > 0 {
+		filter := Filter{
+			IDs:   bookmarkedEventIDs,
+			Limit: len(bookmarkedEventIDs),
+		}
+		events, eose = fetchEventsFromRelaysCached(relays, filter)
+		log.Printf("Fetched %d bookmarked events", len(events))
+	} else if isBookmarksView {
+		// No bookmarks found
+		events = []Event{}
+		eose = true
+	} else {
+		filter := Filter{
+			Authors: authors,
+			Kinds:   kinds,
+			Limit:   fetchLimit,
+			Since:   since,
+			Until:   until,
+		}
+		events, eose = fetchEventsFromRelaysCached(relays, filter)
 	}
 
-	// Fetch events from relays (with caching)
-	events, eose := fetchEventsFromRelaysCached(relays, filter)
-
 	// Filter out replies (events with e tags) from main timeline
+	// Note: kind 6 (reposts) use e tags to reference the reposted event, not as replies
 	if noReplies {
 		filtered := make([]Event, 0, len(events))
 		for _, evt := range events {
-			if !isReply(evt) {
+			if !isReply(evt) || evt.Kind == 6 {
 				filtered = append(filtered, evt)
 			}
 		}
@@ -127,16 +196,36 @@ func htmlTimelineHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Filter out kind 30311 (live events) that don't have a streaming or recording URL
+	// These are non-video "live activities" like game presence, not actual streams to watch
+	{
+		filtered := make([]Event, 0, len(events))
+		for _, evt := range events {
+			if evt.Kind == 30311 {
+				hasStreamingURL := false
+				for _, tag := range evt.Tags {
+					if len(tag) >= 2 && (tag[0] == "streaming" || tag[0] == "recording") && tag[1] != "" {
+						hasStreamingURL = true
+						break
+					}
+				}
+				if !hasStreamingURL {
+					continue // Skip non-streaming live events
+				}
+			}
+			filtered = append(filtered, evt)
+		}
+		events = filtered
+	}
+
 	// Collect unique pubkeys and event IDs for enrichment
 	pubkeySet := make(map[string]bool)
 	eventIDs := make([]string, 0, len(events))
 	contents := make([]string, 0, len(events))
 	for _, evt := range events {
-		if evt.Kind == 1 { // Only for notes
-			pubkeySet[evt.PubKey] = true
-			eventIDs = append(eventIDs, evt.ID)
-			contents = append(contents, evt.Content)
-		}
+		pubkeySet[evt.PubKey] = true
+		eventIDs = append(eventIDs, evt.ID)
+		contents = append(contents, evt.Content)
 	}
 
 	// Also collect pubkeys from npub/nprofile mentions in content
@@ -223,6 +312,10 @@ func htmlTimelineHandler(w http.ResponseWriter, r *http.Request) {
 		}
 		nextURL += "&feed=" + feedMode
 		resp.Page.Next = &nextURL
+
+		// Prefetch next page in background to warm the cache
+		// This makes clicking "Older →" feel instant
+		go prefetchNextPage(relays, authors, kinds, limit, lastCreatedAt, noReplies)
 	}
 
 	// Get query params for messages (session already fetched at start)
@@ -232,8 +325,20 @@ func htmlTimelineHandler(w http.ResponseWriter, r *http.Request) {
 	// Build current URL for reaction redirects
 	currentURL := r.URL.Path + "?" + r.URL.RawQuery
 
+	// Get theme from cookie
+	themeClass, themeLabel := getThemeFromRequest(r)
+
+	// Generate CSRF token for forms (use session ID if logged in, otherwise empty)
+	var csrfToken string
+	if session != nil && session.Connected {
+		csrfToken = generateCSRFToken(session.ID)
+	}
+
+	// Check for unread notifications
+	hasUnreadNotifs := checkUnreadNotifications(r, session, relays)
+
 	// Render HTML - showReactions is opposite of fast mode
-	html, err := renderHTML(resp, relays, authors, kinds, limit, session, errorMsg, successMsg, !fast, feedMode, currentURL)
+	html, err := renderHTML(resp, relays, authors, kinds, limit, session, errorMsg, successMsg, !fast, feedMode, currentURL, themeClass, themeLabel, csrfToken, hasUnreadNotifs)
 	if err != nil {
 		log.Printf("Error rendering HTML: %v", err)
 		http.Error(w, "Error rendering page", http.StatusInternalServerError)
@@ -248,8 +353,8 @@ func htmlTimelineHandler(w http.ResponseWriter, r *http.Request) {
 func htmlThreadHandler(w http.ResponseWriter, r *http.Request) {
 	// Extract event ID from path: /html/thread/{eventId}
 	eventID := strings.TrimPrefix(r.URL.Path, "/html/thread/")
-	if eventID == "" {
-		http.Error(w, "Event ID required", http.StatusBadRequest)
+	if eventID == "" || !isValidEventID(eventID) {
+		http.Error(w, "Invalid event ID", http.StatusBadRequest)
 		return
 	}
 
@@ -393,8 +498,23 @@ func htmlThreadHandler(w http.ResponseWriter, r *http.Request) {
 	// Build current URL for reaction redirects
 	currentURL := r.URL.Path
 
+	// Get theme from cookie
+	themeClass, themeLabel := getThemeFromRequest(r)
+
+	// Get success message from query param
+	successMsg := q.Get("success")
+
+	// Generate CSRF token for forms (use session ID if logged in)
+	var csrfToken string
+	if session != nil && session.Connected {
+		csrfToken = generateCSRFToken(session.ID)
+	}
+
+	// Check for unread notifications
+	hasUnreadNotifs := checkUnreadNotifications(r, session, relays)
+
 	// Render HTML
-	htmlContent, err := renderThreadHTML(resp, relays, session, currentURL)
+	htmlContent, err := renderThreadHTML(resp, relays, session, currentURL, themeClass, themeLabel, successMsg, csrfToken, hasUnreadNotifs)
 	if err != nil {
 		log.Printf("Error rendering thread HTML: %v", err)
 		http.Error(w, "Error rendering page", http.StatusInternalServerError)
@@ -536,8 +656,47 @@ func htmlProfileHandler(w http.ResponseWriter, r *http.Request) {
 		},
 	}
 
+	// Get theme from cookie
+	themeClass, themeLabel := getThemeFromRequest(r)
+
+	// Get session for login status
+	session := getSessionFromRequest(r)
+	loggedIn := session != nil && session.Connected
+
+	// Check if logged-in user follows this profile and if this is their own profile
+	var isFollowing, isSelf bool
+	if session != nil && session.Connected {
+		userPubkeyHex := hex.EncodeToString(session.UserPubKey)
+		isSelf = pubkey == userPubkeyHex
+
+		// Check if profile pubkey is in session's following list
+		session.mu.Lock()
+		for _, followedPubkey := range session.FollowingPubkeys {
+			if followedPubkey == pubkey {
+				isFollowing = true
+				break
+			}
+		}
+		session.mu.Unlock()
+	}
+
+	// Build current URL for form redirects
+	currentURL := r.URL.Path
+	if r.URL.RawQuery != "" {
+		currentURL += "?" + r.URL.RawQuery
+	}
+
+	// Generate CSRF token for forms (use session ID if logged in)
+	var csrfToken string
+	if session != nil && session.Connected {
+		csrfToken = generateCSRFToken(session.ID)
+	}
+
+	// Check for unread notifications
+	hasUnreadNotifs := checkUnreadNotifications(r, session, relays)
+
 	// Render HTML
-	htmlContent, err := renderProfileHTML(resp, relays, limit)
+	htmlContent, err := renderProfileHTML(resp, relays, limit, themeClass, themeLabel, loggedIn, currentURL, csrfToken, isFollowing, isSelf, hasUnreadNotifs)
 	if err != nil {
 		log.Printf("Error rendering profile HTML: %v", err)
 		http.Error(w, "Error rendering page", http.StatusInternalServerError)
@@ -547,4 +706,224 @@ func htmlProfileHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "max-age=30")
 	w.Write([]byte(htmlContent))
+}
+
+func htmlThemeHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Redirect(w, r, "/html/timeline?kinds=1&limit=20", http.StatusSeeOther)
+		return
+	}
+
+	// Read current theme from cookie
+	currentTheme := ""
+	if cookie, err := r.Cookie("theme"); err == nil {
+		currentTheme = cookie.Value
+	}
+
+	// Cycle through states: "" (system) -> "dark" -> "light" -> "" (system)
+	var newTheme string
+	switch currentTheme {
+	case "":
+		newTheme = "dark"
+	case "dark":
+		newTheme = "light"
+	case "light":
+		newTheme = ""
+	default:
+		newTheme = ""
+	}
+
+	// Set cookie (1 year expiry)
+	http.SetCookie(w, &http.Cookie{
+		Name:     "theme",
+		Value:    newTheme,
+		Path:     "/",
+		MaxAge:   365 * 24 * 60 * 60,
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+	})
+
+	// Redirect back to referer or timeline (sanitize to prevent open redirect)
+	returnURL := r.Header.Get("Referer")
+	// Extract just the path from Referer header (ignore host) to prevent open redirect
+	if returnURL != "" {
+		if parsed, err := url.Parse(returnURL); err == nil {
+			returnURL = parsed.Path
+			if parsed.RawQuery != "" {
+				returnURL += "?" + parsed.RawQuery
+			}
+		} else {
+			returnURL = ""
+		}
+	}
+	returnURL = sanitizeReturnURL(returnURL)
+	http.Redirect(w, r, returnURL, http.StatusSeeOther)
+}
+
+func htmlNotificationsHandler(w http.ResponseWriter, r *http.Request) {
+	// Get session - must be logged in
+	session := getSessionFromRequest(r)
+	if session == nil || !session.Connected {
+		http.Redirect(w, r, "/html/login", http.StatusSeeOther)
+		return
+	}
+
+	pubkeyHex := hex.EncodeToString(session.UserPubKey)
+
+	// Parse until parameter for pagination
+	var until *int64
+	if untilStr := r.URL.Query().Get("until"); untilStr != "" {
+		if u, err := strconv.ParseInt(untilStr, 10, 64); err == nil {
+			until = &u
+		}
+	}
+
+	// Get user's relays
+	relays := []string{
+		"wss://relay.damus.io",
+		"wss://relay.nostr.band",
+		"wss://relay.primal.net",
+		"wss://nos.lol",
+		"wss://nostr.mom",
+	}
+
+	// Use user's read relays if available
+	if session.UserRelayList != nil && len(session.UserRelayList.Read) > 0 {
+		relays = session.UserRelayList.Read
+	}
+
+	// Fetch notifications (request one extra to know if there are more)
+	const limit = 50
+	notifications := fetchNotifications(relays, pubkeyHex, limit+1, until)
+
+	// Collect pubkeys for profile enrichment and target event IDs
+	pubkeySet := make(map[string]bool)
+	targetEventIDs := make([]string, 0)
+	for _, notif := range notifications {
+		pubkeySet[notif.Event.PubKey] = true
+		// Collect target event IDs for reactions/reposts
+		if notif.TargetEventID != "" && (notif.Type == NotificationReaction || notif.Type == NotificationRepost) {
+			targetEventIDs = append(targetEventIDs, notif.TargetEventID)
+		}
+	}
+	pubkeys := make([]string, 0, len(pubkeySet))
+	for pk := range pubkeySet {
+		pubkeys = append(pubkeys, pk)
+	}
+
+	// Fetch profiles
+	profiles := fetchProfiles(relays, pubkeys)
+
+	// Fetch target events for reactions/reposts to show context
+	targetEvents := make(map[string]*Event)
+	if len(targetEventIDs) > 0 {
+		// Fetch events by their IDs using a filter
+		filter := Filter{
+			IDs:   targetEventIDs,
+			Limit: len(targetEventIDs),
+		}
+		events, _ := fetchEventsFromRelays(relays, filter)
+		for i := range events {
+			targetEvents[events[i].ID] = &events[i]
+		}
+	}
+
+	// Get theme
+	themeClass, themeLabel := getThemeFromRequest(r)
+
+	// Get user display name
+	userDisplayName := "@" + pubkeyHex[:8]
+	if userProfile, ok := profiles[pubkeyHex]; ok {
+		if userProfile.DisplayName != "" {
+			userDisplayName = userProfile.DisplayName
+		} else if userProfile.Name != "" {
+			userDisplayName = userProfile.Name
+		}
+	}
+
+	// Calculate pagination - if we got more than limit, there are more pages
+	var pagination *HTMLPagination
+	if len(notifications) > limit {
+		// Remove the extra notification we fetched
+		notifications = notifications[:limit]
+		// Use the timestamp of the last notification for the next page
+		lastNotif := notifications[len(notifications)-1]
+		nextUntil := lastNotif.Event.CreatedAt
+		pagination = &HTMLPagination{
+			Next: fmt.Sprintf("/html/notifications?until=%d", nextUntil),
+		}
+	}
+
+	// Update last seen cookie - current time (only on first page)
+	if until == nil {
+		http.SetCookie(w, &http.Cookie{
+			Name:     "notifications_last_seen",
+			Value:    fmt.Sprintf("%d", time.Now().Unix()),
+			Path:     "/",
+			MaxAge:   365 * 24 * 60 * 60, // 1 year
+			HttpOnly: true,
+			SameSite: http.SameSiteLaxMode,
+		})
+	}
+
+	// Render template
+	htmlContent, err := renderNotificationsHTML(notifications, profiles, targetEvents, themeClass, themeLabel, userDisplayName, pubkeyHex, pagination)
+	if err != nil {
+		log.Printf("Error rendering notifications HTML: %v", err)
+		http.Error(w, "Error rendering page", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Write([]byte(htmlContent))
+}
+
+// prefetchNextPage fetches the next page of events in the background to warm the cache.
+// This makes clicking "Older →" feel instant since the data is already cached.
+func prefetchNextPage(relays, authors []string, kinds []int, limit int, until int64, noReplies bool) {
+	// Use same fetch limit logic as the handler
+	fetchLimit := limit
+	if noReplies {
+		fetchLimit = limit * 5
+	}
+
+	filter := Filter{
+		Authors: authors,
+		Kinds:   kinds,
+		Limit:   fetchLimit,
+		Until:   &until,
+	}
+
+	// Fetch events - this populates the event cache
+	events, _ := fetchEventsFromRelaysCached(relays, filter)
+
+	if len(events) == 0 {
+		return
+	}
+
+	// Collect unique pubkeys from the prefetched events
+	pubkeySet := make(map[string]bool)
+	contents := make([]string, 0, len(events))
+	for _, evt := range events {
+		pubkeySet[evt.PubKey] = true
+		contents = append(contents, evt.Content)
+	}
+
+	// Also collect pubkeys from npub/nprofile mentions in content
+	mentionedPubkeys := ExtractMentionedPubkeys(contents)
+	for _, pk := range mentionedPubkeys {
+		pubkeySet[pk] = true
+	}
+
+	// Prefetch profiles - this populates the profile cache
+	if len(pubkeySet) > 0 {
+		pubkeys := make([]string, 0, len(pubkeySet))
+		for pk := range pubkeySet {
+			pubkeys = append(pubkeys, pk)
+		}
+		fetchProfiles(relays, pubkeys)
+	}
+
+	log.Printf("Prefetch: warmed cache for next page (%d events, %d profiles)", len(events), len(pubkeySet))
 }

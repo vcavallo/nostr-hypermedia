@@ -51,6 +51,11 @@ func (c *ProfileCache) Set(pubkey string, profile *ProfileInfo) {
 	})
 }
 
+// Delete removes a profile from the cache
+func (c *ProfileCache) Delete(pubkey string) {
+	c.profiles.Delete(pubkey)
+}
+
 // SetMultiple stores multiple profiles at once
 func (c *ProfileCache) SetMultiple(profiles map[string]*ProfileInfo) {
 	now := time.Now()
@@ -159,14 +164,14 @@ func buildEventCacheKey(relays []string, filter Filter) string {
 func getEventTTL(filter Filter) time.Duration {
 	if len(filter.Authors) == 0 {
 		// Global timeline - cache longer, high hit rate
-		return 30 * time.Second
+		return 60 * time.Second
 	}
 	if len(filter.Authors) <= 5 {
 		// Small author list (maybe a profile page)
-		return 20 * time.Second
+		return 45 * time.Second
 	}
-	// Large author list (follow list) - shorter cache
-	return 15 * time.Second
+	// Large author list (follow list) - moderate cache
+	return 30 * time.Second
 }
 
 // Get retrieves cached events if available and not expired
@@ -297,6 +302,54 @@ func (c *ContactCache) Set(pubkey string, contacts []string) {
 	c.contacts.Store(pubkey, &cachedContacts{
 		pubkeys:   contacts,
 		fetchedAt: time.Now(),
+	})
+}
+
+// RelayListCache stores relay lists with TTL
+type RelayListCache struct {
+	relayLists sync.Map
+	ttl        time.Duration
+	notFoundTTL time.Duration // shorter TTL for "not found" entries
+}
+
+type cachedRelayList struct {
+	relayList *RelayList
+	fetchedAt time.Time
+	notFound  bool // true if we looked but found nothing
+}
+
+// Global relay list cache - 30 minute TTL, 5 minute TTL for not-found
+var relayListCache = &RelayListCache{
+	ttl:        30 * time.Minute,
+	notFoundTTL: 5 * time.Minute,
+}
+
+// Get retrieves a relay list from cache if not expired
+func (c *RelayListCache) Get(pubkey string) (*RelayList, bool, bool) {
+	val, ok := c.relayLists.Load(pubkey)
+	if !ok {
+		return nil, false, false // not in cache
+	}
+
+	cached := val.(*cachedRelayList)
+	ttl := c.ttl
+	if cached.notFound {
+		ttl = c.notFoundTTL
+	}
+	if time.Since(cached.fetchedAt) > ttl {
+		c.relayLists.Delete(pubkey)
+		return nil, false, false // expired
+	}
+
+	return cached.relayList, cached.notFound, true // found in cache
+}
+
+// Set stores a relay list in the cache
+func (c *RelayListCache) Set(pubkey string, relayList *RelayList) {
+	c.relayLists.Store(pubkey, &cachedRelayList{
+		relayList: relayList,
+		fetchedAt: time.Now(),
+		notFound:  relayList == nil,
 	})
 }
 

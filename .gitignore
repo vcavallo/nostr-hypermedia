@@ -1,0 +1,29 @@
+# Build output
+nostr-server
+
+# Development secrets
+.dev-keypair
+
+# Environment files
+.env
+.env.local
+.env.*.local
+
+# Editor/IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Test output
+coverage.out
+*.test
+
+# Temporary files
+*.tmp
+*.log
