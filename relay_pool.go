@@ -3,24 +3,29 @@ package main
 import (
 	"context"
 	"errors"
-	"log"
+	"log/slog"
 	"net"
 	"net/url"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
 )
 
-// isRelayURLSafe validates that a relay URL is safe to connect to
-// Allows localhost for development but blocks other private IP ranges
+// Connection pool limits
+const (
+	maxTotalConnections = 50 // Maximum total relay connections
+)
+
+// isRelayURLSafe validates relay URL (blocks private IPs, allows localhost)
 func isRelayURLSafe(relayURL string) bool {
 	parsed, err := url.Parse(relayURL)
 	if err != nil {
 		return false
 	}
 
-	// Only allow ws:// and wss:// schemes
 	if parsed.Scheme != "ws" && parsed.Scheme != "wss" {
 		return false
 	}
@@ -30,18 +35,15 @@ func isRelayURLSafe(relayURL string) bool {
 		return false
 	}
 
-	// Allow localhost for development
 	if host == "localhost" || host == "127.0.0.1" || host == "::1" {
 		return true
 	}
 
-	// Resolve hostname and check IPs
 	ips, err := net.LookupIP(host)
 	if err != nil {
-		// If we can't resolve, allow it (might be valid external host)
-		// but block obvious internal names
+		// Can't resolve - allow unless obviously internal
 		if len(host) > 0 && (host[len(host)-1] == '.' ||
-			contains(host, ".local") || contains(host, ".internal")) {
+			strings.Contains(host, ".local") || strings.Contains(host, ".internal")) {
 			return false
 		}
 		return true
@@ -56,62 +58,26 @@ func isRelayURLSafe(relayURL string) bool {
 	return true
 }
 
-// isRelayIPSafe checks if an IP is safe for relay connections
-// Allows loopback (localhost) but blocks other private ranges
+// isRelayIPSafe returns false for private/internal IPs (except loopback)
 func isRelayIPSafe(ip net.IP) bool {
 	if ip == nil {
 		return false
 	}
-
-	// Allow loopback (localhost)
 	if ip.IsLoopback() {
 		return true
 	}
-
-	// Block private networks (10.x, 172.16-31.x, 192.168.x)
-	if ip.IsPrivate() {
+	if ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
 		return false
 	}
-
-	// Block link-local (169.254.x.x)
-	if ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
+	if ip.IsUnspecified() || ip.IsMulticast() {
 		return false
 	}
-
-	// Block unspecified (0.0.0.0)
-	if ip.IsUnspecified() {
+	if ip.Equal(net.ParseIP("169.254.169.254")) { // Cloud metadata
 		return false
 	}
-
-	// Block cloud metadata IP
-	metadataIP := net.ParseIP("169.254.169.254")
-	if ip.Equal(metadataIP) {
-		return false
-	}
-
-	// Block multicast
-	if ip.IsMulticast() {
-		return false
-	}
-
 	return true
 }
 
-// contains checks if a string contains a substring (simple helper)
-func contains(s, substr string) bool {
-	return len(s) >= len(substr) && (s == substr || len(s) > len(substr) && containsAt(s, substr))
-}
-
-func containsAt(s, substr string) bool {
-	for i := 0; i <= len(s)-len(substr); i++ {
-		if s[i:i+len(substr)] == substr {
-			return true
-		}
-	}
-	return false
-}
-
-// Subscription represents an active subscription on a relay connection
 type Subscription struct {
 	ID        string
 	EventChan chan Event
@@ -120,95 +86,379 @@ type Subscription struct {
 	closeOnce sync.Once
 }
 
-// Close safely closes the Done channel exactly once
 func (s *Subscription) Close() {
 	s.closeOnce.Do(func() {
 		close(s.Done)
 	})
 }
 
-// RelayConn manages a single websocket connection with multiple subscriptions
+type OKResponse struct {
+	EventID string
+	Success bool
+	Message string
+}
+
 type RelayConn struct {
 	conn          *websocket.Conn
 	relayURL      string
 	mu            sync.Mutex
 	writeMu       sync.Mutex
 	subscriptions map[string]*Subscription
+	okHandlers    map[string]chan OKResponse
 	closed        bool
 	lastActivity  time.Time
+	lastPong      time.Time
 }
 
-// RelayPool manages connections to multiple relays
+// isClosed returns whether the connection has been closed (thread-safe)
+func (rc *RelayConn) isClosed() bool {
+	rc.mu.Lock()
+	defer rc.mu.Unlock()
+	return rc.closed
+}
+
 type RelayPool struct {
 	mu          sync.RWMutex
-	connections map[string]*RelayConn // relayURL -> connection
+	connections map[string]*RelayConn
+	stopCh      chan struct{}
+	stopOnce    sync.Once
 }
 
-// Global relay pool
+type relayFailure struct {
+	lastFailure  time.Time
+	failureCount int
+	backoffUntil time.Time
+}
+
+type relayStats struct {
+	avgResponseTime time.Duration
+	responseCount   int
+	lastResponse    time.Time
+}
+
+type RelayHealth struct {
+	mu       sync.RWMutex
+	failures map[string]*relayFailure
+	stats    map[string]*relayStats
+}
+
+var relayHealth = &RelayHealth{
+	failures: make(map[string]*relayFailure),
+	stats:    make(map[string]*relayStats),
+}
+
+func (h *RelayHealth) shouldSkip(relayURL string) bool {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+
+	f := h.failures[relayURL]
+	if f == nil {
+		return false
+	}
+	return time.Now().Before(f.backoffUntil)
+}
+
+func (h *RelayHealth) recordFailure(relayURL string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	f := h.failures[relayURL]
+	if f == nil {
+		f = &relayFailure{}
+		h.failures[relayURL] = f
+	}
+
+	f.lastFailure = time.Now()
+	f.failureCount++
+
+	var backoff time.Duration // Exponential: 30s, 60s, 2m, 5m max
+	switch {
+	case f.failureCount <= 1:
+		backoff = 30 * time.Second
+	case f.failureCount == 2:
+		backoff = 60 * time.Second
+	case f.failureCount == 3:
+		backoff = 2 * time.Minute
+	default:
+		backoff = 5 * time.Minute
+	}
+
+	f.backoffUntil = time.Now().Add(backoff)
+	slog.Warn("relay connection failed",
+		"relay", relayURL,
+		"failure_count", f.failureCount,
+		"backoff_until", f.backoffUntil.Format("15:04:05"))
+}
+
+func (h *RelayHealth) recordSuccess(relayURL string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	delete(h.failures, relayURL)
+}
+
+func (h *RelayHealth) recordResponseTime(relayURL string, duration time.Duration) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	s := h.stats[relayURL]
+	if s == nil {
+		s = &relayStats{}
+		h.stats[relayURL] = s
+	}
+
+	// Exponential moving average (alpha=0.3)
+	if s.responseCount == 0 {
+		s.avgResponseTime = duration
+	} else {
+		alpha := 0.3
+		s.avgResponseTime = time.Duration(alpha*float64(duration) + (1-alpha)*float64(s.avgResponseTime))
+	}
+
+	s.responseCount++
+	s.lastResponse = time.Now()
+}
+
+func (h *RelayHealth) getAverageResponseTime(relayURL string) time.Duration {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+
+	s := h.stats[relayURL]
+	if s == nil || s.responseCount == 0 {
+		return 1 * time.Second
+	}
+	return s.avgResponseTime
+}
+
+// getRelayScore returns 0-100 (higher = better, factors in response time + failures)
+func (h *RelayHealth) getRelayScore(relayURL string) int {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+
+	score := 50
+
+	if s := h.stats[relayURL]; s != nil && s.responseCount > 0 {
+		avgMs := s.avgResponseTime.Milliseconds()
+		switch {
+		case avgMs < 200:
+			score = 50
+		case avgMs < 500:
+			score = 40
+		case avgMs < 1000:
+			score = 25
+		default:
+			score = 10
+		}
+
+		bonus := s.responseCount
+		if bonus > 10 {
+			bonus = 10
+		}
+		score += bonus
+	}
+
+	if f := h.failures[relayURL]; f != nil {
+		penalty := f.failureCount * 10
+		if penalty > 30 {
+			penalty = 30
+		}
+		score -= penalty
+
+		if time.Now().Before(f.backoffUntil) {
+			score -= 20
+		}
+	}
+
+	if score < 0 {
+		score = 0
+	}
+	if score > 100 {
+		score = 100
+	}
+
+	return score
+}
+
+// SortRelaysByScore returns relays sorted by score (best first)
+func (h *RelayHealth) SortRelaysByScore(relays []string) []string {
+	if len(relays) <= 1 {
+		return relays
+	}
+
+	scores := make(map[string]int, len(relays))
+	for _, relay := range relays {
+		scores[relay] = h.getRelayScore(relay)
+	}
+
+	sorted := make([]string, len(relays))
+	copy(sorted, relays)
+
+	sort.Slice(sorted, func(i, j int) bool {
+		return scores[sorted[i]] > scores[sorted[j]]
+	})
+
+	return sorted
+}
+
+// GetExpectedResponseTime returns expected time for fastest N relays (+50% buffer)
+func (h *RelayHealth) GetExpectedResponseTime(relays []string, minRelays int) time.Duration {
+	if len(relays) == 0 {
+		return 500 * time.Millisecond
+	}
+
+	times := make([]time.Duration, 0, len(relays))
+	for _, relay := range relays {
+		times = append(times, h.getAverageResponseTime(relay))
+	}
+
+	sort.Slice(times, func(i, j int) bool {
+		return times[i] < times[j]
+	})
+
+	idx := minRelays - 1
+	if idx >= len(times) {
+		idx = len(times) - 1
+	}
+	if idx < 0 {
+		idx = 0
+	}
+
+	expected := times[idx] + times[idx]/2 // +50% buffer
+	if expected < 200*time.Millisecond {
+		expected = 200 * time.Millisecond
+	}
+	if expected > 2*time.Second {
+		expected = 2 * time.Second
+	}
+
+	return expected
+}
+
 var relayPool = NewRelayPool()
 
-// NewRelayPool creates a new connection pool
 func NewRelayPool() *RelayPool {
 	pool := &RelayPool{
 		connections: make(map[string]*RelayConn),
+		stopCh:      make(chan struct{}),
 	}
 	go pool.cleanupLoop()
 	return pool
 }
 
-// getOrCreateConn gets an existing connection or creates a new one
+// Close shuts down the relay pool and all connections
+func (p *RelayPool) Close() {
+	p.stopOnce.Do(func() {
+		close(p.stopCh)
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		for _, rc := range p.connections {
+			rc.markClosed()
+		}
+		p.connections = make(map[string]*RelayConn)
+	})
+}
+
+func DefaultRelays() []string {
+	return ConfigGetDefaultRelays()
+}
+
+// WarmupConnections pre-connects to default relays at startup
+func WarmupConnections() {
+	slog.Debug("warming up relay connections")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	var wg sync.WaitGroup
+	for _, relay := range DefaultRelays() {
+		wg.Add(1)
+		go func(relayURL string) {
+			defer wg.Done()
+			if _, err := relayPool.getOrCreateConn(ctx, relayURL); err != nil {
+				slog.Debug("warmup failed", "relay", relayURL, "error", err)
+			} else {
+				slog.Debug("warmup connected", "relay", relayURL)
+			}
+		}(relay)
+	}
+	wg.Wait()
+	slog.Info("relay warmup complete", "relay_count", len(DefaultRelays()))
+}
+
 func (p *RelayPool) getOrCreateConn(ctx context.Context, relayURL string) (*RelayConn, error) {
-	// Validate relay URL before connecting
+	relayURL = strings.TrimSuffix(relayURL, "/")
+
 	if !isRelayURLSafe(relayURL) {
 		return nil, errors.New("relay URL blocked: unsafe destination")
+	}
+	if relayHealth.shouldSkip(relayURL) {
+		return nil, errors.New("relay in backoff period")
 	}
 
 	p.mu.RLock()
 	rc := p.connections[relayURL]
 	p.mu.RUnlock()
 
-	if rc != nil && !rc.closed {
+	if rc != nil && !rc.isClosed() {
 		return rc, nil
 	}
 
-	// Need to create a new connection
+	// Check connection limit before creating new connection
+	p.mu.RLock()
+	connCount := len(p.connections)
+	p.mu.RUnlock()
+	if connCount >= maxTotalConnections {
+		return nil, errors.New("connection pool limit reached")
+	}
+
+	slog.Debug("creating new relay connection", "relay", relayURL)
+	conn, _, err := websocket.DefaultDialer.DialContext(ctx, relayURL, nil)
+	if err != nil {
+		relayHealth.recordFailure(relayURL)
+		return nil, err
+	}
+
+	if tcpConn, ok := conn.UnderlyingConn().(*net.TCPConn); ok {
+		tcpConn.SetNoDelay(true) // Reduce latency
+	}
+
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	// Double-check after acquiring write lock
-	rc = p.connections[relayURL]
-	if rc != nil && !rc.closed {
-		return rc, nil
-	}
-
-	// Create new connection
-	log.Printf("Pool: creating new connection to %s", relayURL)
-	conn, _, err := websocket.DefaultDialer.DialContext(ctx, relayURL, nil)
-	if err != nil {
-		return nil, err
+	// Another goroutine may have connected while we were dialing
+	if existing := p.connections[relayURL]; existing != nil && !existing.closed {
+		conn.Close()
+		return existing, nil
 	}
 
 	rc = &RelayConn{
 		conn:          conn,
 		relayURL:      relayURL,
 		subscriptions: make(map[string]*Subscription),
+		okHandlers:    make(map[string]chan OKResponse),
 		lastActivity:  time.Now(),
+		lastPong:      time.Now(),
 	}
 
-	p.connections[relayURL] = rc
+	rc.conn.SetPongHandler(func(string) error {
+		rc.mu.Lock()
+		rc.lastPong = time.Now()
+		rc.mu.Unlock()
+		return nil
+	})
 
-	// Start the read loop for this connection
+	p.connections[relayURL] = rc
+	relayHealth.recordSuccess(relayURL)
+
 	go rc.readLoop()
+	go rc.pingLoop()
 
 	return rc, nil
 }
 
-// Subscribe creates a new subscription on the relay
 func (p *RelayPool) Subscribe(ctx context.Context, relayURL string, subID string, filter map[string]interface{}) (*Subscription, error) {
 	const maxRetries = 3
 	var rc *RelayConn
 	var err error
-	var connected bool
 
 	for attempt := 0; attempt < maxRetries; attempt++ {
 		rc, err = p.getOrCreateConn(ctx, relayURL)
@@ -216,39 +466,55 @@ func (p *RelayPool) Subscribe(ctx context.Context, relayURL string, subID string
 			return nil, err
 		}
 
-		// Check if connection is still valid
-		rc.mu.Lock()
-		if rc.closed {
-			rc.mu.Unlock()
-			// Connection was closed, remove and retry
+		// Check if connection is still valid using thread-safe method
+		if rc.isClosed() {
+			// Remove stale connection from pool
+			// Acquire pool lock first (consistent lock ordering: pool -> conn)
 			p.mu.Lock()
-			delete(p.connections, relayURL)
+			if p.connections[relayURL] == rc {
+				delete(p.connections, relayURL)
+			}
 			p.mu.Unlock()
 			continue
 		}
-		connected = true
 		break
 	}
 
-	if !connected {
+	if rc == nil || rc.isClosed() {
 		return nil, errors.New("failed to establish connection after retries")
 	}
 
+	bufSize := 100 // Event buffer size
+	if limit, ok := filter["limit"].(float64); ok && limit > 0 {
+		bufSize = int(limit) * 2
+	}
+	if bufSize < 50 {
+		bufSize = 50
+	}
+	if bufSize > 500 {
+		bufSize = 500
+	}
 	sub := &Subscription{
 		ID:        subID,
-		EventChan: make(chan Event, 100),
+		EventChan: make(chan Event, bufSize),
 		EOSEChan:  make(chan bool, 1),
 		Done:      make(chan struct{}),
 	}
 
-	// Register subscription (rc.mu is already locked from the loop)
+	// Add subscription under lock
+	rc.mu.Lock()
+	if rc.closed {
+		rc.mu.Unlock()
+		return nil, errors.New("connection closed during subscribe")
+	}
 	rc.subscriptions[subID] = sub
 	rc.mu.Unlock()
 
-	// Send REQ
 	req := []interface{}{"REQ", subID, filter}
 	rc.writeMu.Lock()
+	rc.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
 	err = rc.conn.WriteJSON(req)
+	rc.conn.SetWriteDeadline(time.Time{}) // Clear deadline
 	rc.writeMu.Unlock()
 
 	if err != nil {
@@ -265,11 +531,12 @@ func (p *RelayPool) Subscribe(ctx context.Context, relayURL string, subID string
 	return sub, nil
 }
 
-// Unsubscribe closes a subscription
 func (p *RelayPool) Unsubscribe(relayURL string, sub *Subscription) {
 	if sub == nil {
 		return
 	}
+
+	relayURL = strings.TrimSuffix(relayURL, "/")
 
 	p.mu.RLock()
 	rc := p.connections[relayURL]
@@ -279,7 +546,6 @@ func (p *RelayPool) Unsubscribe(relayURL string, sub *Subscription) {
 		return
 	}
 
-	// Check if we should send CLOSE and remove subscription
 	rc.mu.Lock()
 	_, exists := rc.subscriptions[sub.ID]
 	shouldSendClose := !rc.closed && exists
@@ -288,31 +554,35 @@ func (p *RelayPool) Unsubscribe(relayURL string, sub *Subscription) {
 	}
 	rc.mu.Unlock()
 
-	// Send CLOSE outside of mutex (best effort, connection may be closed)
-	if shouldSendClose {
+	if shouldSendClose { // Send CLOSE (best effort)
 		closeMsg := []interface{}{"CLOSE", sub.ID}
 		rc.writeMu.Lock()
+		rc.conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
 		rc.conn.WriteJSON(closeMsg)
+		rc.conn.SetWriteDeadline(time.Time{})
 		rc.writeMu.Unlock()
 	}
 
-	// Signal done using thread-safe Close method
 	sub.Close()
 }
 
-// readLoop continuously reads from the connection and routes messages
 func (rc *RelayConn) readLoop() {
 	defer rc.markClosed()
 
+	// Read timeout should be longer than ping interval (30s) + pong timeout (60s)
+	// to allow normal operation while catching truly hung connections
+	const readTimeout = 90 * time.Second
+
 	for {
 		var msg []interface{}
+		rc.conn.SetReadDeadline(time.Now().Add(readTimeout))
 		err := rc.conn.ReadJSON(&msg)
 		if err != nil {
 			rc.mu.Lock()
 			closed := rc.closed
 			rc.mu.Unlock()
 			if !closed {
-				log.Printf("Pool: read error from %s: %v", rc.relayURL, err)
+				slog.Debug("relay read error", "relay", rc.relayURL, "error", err)
 			}
 			return
 		}
@@ -356,6 +626,11 @@ func (rc *RelayConn) readLoop() {
 				case <-sub.Done:
 				default:
 					// Channel full, drop event
+					droppedEventCount.Add(1)
+					slog.Debug("dropped event (channel full)",
+						"event_id", shortID(evt.ID),
+						"relay", rc.relayURL,
+						"total_dropped", droppedEventCount.Load())
 				}
 			}
 
@@ -379,8 +654,7 @@ func (rc *RelayConn) readLoop() {
 				}
 			}
 
-		case "CLOSED":
-			// Subscription was closed by relay
+		case "CLOSED": // Subscription closed by relay
 			if len(msg) >= 2 {
 				subID, _ := msg[1].(string)
 				rc.mu.Lock()
@@ -394,16 +668,73 @@ func (rc *RelayConn) readLoop() {
 				}
 			}
 
+		case "OK": // EVENT submission response
+			if len(msg) >= 3 {
+				eventID, _ := msg[1].(string)
+				success, _ := msg[2].(bool)
+				message := ""
+				if len(msg) >= 4 {
+					message, _ = msg[3].(string)
+				}
+
+				rc.mu.Lock()
+				handler := rc.okHandlers[eventID]
+				if handler != nil {
+					delete(rc.okHandlers, eventID)
+				}
+				rc.mu.Unlock()
+
+				if handler != nil {
+					select {
+					case handler <- OKResponse{EventID: eventID, Success: success, Message: message}:
+					default:
+					}
+				}
+			}
+
 		case "NOTICE":
 			if len(msg) >= 2 {
 				notice, _ := msg[1].(string)
-				log.Printf("Pool: NOTICE from %s: %s", rc.relayURL, notice)
+				slog.Debug("relay NOTICE", "relay", rc.relayURL, "message", notice)
 			}
 		}
 	}
 }
 
-// markClosed marks the connection as closed and cleans up
+func (rc *RelayConn) pingLoop() {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		rc.mu.Lock()
+		closed := rc.closed
+		lastPong := rc.lastPong
+		rc.mu.Unlock()
+
+		if closed {
+			return
+		}
+
+		if time.Since(lastPong) > 60*time.Second { // No pong in 60s = dead
+			slog.Debug("relay connection dead (no pong)", "relay", rc.relayURL)
+			rc.markClosed()
+			return
+		}
+
+		rc.writeMu.Lock()
+		rc.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+		err := rc.conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(10*time.Second))
+		rc.conn.SetWriteDeadline(time.Time{})
+		rc.writeMu.Unlock()
+
+		if err != nil {
+			slog.Debug("relay ping failed", "relay", rc.relayURL, "error", err)
+			rc.markClosed()
+			return
+		}
+	}
+}
+
 func (rc *RelayConn) markClosed() {
 	rc.mu.Lock()
 	defer rc.mu.Unlock()
@@ -415,117 +746,117 @@ func (rc *RelayConn) markClosed() {
 	rc.closed = true
 	rc.conn.Close()
 
-	// Close all subscription channels
 	for _, sub := range rc.subscriptions {
 		sub.Close()
 	}
 	rc.subscriptions = make(map[string]*Subscription)
+
+	for eventID, handler := range rc.okHandlers {
+		select {
+		case handler <- OKResponse{EventID: eventID, Success: false, Message: "connection closed"}:
+		default:
+		}
+	}
+	rc.okHandlers = make(map[string]chan OKResponse)
 }
 
-// cleanupLoop periodically removes stale connections
 func (p *RelayPool) cleanupLoop() {
 	ticker := time.NewTicker(60 * time.Second)
-	for range ticker.C {
-		p.cleanup()
-	}
-}
-
-// cleanup removes connections that have been idle too long
-func (p *RelayPool) cleanup() {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	now := time.Now()
-	for url, rc := range p.connections {
-		rc.mu.Lock()
-		idle := len(rc.subscriptions) == 0 && now.Sub(rc.lastActivity) > 2*time.Minute
-		rc.mu.Unlock()
-
-		if rc.closed || idle {
-			if !rc.closed {
-				log.Printf("Pool: closing idle connection to %s", url)
-				rc.markClosed()
-			}
-			delete(p.connections, url)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-p.stopCh:
+			return
+		case <-ticker.C:
+			p.cleanup()
 		}
 	}
 }
 
-// CloseRelay closes a specific relay connection
-func (p *RelayPool) CloseRelay(relayURL string) {
-	p.mu.Lock()
-	rc := p.connections[relayURL]
-	delete(p.connections, relayURL)
-	p.mu.Unlock()
+func (p *RelayPool) cleanup() {
+	now := time.Now()
 
-	if rc != nil {
+	// First pass: collect connections to check (under read lock)
+	p.mu.RLock()
+	toCheck := make(map[string]*RelayConn)
+	for url, rc := range p.connections {
+		toCheck[url] = rc
+	}
+	p.mu.RUnlock()
+
+	// Check each connection without holding pool lock (avoid nested locks)
+	var toRemove []string
+	var toClose []*RelayConn
+	for url, rc := range toCheck {
+		rc.mu.Lock()
+		idle := len(rc.subscriptions) == 0 && now.Sub(rc.lastActivity) > 2*time.Minute
+		closed := rc.closed
+		rc.mu.Unlock()
+
+		if closed || idle {
+			toRemove = append(toRemove, url)
+			if !closed {
+				slog.Debug("closing idle relay connection", "relay", url)
+				toClose = append(toClose, rc)
+			}
+		}
+	}
+
+	// Close idle connections
+	for _, rc := range toClose {
 		rc.markClosed()
 	}
+
+	// Second pass: remove from pool (under write lock)
+	if len(toRemove) > 0 {
+		p.mu.Lock()
+		for _, url := range toRemove {
+			// Double-check the connection is still the same before removing
+			if rc, exists := p.connections[url]; exists && (rc.isClosed() || toCheck[url] == rc) {
+				delete(p.connections, url)
+			}
+		}
+		p.mu.Unlock()
+	}
 }
 
-// PooledConn is a compatibility wrapper for code that expects the old interface
-type PooledConn struct {
-	pool     *RelayPool
-	relayURL string
-	sub      *Subscription
-}
-
-// Get returns a PooledConn for compatibility with existing code
-func (p *RelayPool) Get(ctx context.Context, relayURL string) (*PooledConn, error) {
-	// Just verify we can connect
-	_, err := p.getOrCreateConn(ctx, relayURL)
+// PublishEvent sends an event to the relay and waits for OK response
+func (p *RelayPool) PublishEvent(ctx context.Context, relayURL string, eventID string, eventMsg []interface{}) (OKResponse, error) {
+	rc, err := p.getOrCreateConn(ctx, relayURL)
 	if err != nil {
-		return nil, err
+		return OKResponse{}, err
 	}
-	return &PooledConn{
-		pool:     p,
-		relayURL: relayURL,
-	}, nil
-}
 
-// Release is a no-op for the new pool (subscriptions are explicitly unsubscribed)
-func (p *RelayPool) Release(pc *PooledConn) {
-	// No-op - subscriptions are closed via Unsubscribe
-}
+	okChan := make(chan OKResponse, 1)
 
-// Close marks connection as bad and removes it from pool
-func (p *RelayPool) Close(pc *PooledConn) {
-	if pc == nil {
-		return
+	rc.mu.Lock()
+	if rc.closed {
+		rc.mu.Unlock()
+		return OKResponse{}, errors.New("connection closed")
 	}
-	p.CloseRelay(pc.relayURL)
-}
+	rc.okHandlers[eventID] = okChan
+	rc.mu.Unlock()
 
-// WriteJSON sends a message on the connection with a timeout
-func (pc *PooledConn) WriteJSON(v interface{}) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
+	defer func() {
+		rc.mu.Lock()
+		delete(rc.okHandlers, eventID)
+		rc.mu.Unlock()
+	}()
 
-	rc, err := pc.pool.getOrCreateConn(ctx, pc.relayURL)
-	if err != nil {
-		return err
-	}
 	rc.writeMu.Lock()
-	defer rc.writeMu.Unlock()
-
-	// Set write deadline to prevent indefinite blocking
 	rc.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
-	defer rc.conn.SetWriteDeadline(time.Time{}) // Clear deadline after write
+	err = rc.conn.WriteJSON(eventMsg)
+	rc.conn.SetWriteDeadline(time.Time{})
+	rc.writeMu.Unlock()
 
-	return rc.conn.WriteJSON(v)
-}
+	if err != nil {
+		return OKResponse{}, err
+	}
 
-// ReadJSON is not supported - use Subscribe instead
-func (pc *PooledConn) ReadJSON(v interface{}) error {
-	return errors.New("ReadJSON not supported on pooled connections - use Subscribe")
-}
-
-// SetReadDeadline is not supported on pooled connections
-func (pc *PooledConn) SetReadDeadline(t time.Time) error {
-	return nil // No-op
-}
-
-// SetSubscriptionID is not used in the new implementation
-func (pc *PooledConn) SetSubscriptionID(subID string) {
-	// No-op
+	select {
+	case resp := <-okChan:
+		return resp, nil
+	case <-ctx.Done():
+		return OKResponse{}, ctx.Err()
+	}
 }

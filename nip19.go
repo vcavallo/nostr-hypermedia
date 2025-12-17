@@ -30,11 +30,10 @@ type NProfile struct {
 
 // TLV type constants for NIP-19
 const (
-	tlvTypeSpecial = 0 // event_id for nevent, pubkey for nprofile
+	tlvTypeSpecial = 0 // d-tag for naddr, event_id for nevent, pubkey for nprofile
 	tlvTypeRelay   = 1 // relay URL
 	tlvTypeAuthor  = 2 // author pubkey
 	tlvTypeKind    = 3 // kind (for naddr)
-	tlvTypeDTag    = 4 // d-tag (for naddr)
 )
 
 // DecodeNEvent decodes a nevent1... bech32 string
@@ -195,6 +194,8 @@ func decodeNAddrTLV(data []byte) (*NAddr, error) {
 		i += tlvLen
 
 		switch tlvType {
+		case tlvTypeSpecial: // d-tag (type 0 is special - for naddr it's the d-tag)
+			n.DTag = string(value)
 		case tlvTypeAuthor: // author pubkey
 			if tlvLen == 32 {
 				n.Author = hex.EncodeToString(value)
@@ -205,8 +206,6 @@ func decodeNAddrTLV(data []byte) (*NAddr, error) {
 				n.Kind = binary.BigEndian.Uint32(value)
 				hasKind = true
 			}
-		case tlvTypeDTag: // d-tag
-			n.DTag = string(value)
 		case tlvTypeRelay: // relay hint
 			n.RelayHints = append(n.RelayHints, string(value))
 		}

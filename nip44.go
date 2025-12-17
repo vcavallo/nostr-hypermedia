@@ -1,6 +1,8 @@
 package main
 
 import (
+	"crypto/aes"
+	"crypto/cipher"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
@@ -8,6 +10,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"math"
+	"strings"
 
 	"github.com/btcsuite/btcd/btcec/v2"
 	"golang.org/x/crypto/chacha20"
@@ -254,4 +257,135 @@ func Nip44Decrypt(payload string, conversationKey []byte) (string, error) {
 	}
 
 	return string(plaintext), nil
+}
+
+// NIP-04 encryption/decryption (deprecated but still used by some wallets)
+
+// GetNip04SharedSecret computes the shared secret for NIP-04 encryption
+// Uses btcec.GenerateSharedSecret for compatibility with go-nostr
+func GetNip04SharedSecret(privKeyBytes []byte, pubKeyBytes []byte) ([]byte, error) {
+	// Parse private key
+	privKey, _ := btcec.PrivKeyFromBytes(privKeyBytes)
+	if privKey == nil {
+		return nil, errors.New("invalid private key")
+	}
+
+	// Parse public key (add 0x02 prefix for even y-coordinate)
+	pubKeyWithPrefix := append([]byte{0x02}, pubKeyBytes...)
+	pubKey, err := btcec.ParsePubKey(pubKeyWithPrefix)
+	if err != nil {
+		// Try with 0x03 prefix (odd y-coordinate)
+		pubKeyWithPrefix[0] = 0x03
+		pubKey, err = btcec.ParsePubKey(pubKeyWithPrefix)
+		if err != nil {
+			return nil, errors.New("invalid public key")
+		}
+	}
+
+	// Use btcec's GenerateSharedSecret for compatibility
+	// This returns just the X coordinate per RFC 5903 Section 9
+	sharedX := btcec.GenerateSharedSecret(privKey, pubKey)
+
+	// Ensure it's exactly 32 bytes (pad with leading zeros if needed)
+	// This is critical because x.Bytes() may return fewer bytes if leading bytes are 0
+	if len(sharedX) < 32 {
+		padded := make([]byte, 32)
+		copy(padded[32-len(sharedX):], sharedX)
+		return padded, nil
+	}
+
+	return sharedX, nil
+}
+
+// Nip04Encrypt encrypts plaintext using NIP-04 (AES-256-CBC)
+// Returns format: base64(ciphertext)?iv=base64(iv)
+func Nip04Encrypt(plaintext string, sharedSecret []byte) (string, error) {
+	// Validate shared secret length
+	if len(sharedSecret) != 32 {
+		return "", errors.New("NIP-04 shared secret must be 32 bytes")
+	}
+
+	// Generate random 16-byte IV
+	iv := make([]byte, 16)
+	if _, err := rand.Read(iv); err != nil {
+		return "", err
+	}
+
+	// PKCS7 padding
+	plaintextBytes := []byte(plaintext)
+	blockSize := aes.BlockSize
+	padding := blockSize - (len(plaintextBytes) % blockSize)
+	paddedPlaintext := make([]byte, len(plaintextBytes)+padding)
+	copy(paddedPlaintext, plaintextBytes)
+	for i := len(plaintextBytes); i < len(paddedPlaintext); i++ {
+		paddedPlaintext[i] = byte(padding)
+	}
+
+	// Create AES cipher
+	block, err := aes.NewCipher(sharedSecret)
+	if err != nil {
+		return "", err
+	}
+
+	// Encrypt with CBC mode
+	ciphertext := make([]byte, len(paddedPlaintext))
+	mode := cipher.NewCBCEncrypter(block, iv)
+	mode.CryptBlocks(ciphertext, paddedPlaintext)
+
+	// Format: base64(ciphertext)?iv=base64(iv)
+	return base64.StdEncoding.EncodeToString(ciphertext) + "?iv=" + base64.StdEncoding.EncodeToString(iv), nil
+}
+
+// Nip04Decrypt decrypts a NIP-04 encrypted payload
+func Nip04Decrypt(payload string, sharedSecret []byte) (string, error) {
+	// Parse format: base64(ciphertext)?iv=base64(iv)
+	parts := strings.Split(payload, "?iv=")
+	if len(parts) != 2 {
+		return "", errors.New("invalid NIP-04 payload format")
+	}
+
+	ciphertext, err := base64.StdEncoding.DecodeString(parts[0])
+	if err != nil {
+		return "", errors.New("invalid ciphertext base64")
+	}
+
+	iv, err := base64.StdEncoding.DecodeString(parts[1])
+	if err != nil {
+		return "", errors.New("invalid IV base64")
+	}
+
+	if len(iv) != 16 {
+		return "", errors.New("invalid IV length")
+	}
+
+	// Create AES cipher
+	block, err := aes.NewCipher(sharedSecret)
+	if err != nil {
+		return "", err
+	}
+
+	// Decrypt with CBC mode
+	if len(ciphertext)%aes.BlockSize != 0 {
+		return "", errors.New("ciphertext is not a multiple of block size")
+	}
+
+	plaintext := make([]byte, len(ciphertext))
+	mode := cipher.NewCBCDecrypter(block, iv)
+	mode.CryptBlocks(plaintext, ciphertext)
+
+	// Remove PKCS7 padding
+	if len(plaintext) == 0 {
+		return "", errors.New("empty plaintext")
+	}
+	padding := int(plaintext[len(plaintext)-1])
+	if padding > aes.BlockSize || padding == 0 {
+		return "", errors.New("invalid padding")
+	}
+	for i := len(plaintext) - padding; i < len(plaintext); i++ {
+		if plaintext[i] != byte(padding) {
+			return "", errors.New("invalid padding bytes")
+		}
+	}
+
+	return string(plaintext[:len(plaintext)-padding]), nil
 }

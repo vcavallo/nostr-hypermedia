@@ -1,0 +1,630 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>NATEOAS Compliance Report</title>
+    <style>
+        :root {
+            --bg: #0d1117;
+            --bg-secondary: #161b22;
+            --text: #c9d1d9;
+            --text-muted: #8b949e;
+            --border: #30363d;
+            --green: #238636;
+            --red: #da3633;
+            --amber: #d29922;
+            --blue: #58a6ff;
+            --purple: #a371f7;
+        }
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+            background: var(--bg);
+            color: var(--text);
+            line-height: 1.6;
+            padding: 2rem;
+        }
+        .container { max-width: 1200px; margin: 0 auto; }
+        h1 { font-size: 2rem; margin-bottom: 0.5rem; }
+        h2 { font-size: 1.5rem; margin: 2rem 0 1rem; border-bottom: 1px solid var(--border); padding-bottom: 0.5rem; }
+        h3 { font-size: 1.2rem; margin: 1.5rem 0 0.5rem; color: var(--text-muted); }
+        .meta { color: var(--text-muted); margin-bottom: 2rem; }
+
+        .score-card {
+            display: flex;
+            align-items: center;
+            gap: 2rem;
+            background: var(--bg-secondary);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 2rem;
+            margin-bottom: 2rem;
+        }
+        .score-circle {
+            width: 120px;
+            height: 120px;
+            border-radius: 50%;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            font-size: 2.5rem;
+            font-weight: bold;
+            border: 4px solid;
+        }
+        .score-label { font-size: 0.8rem; color: var(--text-muted); }
+        .score-details { flex: 1; }
+
+        .phase-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+            gap: 1rem;
+            margin-bottom: 2rem;
+        }
+        .phase-card {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 1rem;
+        }
+        .phase-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 0.5rem;
+        }
+        .phase-name { font-weight: 600; }
+        .phase-score {
+            font-size: 1.2rem;
+            font-weight: bold;
+        }
+        .progress-bar {
+            height: 8px;
+            background: var(--border);
+            border-radius: 4px;
+            overflow: hidden;
+        }
+        .progress-fill {
+            height: 100%;
+            border-radius: 4px;
+            transition: width 0.3s;
+        }
+        .phase-desc {
+            margin-top: 0.5rem;
+            color: var(--text-muted);
+            font-size: 0.85rem;
+        }
+        .phase-stats {
+            margin-top: 0.5rem;
+            font-size: 0.8rem;
+            color: var(--text-muted);
+        }
+
+        .phase-section {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            margin-bottom: 1rem;
+            overflow: hidden;
+        }
+        .phase-section-header {
+            padding: 1rem;
+            border-bottom: 1px solid var(--border);
+            cursor: pointer;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .phase-section-header:hover { background: rgba(255,255,255,0.02); }
+        .phase-title { font-family: monospace; color: var(--blue); }
+        .phase-subtitle { color: var(--text-muted); font-size: 0.85rem; margin-left: 1rem; }
+        .phase-badges { display: flex; gap: 0.5rem; }
+        .badge { padding: 0.2rem 0.5rem; border-radius: 4px; font-size: 0.85rem; }
+        .badge-pass { background: rgba(35,134,54,0.2); color: var(--green); }
+        .badge-fail { background: rgba(218,54,51,0.2); color: var(--red); }
+        .badge-partial { background: rgba(210,153,34,0.2); color: var(--amber); }
+
+        .checks-list {
+            padding: 0;
+            display: none;
+        }
+        .phase-section.open .checks-list { display: block; }
+        .check-item {
+            padding: 0.75rem 1rem;
+            border-bottom: 1px solid var(--border);
+            display: flex;
+            gap: 1rem;
+            align-items: flex-start;
+        }
+        .check-item:last-child { border-bottom: none; }
+        .check-icon {
+            width: 24px;
+            height: 24px;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 14px;
+            flex-shrink: 0;
+        }
+        .check-pass { background: var(--green); color: white; }
+        .check-fail { background: var(--red); color: white; }
+        .check-partial { background: var(--amber); color: white; }
+        .check-details { flex: 1; }
+        .check-name { font-weight: 500; }
+        .check-desc { color: var(--text-muted); font-size: 0.9rem; }
+        .check-result { color: var(--text-muted); font-size: 0.85rem; font-family: monospace; margin-top: 0.25rem; }
+        .check-weight {
+            font-size: 0.75rem;
+            background: var(--border);
+            padding: 0.15rem 0.5rem;
+            border-radius: 3px;
+            color: var(--text-muted);
+        }
+
+        .files-list {
+            margin-top: 0.5rem;
+            padding: 0.5rem;
+            background: var(--bg);
+            border-radius: 4px;
+            font-family: monospace;
+            font-size: 0.8rem;
+        }
+        .file-match {
+            padding: 0.25rem 0;
+            border-bottom: 1px solid var(--border);
+        }
+        .file-match:last-child { border-bottom: none; }
+        .file-loc { color: var(--blue); }
+        .file-issue { color: var(--amber); }
+
+        .recommendations {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 1rem;
+        }
+        .recommendations ul { margin-left: 1.5rem; }
+        .recommendations li { margin: 0.5rem 0; color: var(--text-muted); }
+
+        .toggle-btn {
+            background: var(--bg);
+            border: 1px solid var(--border);
+            color: var(--text);
+            padding: 0.5rem 1rem;
+            border-radius: 6px;
+            cursor: pointer;
+            margin-bottom: 1rem;
+        }
+        .toggle-btn:hover { border-color: var(--text-muted); }
+
+        .nateoas-link {
+            color: var(--blue);
+            text-decoration: none;
+        }
+        .nateoas-link:hover { text-decoration: underline; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>NATEOAS Compliance Report</h1>
+        <p class="meta">Generated: 2025-12-17 07:21:23</p>
+
+        <div class="score-card">
+            <div class="score-circle" style="border-color: #22c55e; color: #22c55e;">
+                A&#43;
+                <span class="score-label">100%</span>
+            </div>
+            <div class="score-details">
+                <h3>Overall NATEOAS Compliance</h3>
+                <p>Based on the <a href="https://github.com/vcavallo/nostr-hypermedia/blob/html-to-nateoas/html-to-nateoas.md" class="nateoas-link">NATEOAS Implementation Guide</a></p>
+                <p style="margin-top: 0.5rem; color: var(--text-muted);">
+                    24 passed, 0 partial, 0 failed of 24 checks
+                </p>
+            </div>
+        </div>
+
+        <h2>Implementation Phases</h2>
+        <div class="phase-grid">
+            
+            <div class="phase-card">
+                <div class="phase-header">
+                    <span class="phase-name">Phase 1: Centralize the Mapping</span>
+                    <span class="phase-score" style="color: #22c55e">100%</span>
+                </div>
+                <div class="progress-bar">
+                    <div class="progress-fill" style="width: 100%; background: #22c55e;"></div>
+                </div>
+                <p class="phase-desc">Single source of truth for actions with ActionTemplate struct and GetActionsForEvent function</p>
+                <p class="phase-stats">6 passed, 0 partial, 0 failed</p>
+            </div>
+            
+            <div class="phase-card">
+                <div class="phase-header">
+                    <span class="phase-name">Phase 2: Make It Dynamic</span>
+                    <span class="phase-score" style="color: #22c55e">100%</span>
+                </div>
+                <div class="progress-bar">
+                    <div class="progress-fill" style="width: 100%; background: #22c55e;"></div>
+                </div>
+                <p class="phase-desc">Runtime flexibility via JSON config, contextual actions, SIGHUP hot-reload</p>
+                <p class="phase-stats">7 passed, 0 partial, 0 failed</p>
+            </div>
+            
+            <div class="phase-card">
+                <div class="phase-header">
+                    <span class="phase-name">Phase 3: Decentralize (Nostr-Native)</span>
+                    <span class="phase-score" style="color: #22c55e">100%</span>
+                </div>
+                <div class="progress-bar">
+                    <div class="progress-fill" style="width: 100%; background: #22c55e;"></div>
+                </div>
+                <p class="phase-desc">Source action definitions from Nostr relays via kind 39001 events</p>
+                <p class="phase-stats">5 passed, 0 partial, 0 failed</p>
+            </div>
+            
+            <div class="phase-card">
+                <div class="phase-header">
+                    <span class="phase-name">Phase 4: Full NATEOAS</span>
+                    <span class="phase-score" style="color: #22c55e">100%</span>
+                </div>
+                <div class="progress-bar">
+                    <div class="progress-fill" style="width: 100%; background: #22c55e;"></div>
+                </div>
+                <p class="phase-desc">Complete hypermedia-driven architecture where protocol data governs all capabilities</p>
+                <p class="phase-stats">6 passed, 0 partial, 0 failed</p>
+            </div>
+            
+        </div>
+
+        <h2>Detailed Findings</h2>
+        <button class="toggle-btn" onclick="document.querySelectorAll('.phase-section').forEach(s => s.classList.toggle('open'))">
+            Toggle All
+        </button>
+
+        
+        <div class="phase-section">
+            <div class="phase-section-header" onclick="this.parentElement.classList.toggle('open')">
+                <span>
+                    <span class="phase-title">Phase 1</span>
+                    <span class="phase-subtitle">Centralize the Mapping</span>
+                </span>
+                <div class="phase-badges">
+                    <span class="badge badge-pass">6 passed</span>
+                    
+                    
+                </div>
+            </div>
+            <div class="checks-list">
+                
+                <div class="check-item">
+                    <div class="check-icon check-pass">✓</div>
+                    <div class="check-details">
+                        <div class="check-name">ActionTemplate struct</div>
+                        <div class="check-desc">ActionTemplate struct with Name, Title, Href, Method, Fields defined</div>
+                        <div class="check-result">ActionTemplate/ActionDefinition struct found in actions.go with all required fields</div>
+                        
+                    </div>
+                    <span class="check-weight">2.0</span>
+                </div>
+                
+                <div class="check-item">
+                    <div class="check-icon check-pass">✓</div>
+                    <div class="check-details">
+                        <div class="check-name">FieldTemplate struct</div>
+                        <div class="check-desc">FieldTemplate/FieldDefinition struct for form field definitions</div>
+                        <div class="check-result">FieldTemplate/FieldDefinition struct found in actions.go</div>
+                        
+                    </div>
+                    <span class="check-weight">1.5</span>
+                </div>
+                
+                <div class="check-item">
+                    <div class="check-icon check-pass">✓</div>
+                    <div class="check-details">
+                        <div class="check-name">GetActionsForEvent function</div>
+                        <div class="check-desc">Function that returns actions based on event kind and context</div>
+                        <div class="check-result">GetActionsForEvent function found with context parameter</div>
+                        
+                    </div>
+                    <span class="check-weight">2.0</span>
+                </div>
+                
+                <div class="check-item">
+                    <div class="check-icon check-pass">✓</div>
+                    <div class="check-details">
+                        <div class="check-name">Templates use centralized actions</div>
+                        <div class="check-desc">Templates iterate over .Actions instead of hardcoding action forms</div>
+                        <div class="check-result">2 template(s) use centralized action iteration</div>
+                        
+                    </div>
+                    <span class="check-weight">3.0</span>
+                </div>
+                
+                <div class="check-item">
+                    <div class="check-icon check-pass">✓</div>
+                    <div class="check-details">
+                        <div class="check-name">No hardcoded action URLs</div>
+                        <div class="check-desc">Action URLs come from ActionTemplate.Href, not hardcoded in templates</div>
+                        <div class="check-result">No hardcoded action URLs found outside centralized action rendering</div>
+                        
+                    </div>
+                    <span class="check-weight">2.5</span>
+                </div>
+                
+                <div class="check-item">
+                    <div class="check-icon check-pass">✓</div>
+                    <div class="check-details">
+                        <div class="check-name">Generic action template</div>
+                        <div class="check-desc">Template that renders forms dynamically from ActionTemplate fields</div>
+                        <div class="check-result">Generic action template found in kinds.go with method switching and field iteration</div>
+                        
+                    </div>
+                    <span class="check-weight">2.0</span>
+                </div>
+                
+            </div>
+        </div>
+        
+        <div class="phase-section">
+            <div class="phase-section-header" onclick="this.parentElement.classList.toggle('open')">
+                <span>
+                    <span class="phase-title">Phase 2</span>
+                    <span class="phase-subtitle">Make It Dynamic</span>
+                </span>
+                <div class="phase-badges">
+                    <span class="badge badge-pass">7 passed</span>
+                    
+                    
+                </div>
+            </div>
+            <div class="checks-list">
+                
+                <div class="check-item">
+                    <div class="check-icon check-pass">✓</div>
+                    <div class="check-details">
+                        <div class="check-name">Actions JSON config file</div>
+                        <div class="check-desc">External JSON file defining actions (not hardcoded in Go)</div>
+                        <div class="check-result">Valid actions config found: actions.json</div>
+                        
+                    </div>
+                    <span class="check-weight">2.0</span>
+                </div>
+                
+                <div class="check-item">
+                    <div class="check-icon check-pass">✓</div>
+                    <div class="check-details">
+                        <div class="check-name">Config loading function</div>
+                        <div class="check-desc">LoadActionsConfig or similar function to load JSON config</div>
+                        <div class="check-result">LoadActionsConfig function found that reads from file</div>
+                        
+                    </div>
+                    <span class="check-weight">1.5</span>
+                </div>
+                
+                <div class="check-item">
+                    <div class="check-icon check-pass">✓</div>
+                    <div class="check-details">
+                        <div class="check-name">SIGHUP hot-reload</div>
+                        <div class="check-desc">Signal handler for config hot-reload without server restart</div>
+                        <div class="check-result">SIGHUP handler found with reload functionality</div>
+                        
+                    </div>
+                    <span class="check-weight">1.5</span>
+                </div>
+                
+                <div class="check-item">
+                    <div class="check-icon check-pass">✓</div>
+                    <div class="check-details">
+                        <div class="check-name">Contextual action logic</div>
+                        <div class="check-desc">Actions vary based on context (login state, author, permissions)</div>
+                        <div class="check-result">Full contextual logic: ActionContext struct, login state checks, author checks</div>
+                        
+                    </div>
+                    <span class="check-weight">2.0</span>
+                </div>
+                
+                <div class="check-item">
+                    <div class="check-icon check-pass">✓</div>
+                    <div class="check-details">
+                        <div class="check-name">Kind-specific overrides</div>
+                        <div class="check-desc">Config supports per-kind action customization (kindOverrides)</div>
+                        <div class="check-result">KindOverrides support found in actions_config.go</div>
+                        
+                    </div>
+                    <span class="check-weight">1.0</span>
+                </div>
+                
+                <div class="check-item">
+                    <div class="check-icon check-pass">✓</div>
+                    <div class="check-details">
+                        <div class="check-name">Display order configuration</div>
+                        <div class="check-desc">Configurable action display order in JSON config</div>
+                        <div class="check-result">displayOrder found in actions.json</div>
+                        
+                    </div>
+                    <span class="check-weight">1.0</span>
+                </div>
+                
+                <div class="check-item">
+                    <div class="check-icon check-pass">✓</div>
+                    <div class="check-details">
+                        <div class="check-name">Runtime action registration</div>
+                        <div class="check-desc">RegisterKindAction or similar for dynamic action registration</div>
+                        <div class="check-result">Runtime action registration found in actions_registry.go</div>
+                        
+                    </div>
+                    <span class="check-weight">1.5</span>
+                </div>
+                
+            </div>
+        </div>
+        
+        <div class="phase-section">
+            <div class="phase-section-header" onclick="this.parentElement.classList.toggle('open')">
+                <span>
+                    <span class="phase-title">Phase 3</span>
+                    <span class="phase-subtitle">Decentralize (Nostr-Native)</span>
+                </span>
+                <div class="phase-badges">
+                    <span class="badge badge-pass">5 passed</span>
+                    
+                    
+                </div>
+            </div>
+            <div class="checks-list">
+                
+                <div class="check-item">
+                    <div class="check-icon check-pass">✓</div>
+                    <div class="check-details">
+                        <div class="check-name">Nostr kind definition fetcher</div>
+                        <div class="check-desc">Function to fetch kind definitions from Nostr relays (kind 39001 or similar)</div>
+                        <div class="check-result">Kind definition fetcher found in nostr_kind_fetcher.go</div>
+                        
+                    </div>
+                    <span class="check-weight">3.0</span>
+                </div>
+                
+                <div class="check-item">
+                    <div class="check-icon check-pass">✓</div>
+                    <div class="check-details">
+                        <div class="check-name">Action tag parsing</div>
+                        <div class="check-desc">Parse [&#34;action&#34;, name, method, href, field_spec...] tags from events</div>
+                        <div class="check-result">Action tag parsing found in nostr_action_tags.go</div>
+                        
+                    </div>
+                    <span class="check-weight">2.0</span>
+                </div>
+                
+                <div class="check-item">
+                    <div class="check-icon check-pass">✓</div>
+                    <div class="check-details">
+                        <div class="check-name">Definition caching</div>
+                        <div class="check-desc">Cache fetched definitions with TTL to avoid repeated relay queries</div>
+                        <div class="check-result">Definition caching with TTL found in nostr_kind_fetcher.go</div>
+                        
+                    </div>
+                    <span class="check-weight">1.5</span>
+                </div>
+                
+                <div class="check-item">
+                    <div class="check-icon check-pass">✓</div>
+                    <div class="check-details">
+                        <div class="check-name">Local fallback support</div>
+                        <div class="check-desc">Fallback to local definitions when Nostr fetch fails</div>
+                        <div class="check-result">Explicit fallback/override mechanism found</div>
+                        
+                    </div>
+                    <span class="check-weight">1.5</span>
+                </div>
+                
+                <div class="check-item">
+                    <div class="check-icon check-pass">✓</div>
+                    <div class="check-details">
+                        <div class="check-name">Background refresh</div>
+                        <div class="check-desc">Background goroutine to refresh definitions without blocking requests</div>
+                        <div class="check-result">Background refresh mechanism found</div>
+                        
+                    </div>
+                    <span class="check-weight">1.0</span>
+                </div>
+                
+            </div>
+        </div>
+        
+        <div class="phase-section">
+            <div class="phase-section-header" onclick="this.parentElement.classList.toggle('open')">
+                <span>
+                    <span class="phase-title">Phase 4</span>
+                    <span class="phase-subtitle">Full NATEOAS</span>
+                </span>
+                <div class="phase-badges">
+                    <span class="badge badge-pass">6 passed</span>
+                    
+                    
+                </div>
+            </div>
+            <div class="checks-list">
+                
+                <div class="check-item">
+                    <div class="check-icon check-pass">✓</div>
+                    <div class="check-details">
+                        <div class="check-name">Action-registry tag handling</div>
+                        <div class="check-desc">Events reference action definitions via action-registry tag pointing to naddr</div>
+                        <div class="check-result">Action-registry tag handling found in nostr_action_tags.go</div>
+                        
+                    </div>
+                    <span class="check-weight">2.5</span>
+                </div>
+                
+                <div class="check-item">
+                    <div class="check-icon check-pass">✓</div>
+                    <div class="check-details">
+                        <div class="check-name">Hypermedia entity builder</div>
+                        <div class="check-desc">BuildHypermediaEntity or similar that discovers all metadata from event tags</div>
+                        <div class="check-result">Hypermedia entity building found</div>
+                        
+                    </div>
+                    <span class="check-weight">2.5</span>
+                </div>
+                
+                <div class="check-item">
+                    <div class="check-icon check-pass">✓</div>
+                    <div class="check-details">
+                        <div class="check-name">No kind-specific conditionals</div>
+                        <div class="check-desc">Templates must NOT contain conditionals based on .Kind values</div>
+                        <div class="check-result">No kind-specific conditionals found - rendering is fully generic</div>
+                        
+                    </div>
+                    <span class="check-weight">3.0</span>
+                </div>
+                
+                <div class="check-item">
+                    <div class="check-icon check-pass">✓</div>
+                    <div class="check-details">
+                        <div class="check-name">Universal event renderer</div>
+                        <div class="check-desc">Single template that renders ANY event type based on event metadata</div>
+                        <div class="check-result">Universal renderer found without kind-specific templates</div>
+                        
+                    </div>
+                    <span class="check-weight">2.5</span>
+                </div>
+                
+                <div class="check-item">
+                    <div class="check-icon check-pass">✓</div>
+                    <div class="check-details">
+                        <div class="check-name">Render-hint tag support</div>
+                        <div class="check-desc">Events can specify render-hint tag for presentation format</div>
+                        <div class="check-result">Render-hint support found in html.go</div>
+                        
+                    </div>
+                    <span class="check-weight">1.5</span>
+                </div>
+                
+                <div class="check-item">
+                    <div class="check-icon check-pass">✓</div>
+                    <div class="check-details">
+                        <div class="check-name">Protocol-agnostic server</div>
+                        <div class="check-desc">Server code contains no hardcoded knowledge of specific kinds in rendering logic</div>
+                        <div class="check-result">Rendering is protocol-agnostic (5 data-fetching kind checks are acceptable)</div>
+                        
+                    </div>
+                    <span class="check-weight">2.0</span>
+                </div>
+                
+            </div>
+        </div>
+        
+
+        
+
+        <h2>Resources</h2>
+        <ul style="margin-left: 1.5rem; color: var(--text-muted);">
+            <li><a href="https://github.com/vcavallo/nostr-hypermedia/blob/html-to-nateoas/html-to-nateoas.md" class="nateoas-link">NATEOAS Implementation Guide</a></li>
+            <li><a href="https://hypermedia.systems/" class="nateoas-link">Hypermedia Systems Book</a></li>
+            <li><a href="https://github.com/nostr-protocol/nips" class="nateoas-link">Nostr Implementation Possibilities (NIPs)</a></li>
+        </ul>
+    </div>
+</body>
+</html>

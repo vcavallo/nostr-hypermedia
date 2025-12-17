@@ -1,0 +1,90 @@
+{
+  "actions": {
+    "reply": {
+      "method": "GET",
+      "href": "/html/thread/{event_id}",
+      "class": "action-reply",
+      "rel": "reply",
+      "icon": "💬",
+      "iconOnly": "never",
+      "hasCount": true,
+      "appliesTo": [1, 6, 20, 22, 9735, 30311]
+    },
+    "repost": {
+      "method": "POST",
+      "href": "/html/repost",
+      "class": "action-repost",
+      "rel": "repost",
+      "icon": "🚀",
+      "iconOnly": "always",
+      "hasCount": false,
+      "appliesTo": [1, 6, 20, 22, 30023],
+      "fields": ["csrf_token", "event_id", "event_pubkey", "kind", "return_url"]
+    },
+    "react": {
+      "method": "POST",
+      "href": "/html/react",
+      "class": "action-react",
+      "rel": "reaction",
+      "icon": "❤️",
+      "iconOnly": "always",
+      "hasCount": true,
+      "appliesTo": [1, 6, 20, 22, 9735, 30023, 30311],
+      "fields": ["csrf_token", "event_id", "event_pubkey", "kind", "return_url", "reaction"]
+    },
+    "zap": {
+      "method": "POST",
+      "href": "/html/zap",
+      "class": "action-zap",
+      "rel": "payment",
+      "icon": "⚡",
+      "iconOnly": "always",
+      "hasCount": true,
+      "requiresWallet": true,
+      "appliesTo": [1, 6, 20, 22, 30023, 30311],
+      "fields": ["csrf_token", "event_id", "event_pubkey", "kind", "return_url"]
+    },
+    "quote": {
+      "method": "GET",
+      "href": "/html/quote/{event_id}",
+      "class": "action-quote",
+      "rel": "quote",
+      "icon": "👉",
+      "iconOnly": "always",
+      "appliesTo": [1, 6, 20, 22, 30023]
+    },
+    "bookmark": {
+      "method": "POST",
+      "href": "/html/bookmark",
+      "class": "action-bookmark",
+      "rel": "bookmark",
+      "groupWith": "quote",
+      "toggleable": true,
+      "appliesTo": [1, 6, 20, 22, 30023],
+      "fields": ["csrf_token", "event_id", "kind", "return_url", "action"]
+    },
+    "mute": {
+      "method": "POST",
+      "href": "/html/mute",
+      "class": "action-mute",
+      "rel": "mute",
+      "groupWith": "quote",
+      "toggleable": true,
+      "appliesTo": [1, 6, 20, 22, 9735, 30023, 30311],
+      "fields": ["csrf_token", "pubkey", "return_url", "action"]
+    },
+    "read": {
+      "method": "GET",
+      "href": "/html/thread/{event_id}",
+      "class": "action-read",
+      "rel": "read-article",
+      "icon": "📖",
+      "iconOnly": "mobile",
+      "appliesTo": [30023]
+    }
+  },
+  "displayOrder": ["read", "reply", "repost", "zap", "react", "quote", "bookmark", "mute"],
+  "fieldDefaults": {
+    "reaction": "❤️"
+  }
+}

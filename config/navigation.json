@@ -1,0 +1,41 @@
+{
+  "feeds": [
+    { "name": "follows", "requiresLogin": true },
+    { "name": "global" }
+  ],
+  "utility": [
+    { "name": "search", "href": "/html/search", "icon": "🔎︎", "iconOnly": "always" },
+    { "name": "notifications", "href": "/html/notifications", "requiresLogin": true, "icon": "🔔", "iconOnly": "always" }
+  ],
+  "settings": [
+    { "name": "profile", "href": "/html/timeline?kinds=1,6,20,22,30311,30023&limit=10&feed=me", "requiresLogin": true },
+    { "name": "edit_profile", "href": "/html/profile/edit", "requiresLogin": true },
+    { "name": "wallet", "href": "/html/wallet", "requiresLogin": true },
+    { "name": "bookmarks", "kinds": [10003], "feed": "me", "requiresLogin": true, "dividerBefore": true },
+    { "name": "highlights", "kinds": [9802], "feed": "me", "requiresLogin": true },
+    { "name": "mutes", "href": "/html/mutes", "requiresLogin": true },
+    { "name": "logout", "href": "/html/logout", "requiresLogin": true, "dividerBefore": true }
+  ],
+  "kindFilters": [
+    { "name": "all", 
+      "kinds": [1,6,20,22,9802,30023,30311,30402], 
+      "kindsByFeed": {
+        "follows": [1,6,20,22,30023],
+        "me": [1,6,20,22,30023,30402]
+      }
+    },
+    { "name": "notes", "kinds": [1] },
+    { "name": "classifieds", "kinds": [30402], "only": ["global"] },
+    { "name": "highlights", "kinds": [9802], "only": ["follows", "me"] },
+    { "name": "live", "kinds": [30311], "only": ["global"] },
+    { "name": "longform", "kinds": [30023] },
+    { "name": "photos", "kinds": [20] },
+    { "name": "shorts", "kinds": [22], "only": ["follows", "global"] }
+  ],
+  "defaults": {
+    "feed": "follows",
+    "loggedOutFeed": "global",
+    "settingsIcon": "avatar",
+    "settingsIconFallback": "/static/avatar.jpg"
+  }
+}

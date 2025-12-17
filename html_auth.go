@@ -8,26 +8,88 @@ import (
 	"errors"
 	"fmt"
 	"html/template"
-	"log"
+	"log/slog"
 	"net/http"
 	"net/url"
+	"os"
 	"regexp"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/skip2/go-qrcode"
 )
 
+// trustedProxyCount is loaded from TRUSTED_PROXY_COUNT env var at startup.
+// 0 = don't trust proxy headers (direct connection, safe default)
+// 1 = one proxy in front (e.g., nginx)
+// 2 = two proxies (e.g., cloudflare -> nginx)
+var trustedProxyCount int
+
+func init() {
+	if count := os.Getenv("TRUSTED_PROXY_COUNT"); count != "" {
+		if n, err := strconv.Atoi(count); err == nil && n >= 0 {
+			trustedProxyCount = n
+			slog.Info("trusted proxy count configured", "count", trustedProxyCount)
+		}
+	}
+}
+
 const sessionCookieName = "nostr_session"
 const sessionMaxAge = 24 * time.Hour
 
-// sanitizeErrorForUser returns a user-safe error message, logging the full error
-// This prevents leaking internal details like relay URLs, file paths, etc.
-func sanitizeErrorForUser(context string, err error) string {
-	// Log the full error for debugging
-	log.Printf("%s: %v", context, err)
+// anonSessionCookieName is for anonymous CSRF protection on login forms.
+// Each login page load gets a unique anonymous session ID bound to the CSRF token.
+const anonSessionCookieName = "anon_session"
+const anonSessionMaxAge = 300 // 5 minutes
 
-	// Return generic messages based on context
+// getClientIP extracts the real client IP from the request.
+// Uses TRUSTED_PROXY_COUNT to determine which IP in X-Forwarded-For to trust.
+// This prevents IP spoofing attacks where attackers set fake X-Forwarded-For headers.
+func getClientIP(r *http.Request) string {
+	// If no trusted proxies, don't trust any headers - use RemoteAddr only
+	if trustedProxyCount == 0 {
+		return parseRemoteAddr(r.RemoteAddr)
+	}
+
+	// Check X-Forwarded-For with trusted proxy count
+	// XFF format: "client, proxy1, proxy2" - rightmost IPs are added by proxies we control
+	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+		ips := strings.Split(xff, ",")
+		// Take IP at position: len(ips) - trustedProxyCount
+		// This skips the trusted proxy IPs at the end that we know are legitimate
+		idx := len(ips) - trustedProxyCount
+		if idx < 0 {
+			idx = 0
+		}
+		return strings.TrimSpace(ips[idx])
+	}
+
+	// Check X-Real-IP (nginx proxy header) - only trust if we have trusted proxies
+	if xri := r.Header.Get("X-Real-IP"); xri != "" {
+		return strings.TrimSpace(xri)
+	}
+
+	// Fall back to RemoteAddr
+	return parseRemoteAddr(r.RemoteAddr)
+}
+
+// parseRemoteAddr extracts the IP from RemoteAddr (which includes port)
+func parseRemoteAddr(remoteAddr string) string {
+	// Remove port if present
+	if idx := strings.LastIndex(remoteAddr, ":"); idx != -1 {
+		remoteAddr = remoteAddr[:idx]
+	}
+	// Handle IPv6 brackets
+	remoteAddr = strings.TrimPrefix(remoteAddr, "[")
+	remoteAddr = strings.TrimSuffix(remoteAddr, "]")
+	return remoteAddr
+}
+
+// sanitizeErrorForUser returns a user-safe error message, logging the full error
+func sanitizeErrorForUser(context string, err error) string {
+	slog.Error(context, "error", err)
 	errStr := err.Error()
 	switch {
 	case strings.Contains(errStr, "timeout"):
@@ -45,75 +107,265 @@ func sanitizeErrorForUser(context string, err error) string {
 	}
 }
 
-// Cached auth templates - initialized at startup
-var (
-	cachedQuoteTemplate *template.Template
-	cachedLoginTemplate *template.Template
-)
+var cachedLoginTemplate *template.Template
 
-// initAuthTemplates compiles auth templates once at startup for performance
 func initAuthTemplates() {
 	var err error
-
-	// Compile quote template
-	cachedQuoteTemplate, err = template.New("quote").Funcs(template.FuncMap{
-		"formatTime": func(ts int64) string {
-			return formatRelativeTime(ts)
-		},
-	}).Parse(htmlQuoteTemplate)
-	if err != nil {
-		log.Fatalf("Failed to compile quote template: %v", err)
-	}
-
-	// Compile login template
 	cachedLoginTemplate, err = template.New("login").Parse(htmlLoginTemplate)
 	if err != nil {
-		log.Fatalf("Failed to compile login template: %v", err)
+		slog.Error("failed to compile login template", "error", err)
+		os.Exit(1)
 	}
 
-	log.Printf("Auth templates compiled successfully")
+	slog.Info("auth templates compiled successfully")
 }
 
-// generateQRCodeDataURL creates a QR code as a base64 data URL
 func generateQRCodeDataURL(content string) string {
 	png, err := qrcode.Encode(content, qrcode.Medium, 256)
 	if err != nil {
-		log.Printf("Failed to generate QR code: %v", err)
+		slog.Error("failed to generate QR code", "error", err)
 		return ""
 	}
 	return "data:image/png;base64," + base64.StdEncoding.EncodeToString(png)
 }
 
-// prefetchUserProfile fetches and caches the user's profile in the background
-// This should be called after login to ensure the profile is ready for display
+// prefetchTimeout is the maximum time allowed for background prefetch operations
+const prefetchTimeout = 30 * time.Second
+
+// prefetchUserProfile caches the user's profile (call after login)
 func prefetchUserProfile(pubkeyHex string, relays []string) {
 	go func() {
-		log.Printf("Prefetching profile for logged-in user: %s", pubkeyHex[:16])
-		fetchProfiles(relays, []string{pubkeyHex})
-	}()
-}
+		ctx, cancel := context.WithTimeout(context.Background(), prefetchTimeout)
+		defer cancel()
 
-// prefetchUserContactList fetches the user's contact list and populates the session
-// This should be called after login to cache who the user follows
-func prefetchUserContactList(session *BunkerSession, relays []string) {
-	go func() {
-		pubkeyHex := hex.EncodeToString(session.UserPubKey)
-		log.Printf("Prefetching contact list for logged-in user: %s", pubkeyHex[:16])
+		done := make(chan struct{})
+		go func() {
+			fetchProfiles(relays, []string{pubkeyHex})
+			close(done)
+		}()
 
-		contacts := fetchContactList(relays, pubkeyHex)
-		if contacts != nil {
-			session.mu.Lock()
-			session.FollowingPubkeys = contacts
-			session.mu.Unlock()
-			log.Printf("Cached %d followed pubkeys for user %s", len(contacts), pubkeyHex[:16])
+		select {
+		case <-done:
+			// Success
+		case <-ctx.Done():
+			slog.Debug("prefetchUserProfile timed out", "pubkey", pubkeyHex[:12])
 		}
 	}()
 }
 
-// getUserDisplayName returns a display name for a pubkey, checking cache first
+// prefetchUserContactList caches who the user follows and prefetches their profiles (call after login)
+func prefetchUserContactList(session *BunkerSession, relays []string) {
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), prefetchTimeout)
+		defer cancel()
+
+		pubkeyHex := hex.EncodeToString(session.UserPubKey)
+
+		done := make(chan struct{})
+		var contacts []string
+		go func() {
+			contacts = fetchContactList(relays, pubkeyHex)
+			close(done)
+		}()
+
+		select {
+		case <-done:
+			if contacts != nil {
+				session.mu.Lock()
+				session.FollowingPubkeys = contacts
+				session.mu.Unlock()
+
+				// Prefetch profiles for contacts (for follows feed avatars)
+				if len(contacts) > 0 {
+					go prefetchContactProfiles(contacts)
+				}
+			}
+		case <-ctx.Done():
+			slog.Debug("prefetchUserContactList timed out", "pubkey", pubkeyHex[:12])
+		}
+	}()
+}
+
+// prefetchContactProfiles prefetches profiles for followed users in batches
+func prefetchContactProfiles(contacts []string) {
+	const batchSize = 50
+	profileRelays := ConfigGetProfileRelays()
+
+	for i := 0; i < len(contacts); i += batchSize {
+		end := i + batchSize
+		if end > len(contacts) {
+			end = len(contacts)
+		}
+		batch := contacts[i:end]
+
+		// Fetch profiles - this will cache them
+		fetchProfiles(profileRelays, batch)
+	}
+	slog.Debug("prefetched contact profiles", "count", len(contacts))
+}
+
+// getSessionRelays returns user's NIP-65 relays or fallback (caches in session)
+func getSessionRelays(session *BunkerSession, fallbackRelays []string) []string {
+	pubkeyHex := hex.EncodeToString(session.UserPubKey)
+
+	session.mu.Lock()
+	if session.UserRelayList != nil && len(session.UserRelayList.Read) > 0 {
+		relays := session.UserRelayList.Read
+		session.mu.Unlock()
+		return relays
+	}
+	session.mu.Unlock()
+
+	// Wait briefly for nip46 goroutine to populate relay list
+	time.Sleep(100 * time.Millisecond)
+
+	session.mu.Lock()
+	if session.UserRelayList != nil && len(session.UserRelayList.Read) > 0 {
+		relays := session.UserRelayList.Read
+		session.mu.Unlock()
+		return relays
+	}
+	session.mu.Unlock()
+
+	relayList := fetchRelayList(pubkeyHex)
+	if relayList != nil && len(relayList.Read) > 0 {
+		session.mu.Lock()
+		if session.UserRelayList == nil {
+			session.UserRelayList = relayList
+		}
+		session.mu.Unlock()
+		return relayList.Read
+	}
+
+	return fallbackRelays
+}
+
+// prefetchUserData fetches bookmarks, reactions, reposts, mutes in parallel
+func prefetchUserData(session *BunkerSession, fallbackRelays []string) {
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), prefetchTimeout)
+		defer cancel()
+
+		pubkeyHex := hex.EncodeToString(session.UserPubKey)
+		relays := getSessionRelays(session, fallbackRelays)
+
+		var wg sync.WaitGroup
+		wg.Add(4)
+
+		go func() { // Bookmarks
+			defer wg.Done()
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+			bookmarkEvents := fetchKind10003(relays, pubkeyHex)
+			if len(bookmarkEvents) > 0 {
+				var eventIDs []string
+				for _, tag := range bookmarkEvents[0].Tags {
+					if tag[0] == "e" && len(tag) > 1 {
+						eventIDs = append(eventIDs, tag[1])
+					}
+				}
+				session.mu.Lock()
+				session.BookmarkedEventIDs = eventIDs
+				session.mu.Unlock()
+			}
+		}()
+
+		go func() { // Reactions
+			defer wg.Done()
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+			reactionEvents := fetchUserReactions(relays, pubkeyHex)
+			if len(reactionEvents) > 0 {
+				var eventIDs []string
+				for _, event := range reactionEvents {
+					for _, tag := range event.Tags {
+						if tag[0] == "e" && len(tag) > 1 {
+							eventIDs = append(eventIDs, tag[1])
+							break
+						}
+					}
+				}
+				session.mu.Lock()
+				session.ReactedEventIDs = eventIDs
+				session.mu.Unlock()
+			}
+		}()
+
+		go func() { // Reposts
+			defer wg.Done()
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+			repostEvents := fetchUserReposts(relays, pubkeyHex)
+			if len(repostEvents) > 0 {
+				var eventIDs []string
+				for _, event := range repostEvents {
+					for _, tag := range event.Tags {
+						if tag[0] == "e" && len(tag) > 1 {
+							eventIDs = append(eventIDs, tag[1])
+							break
+						}
+					}
+				}
+				session.mu.Lock()
+				session.RepostedEventIDs = eventIDs
+				session.mu.Unlock()
+			}
+		}()
+
+		go func() { // Mute list
+			defer wg.Done()
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+			slog.Debug("fetching mute list", "pubkey", pubkeyHex[:12], "relays", len(relays))
+			muteEvents := fetchKind10000(relays, pubkeyHex)
+			slog.Debug("mute list fetch result", "pubkey", pubkeyHex[:12], "events", len(muteEvents))
+			if len(muteEvents) > 0 {
+				pubkeys, eventIDs, hashtags, words := parseMuteList(muteEvents[0])
+				session.mu.Lock()
+				session.MutedPubkeys = pubkeys
+				session.MutedEventIDs = eventIDs
+				session.MutedHashtags = hashtags
+				session.MutedWords = words
+				session.mu.Unlock()
+				slog.Debug("loaded mute list", "pubkey", pubkeyHex[:12],
+					"pubkeys", len(pubkeys), "events", len(eventIDs),
+					"hashtags", len(hashtags), "words", len(words))
+			}
+		}()
+
+		// Wait with timeout
+		done := make(chan struct{})
+		go func() {
+			wg.Wait()
+			close(done)
+		}()
+
+		select {
+		case <-done:
+			// All prefetch operations completed - save updated session to cache
+			if err := sessionStore.Set(ctx, session); err != nil {
+				slog.Debug("failed to save session after prefetch", "error", err)
+			}
+		case <-ctx.Done():
+			slog.Debug("prefetchUserData timed out", "pubkey", pubkeyHex[:12])
+		}
+	}()
+}
+
 func getUserDisplayName(pubkeyHex string) string {
-	// Check profile cache
-	if profile, ok := profileCache.Get(pubkeyHex); ok && profile != nil {
+	if profile, _, inCache := profileCache.Get(pubkeyHex); inCache && profile != nil {
 		if profile.DisplayName != "" {
 			return "@" + profile.DisplayName
 		}
@@ -128,6 +380,24 @@ func getUserDisplayName(pubkeyHex string) string {
 	return "@" + pubkeyHex[:12] + "..."
 }
 
+// getUserAvatarURL returns the user's profile picture URL, or empty string if not available
+// If not cached, triggers a quick fetch to populate the cache
+func getUserAvatarURL(pubkeyHex string) string {
+	if profile, _, inCache := profileCache.Get(pubkeyHex); inCache && profile != nil {
+		if profile.Picture != "" {
+			return GetValidatedAvatarURL(profile.Picture)
+		}
+		return "" // Profile exists but has no picture
+	}
+
+	// Not in cache - fetch with short timeout to avoid blocking
+	profiles := fetchProfilesWithTimeout(ConfigGetProfileRelays(), []string{pubkeyHex}, 500*time.Millisecond)
+	if profile := profiles[pubkeyHex]; profile != nil && profile.Picture != "" {
+		return GetValidatedAvatarURL(profile.Picture)
+	}
+	return ""
+}
+
 // htmlLoginHandler shows the login page (GET) or processes login (POST)
 func htmlLoginHandler(w http.ResponseWriter, r *http.Request) {
 	// Handle POST - delegate to submit handler (for bunker:// URLs)
@@ -139,14 +409,14 @@ func htmlLoginHandler(w http.ResponseWriter, r *http.Request) {
 	// Check if already logged in
 	session := getSessionFromRequest(r)
 	if session != nil && session.Connected {
-		http.Redirect(w, r, "/html/timeline?kinds=1&limit=20", http.StatusSeeOther)
+		http.Redirect(w, r, DefaultTimelineURL(), http.StatusSeeOther)
 		return
 	}
 
 	// Generate nostrconnect:// URL for the user
-	nostrConnectURL, secret, err := GenerateNostrConnectURL(defaultNostrConnectRelays)
+	nostrConnectURL, secret, err := GenerateNostrConnectURL(defaultNostrConnectRelays())
 	if err != nil {
-		log.Printf("Failed to generate nostrconnect URL: %v", err)
+		slog.Error("failed to generate nostrconnect URL", "error", err)
 	}
 
 	// Generate QR code
@@ -164,6 +434,28 @@ func htmlLoginHandler(w http.ResponseWriter, r *http.Request) {
 	// Get theme from cookie
 	themeClass, _ := getThemeFromRequest(r)
 
+	// Generate unique anonymous session ID for CSRF protection
+	// This ensures each login page load has a unique token bound to a cookie
+	anonSessionID, err := generateSessionID()
+	if err != nil {
+		slog.Error("failed to generate anonymous session ID", "error", err)
+		anonSessionID = "fallback-" + fmt.Sprintf("%d", time.Now().UnixNano())
+	}
+
+	// Store anonymous session ID in cookie (SameSite=Strict for login security)
+	http.SetCookie(w, &http.Cookie{
+		Name:     anonSessionCookieName,
+		Value:    anonSessionID,
+		Path:     "/html/login",
+		MaxAge:   anonSessionMaxAge,
+		HttpOnly: true,
+		Secure:   shouldSecureCookie(r),
+		SameSite: http.SameSiteStrictMode,
+	})
+
+	// Generate CSRF token bound to this specific anonymous session
+	csrfToken := generateCSRFToken(anonSessionID)
+
 	data := struct {
 		Title           string
 		Error           string
@@ -173,6 +465,7 @@ func htmlLoginHandler(w http.ResponseWriter, r *http.Request) {
 		QRCodeDataURL   template.URL
 		ServerPubKey    string
 		ThemeClass      string
+		CSRFToken       string
 	}{
 		Title:           "Login with Nostr Connect",
 		NostrConnectURL: nostrConnectURL,
@@ -180,11 +473,13 @@ func htmlLoginHandler(w http.ResponseWriter, r *http.Request) {
 		QRCodeDataURL:   template.URL(qrCodeDataURL),
 		ServerPubKey:    serverPubKey,
 		ThemeClass:      themeClass,
+		CSRFToken:       csrfToken,
 	}
 
-	// Check for error/success messages in query params
-	data.Error = r.URL.Query().Get("error")
-	data.Success = r.URL.Query().Get("success")
+	// Check for flash messages from cookies
+	flash := getFlashMessages(w, r)
+	data.Error = flash.Error
+	data.Success = flash.Success
 
 	renderLoginPage(w, data)
 }
@@ -196,16 +491,44 @@ func htmlLoginSubmitHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Get anonymous session from cookie for CSRF validation
+	anonCookie, err := r.Cookie(anonSessionCookieName)
+	if err != nil {
+		redirectWithError(w, r, "/html/login", "Session expired, please try again")
+		return
+	}
+
+	// Validate CSRF token against this anonymous session
+	csrfToken := r.FormValue("csrf_token")
+	if !validateCSRFToken(anonCookie.Value, csrfToken) {
+		redirectWithError(w, r, "/html/login", "Invalid security token, please try again")
+		return
+	}
+
+	// Clear the anonymous session cookie (it's single-use)
+	http.SetCookie(w, &http.Cookie{
+		Name:   anonSessionCookieName,
+		Value:  "",
+		Path:   "/html/login",
+		MaxAge: -1,
+	})
+
+	// Rate limit login attempts by IP
+	if err := CheckLoginRateLimit(getClientIP(r)); err != nil {
+		redirectWithError(w, r, "/html/login", "Too many login attempts. Please wait a minute and try again.")
+		return
+	}
+
 	bunkerURL := strings.TrimSpace(r.FormValue("bunker_url"))
 	if bunkerURL == "" {
-		http.Redirect(w, r, "/html/login?error=Please+enter+a+bunker+URL", http.StatusSeeOther)
+		redirectWithError(w, r, "/html/login", "Please enter a bunker URL")
 		return
 	}
 
 	// Parse bunker URL
 	session, err := ParseBunkerURL(bunkerURL)
 	if err != nil {
-		http.Redirect(w, r, "/html/login?error="+escapeURLParam(sanitizeErrorForUser("Parse bunker URL", err)), http.StatusSeeOther)
+		redirectWithError(w, r, "/html/login", sanitizeErrorForUser("Parse bunker URL", err))
 		return
 	}
 
@@ -213,9 +536,8 @@ func htmlLoginSubmitHandler(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
-	log.Printf("Connecting to bunker...")
 	if err := session.Connect(ctx); err != nil {
-		http.Redirect(w, r, "/html/login?error="+escapeURLParam(sanitizeErrorForUser("Connect to bunker", err)), http.StatusSeeOther)
+		redirectWithError(w, r, "/html/login", sanitizeErrorForUser("Connect to bunker", err))
 		return
 	}
 
@@ -229,30 +551,43 @@ func htmlLoginSubmitHandler(w http.ResponseWriter, r *http.Request) {
 		Path:     "/",
 		MaxAge:   int(sessionMaxAge.Seconds()),
 		HttpOnly: true,
+		Secure:   shouldSecureCookie(r),
 		SameSite: http.SameSiteLaxMode,
 	})
 
-	log.Printf("User logged in: %s", hex.EncodeToString(session.UserPubKey))
-
-	// Prefetch user profile and contact list in background so they're ready for display
+	// Prefetch user profile, contact list, bookmarks, reactions, and reposts in background so they're ready for display
 	prefetchUserProfile(hex.EncodeToString(session.UserPubKey), session.Relays)
 	prefetchUserContactList(session, session.Relays)
+	prefetchUserData(session, session.Relays)
 
-	http.Redirect(w, r, "/html/timeline?kinds=1&limit=20&success=Logged+in+successfully", http.StatusSeeOther)
+	// Redirect to logged-in user's default feed (from config)
+	feedsConfig := GetFeedsConfig()
+	defaultFeed := feedsConfig.Defaults.Feed
+	if defaultFeed == "" {
+		defaultFeed = "follows"
+	}
+	redirectWithSuccess(w, r, DefaultTimelineURLWithFeed(defaultFeed), "Logged in successfully")
 }
 
 // htmlCheckConnectionHandler checks if a nostrconnect session is ready
 func htmlCheckConnectionHandler(w http.ResponseWriter, r *http.Request) {
+	// Rate limit connection checks by IP
+	if err := CheckLoginRateLimit(getClientIP(r)); err != nil {
+		redirectWithError(w, r, "/html/login", "Too many connection attempts. Please wait a minute and try again.")
+		return
+	}
+
 	secret := r.URL.Query().Get("secret")
 	if secret == "" {
-		http.Redirect(w, r, "/html/login?error=Missing+connection+secret", http.StatusSeeOther)
+		redirectWithError(w, r, "/html/login", "Missing connection secret")
 		return
 	}
 
 	session := CheckConnection(secret)
 	if session == nil {
-		// Not connected yet
-		http.Redirect(w, r, "/html/login?error=Connection+not+ready.+Make+sure+you+approved+in+your+signer+app,+then+try+again.&secret="+escapeURLParam(secret), http.StatusSeeOther)
+		// Not connected yet - keep secret in URL so user can retry
+		setFlashError(w, r, "Connection not ready. Make sure you approved in your signer app, then try again.")
+		http.Redirect(w, r, "/html/login?secret="+escapeURLParam(secret), http.StatusSeeOther)
 		return
 	}
 
@@ -265,16 +600,22 @@ func htmlCheckConnectionHandler(w http.ResponseWriter, r *http.Request) {
 		Path:     "/",
 		MaxAge:   int(sessionMaxAge.Seconds()),
 		HttpOnly: true,
+		Secure:   shouldSecureCookie(r),
 		SameSite: http.SameSiteLaxMode,
 	})
 
-	log.Printf("User logged in via nostrconnect: %s", hex.EncodeToString(session.UserPubKey))
-
-	// Prefetch user profile and contact list in background so they're ready for display
+	// Prefetch user profile, contact list, bookmarks, reactions, and reposts in background so they're ready for display
 	prefetchUserProfile(hex.EncodeToString(session.UserPubKey), session.Relays)
 	prefetchUserContactList(session, session.Relays)
+	prefetchUserData(session, session.Relays)
 
-	http.Redirect(w, r, "/html/timeline?kinds=1&limit=20&success=Logged+in+successfully", http.StatusSeeOther)
+	// Redirect to logged-in user's default feed (from config)
+	feedsConfigNC := GetFeedsConfig()
+	defaultFeedNC := feedsConfigNC.Defaults.Feed
+	if defaultFeedNC == "" {
+		defaultFeedNC = "follows"
+	}
+	redirectWithSuccess(w, r, DefaultTimelineURLWithFeed(defaultFeedNC), "Logged in successfully")
 }
 
 // htmlReconnectHandler tries to reconnect to an existing approved signer
@@ -284,9 +625,31 @@ func htmlReconnectHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Get anonymous session from cookie for CSRF validation
+	anonCookie, err := r.Cookie(anonSessionCookieName)
+	if err != nil {
+		redirectWithError(w, r, "/html/login", "Session expired, please try again")
+		return
+	}
+
+	// Validate CSRF token against this anonymous session
+	csrfToken := r.FormValue("csrf_token")
+	if !validateCSRFToken(anonCookie.Value, csrfToken) {
+		redirectWithError(w, r, "/html/login", "Invalid security token, please try again")
+		return
+	}
+
+	// Clear the anonymous session cookie (it's single-use)
+	http.SetCookie(w, &http.Cookie{
+		Name:   anonSessionCookieName,
+		Value:  "",
+		Path:   "/html/login",
+		MaxAge: -1,
+	})
+
 	signerPubKey := strings.TrimSpace(r.FormValue("signer_pubkey"))
 	if signerPubKey == "" {
-		http.Redirect(w, r, "/html/login?error=Please+enter+your+signer+pubkey", http.StatusSeeOther)
+		redirectWithError(w, r, "/html/login", "Please enter your signer pubkey")
 		return
 	}
 
@@ -295,7 +658,7 @@ func htmlReconnectHandler(w http.ResponseWriter, r *http.Request) {
 		// Decode bech32 npub to hex
 		decoded, err := decodeBech32Pubkey(signerPubKey)
 		if err != nil {
-			http.Redirect(w, r, "/html/login?error="+escapeURLParam("Invalid npub format"), http.StatusSeeOther)
+			redirectWithError(w, r, "/html/login", "Invalid npub format")
 			return
 		}
 		signerPubKey = decoded
@@ -303,15 +666,13 @@ func htmlReconnectHandler(w http.ResponseWriter, r *http.Request) {
 
 	// Validate hex
 	if len(signerPubKey) != 64 {
-		http.Redirect(w, r, "/html/login?error=Invalid+pubkey+length+(expected+64+hex+chars+or+npub)", http.StatusSeeOther)
+		redirectWithError(w, r, "/html/login", "Invalid pubkey length (expected 64 hex chars or npub)")
 		return
 	}
 
-	log.Printf("Attempting to reconnect to signer...")
-
-	session, err := TryReconnectToSigner(signerPubKey, defaultNostrConnectRelays)
+	session, err := TryReconnectToSigner(signerPubKey, defaultNostrConnectRelays())
 	if err != nil {
-		http.Redirect(w, r, "/html/login?error="+escapeURLParam(sanitizeErrorForUser("Reconnect to signer", err)), http.StatusSeeOther)
+		redirectWithError(w, r, "/html/login", sanitizeErrorForUser("Reconnect to signer", err))
 		return
 	}
 
@@ -324,16 +685,22 @@ func htmlReconnectHandler(w http.ResponseWriter, r *http.Request) {
 		Path:     "/",
 		MaxAge:   int(sessionMaxAge.Seconds()),
 		HttpOnly: true,
+		Secure:   shouldSecureCookie(r),
 		SameSite: http.SameSiteLaxMode,
 	})
 
-	log.Printf("User logged in via reconnect: %s", hex.EncodeToString(session.UserPubKey))
-
-	// Prefetch user profile and contact list in background so they're ready for display
+	// Prefetch user profile, contact list, bookmarks, reactions, and reposts in background so they're ready for display
 	prefetchUserProfile(hex.EncodeToString(session.UserPubKey), session.Relays)
 	prefetchUserContactList(session, session.Relays)
+	prefetchUserData(session, session.Relays)
 
-	http.Redirect(w, r, "/html/timeline?kinds=1&limit=20&success=Reconnected+successfully", http.StatusSeeOther)
+	// Redirect to logged-in user's default feed (from config)
+	feedsConfigRC := GetFeedsConfig()
+	defaultFeedRC := feedsConfigRC.Defaults.Feed
+	if defaultFeedRC == "" {
+		defaultFeedRC = "follows"
+	}
+	redirectWithSuccess(w, r, DefaultTimelineURLWithFeed(defaultFeedRC), "Reconnected successfully")
 }
 
 // decodeBech32Pubkey decodes an npub to hex pubkey
@@ -527,6 +894,8 @@ func bech32CreateChecksum(hrp string, data []byte) []byte {
 func htmlLogoutHandler(w http.ResponseWriter, r *http.Request) {
 	session := getSessionFromRequest(r)
 	if session != nil {
+		// Close persistent NIP-46 relay connections before deleting session
+		session.CloseRelayConns()
 		bunkerSessions.Delete(session.ID)
 	}
 
@@ -537,34 +906,44 @@ func htmlLogoutHandler(w http.ResponseWriter, r *http.Request) {
 		Path:     "/",
 		MaxAge:   -1,
 		HttpOnly: true,
+		Secure:   shouldSecureCookie(r),
 	})
 
-	http.Redirect(w, r, "/html/login?success=Logged+out", http.StatusSeeOther)
+	redirectWithSuccess(w, r, "/html/login", "Logged out")
 }
 
 // htmlPostNoteHandler handles note posting via POST form
 func htmlPostNoteHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Redirect(w, r, "/html/timeline?kinds=1&limit=20", http.StatusSeeOther)
+		http.Redirect(w, r, DefaultTimelineURL(), http.StatusSeeOther)
 		return
 	}
 
-	session := getSessionFromRequest(r)
-	if session == nil || !session.Connected {
-		http.Redirect(w, r, "/html/login?error=Please+login+first", http.StatusSeeOther)
+	session := requireAuth(w, r)
+	if session == nil {
 		return
 	}
 
 	// Validate CSRF token
 	csrfToken := r.FormValue("csrf_token")
-	if !validateCSRFToken(session.ID, csrfToken) {
-		http.Error(w, "Invalid or expired CSRF token", http.StatusForbidden)
+	if !requireCSRF(w, session.ID, csrfToken) {
 		return
 	}
 
 	content := strings.TrimSpace(r.FormValue("content"))
+	gifURL := strings.TrimSpace(r.FormValue("gif_url"))
+
+	// Append GIF URL to content if present
+	if gifURL != "" {
+		if content != "" {
+			content = content + "\n\n" + gifURL
+		} else {
+			content = gifURL
+		}
+	}
+
 	if content == "" {
-		http.Redirect(w, r, "/html/timeline?kinds=1&limit=20&error=Note+content+is+required", http.StatusSeeOther)
+		redirectWithError(w, r, DefaultTimelineURL(), "You cannot post an empty note!")
 		return
 	}
 
@@ -582,67 +961,126 @@ func htmlPostNoteHandler(w http.ResponseWriter, r *http.Request) {
 
 	signedEvent, err := session.SignEvent(ctx, event)
 	if err != nil {
-		log.Printf("Failed to sign event: %v", err)
-		http.Redirect(w, r, "/html/timeline?kinds=1&limit=20&error="+escapeURLParam(sanitizeErrorForUser("Sign event", err)), http.StatusSeeOther)
+		slog.Error("failed to sign event", "error", err)
+		if isHelmRequest(r) {
+			http.Error(w, sanitizeErrorForUser("Sign event", err), http.StatusInternalServerError)
+			return
+		}
+		redirectWithError(w, r, DefaultTimelineURL(), sanitizeErrorForUser("Sign event", err))
 		return
 	}
 
-	// Publish to relays
-	relays := []string{
-		"wss://relay.damus.io",
-		"wss://relay.nostr.band",
-		"wss://relay.primal.net",
-		"wss://nos.lol",
+	// Publish to relays (use NIP-65 write relays if available, otherwise defaults)
+	relays := ConfigGetPublishRelays()
+	if session.UserRelayList != nil && len(session.UserRelayList.Write) > 0 {
+		relays = session.UserRelayList.Write
 	}
 
 	publishEvent(ctx, relays, signedEvent)
 
-	log.Printf("Published note: %s", signedEvent.ID)
-	http.Redirect(w, r, "/html/timeline?kinds=1&limit=20&success=Note+published", http.StatusSeeOther)
+	// For HelmJS requests, return the cleared form + new note as OOB
+	if isHelmRequest(r) {
+		// Generate new CSRF token
+		newCSRFToken := generateCSRFToken(session.ID)
+
+		// Build HTMLEventItem for the new note
+		userPubkey := hex.EncodeToString(session.UserPubKey)
+		npub, _ := encodeBech32Pubkey(userPubkey)
+
+		// Get user's profile for display
+		var authorProfile *ProfileInfo
+		if profile, _, inCache := profileCache.Get(userPubkey); inCache && profile != nil {
+			authorProfile = profile
+		}
+
+		// Build actions for the new note
+		actionCtx := ActionContext{
+			EventID:      signedEvent.ID,
+			EventPubkey:  userPubkey,
+			Kind:         1,
+			IsBookmarked: false,
+			IsReacted:    false,
+			IsReposted:   false,
+			ReplyCount:   0,
+			LoggedIn:     true,
+			HasWallet:    session.HasWallet(),
+			IsAuthor:     true,
+			CSRFToken:    newCSRFToken,
+			ReturnURL:    DefaultTimelineURLLoggedIn(),
+		}
+		entity := BuildHypermediaEntity(actionCtx, signedEvent.Tags, nil)
+		actionGroups := GroupActionsForKind(entity.Actions, 1)
+
+		newNote := &HTMLEventItem{
+			ID:            signedEvent.ID,
+			Pubkey:        userPubkey,
+			Npub:          npub,
+			NpubShort:     formatNpubShort(npub),
+			Kind:          1,
+			Tags:          signedEvent.Tags,
+			Content:       content,
+			ContentHTML:   processContentToHTML(content),
+			AuthorProfile: authorProfile,
+			CreatedAt:     signedEvent.CreatedAt,
+			ActionGroups:  actionGroups,
+			LoggedIn:      true,
+		}
+
+		html, err := renderPostResponse(newCSRFToken, newNote)
+		if err != nil {
+			slog.Error("failed to render post response", "error", err)
+			http.Error(w, "Failed to render response", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Write([]byte(html))
+		return
+	}
+
+	redirectWithSuccess(w, r, DefaultTimelineURLLoggedIn(), "Note published")
 }
 
 // htmlReplyHandler handles replying to a note via POST form
 func htmlReplyHandler(w http.ResponseWriter, r *http.Request) {
-	log.Printf("Reply handler called: method=%s", r.Method)
-
 	if r.Method != http.MethodPost {
-		http.Redirect(w, r, "/html/timeline?kinds=1&limit=20", http.StatusSeeOther)
+		http.Redirect(w, r, DefaultTimelineURL(), http.StatusSeeOther)
 		return
 	}
 
-	session := getSessionFromRequest(r)
+	session := requireAuth(w, r)
 	if session == nil {
-		log.Printf("Reply failed: no session found")
-		http.Redirect(w, r, "/html/login?error=Please+login+first", http.StatusSeeOther)
-		return
-	}
-	if !session.Connected {
-		log.Printf("Reply failed: session not connected")
-		http.Redirect(w, r, "/html/login?error=Please+login+first", http.StatusSeeOther)
 		return
 	}
 
 	// Validate CSRF token
 	csrfToken := r.FormValue("csrf_token")
-	if !validateCSRFToken(session.ID, csrfToken) {
-		http.Error(w, "Invalid or expired CSRF token", http.StatusForbidden)
+	if !requireCSRF(w, session.ID, csrfToken) {
 		return
 	}
 
-	log.Printf("Reply: session valid, user=%s", hex.EncodeToString(session.UserPubKey)[:16])
-
 	content := strings.TrimSpace(r.FormValue("content"))
+	gifURL := strings.TrimSpace(r.FormValue("gif_url"))
 	replyTo := strings.TrimSpace(r.FormValue("reply_to"))
 	replyToPubkey := strings.TrimSpace(r.FormValue("reply_to_pubkey"))
+	replyCountStr := r.FormValue("reply_count")
+
+	// Append GIF URL to content if present
+	if gifURL != "" {
+		if content != "" {
+			content = content + "\n\n" + gifURL
+		} else {
+			content = gifURL
+		}
+	}
 
 	// Validate event ID first to prevent path injection
 	if replyTo == "" || !isValidEventID(replyTo) {
-		http.Redirect(w, r, "/html/timeline?kinds=1&limit=20&error=Invalid+reply+target", http.StatusSeeOther)
+		redirectWithError(w, r, DefaultTimelineURL(), "Invalid reply target")
 		return
 	}
 
 	if content == "" {
-		http.Redirect(w, r, "/html/thread/"+replyTo+"?error=Reply+content+is+required", http.StatusSeeOther)
+		redirectWithError(w, r, "/html/thread/"+replyTo, "You cannot post an empty note!")
 		return
 	}
 
@@ -652,7 +1090,13 @@ func htmlReplyHandler(w http.ResponseWriter, r *http.Request) {
 		{"e", replyTo, "", "reply"},
 	}
 	if replyToPubkey != "" {
-		tags = append(tags, []string{"p", replyToPubkey})
+		// Validate pubkey is valid 64-char hex (32 bytes)
+		if decoded, err := hex.DecodeString(replyToPubkey); err != nil || len(decoded) != 32 {
+			slog.Warn("reply: invalid pubkey format", "pubkey", replyToPubkey)
+			// Skip invalid pubkey but continue with reply
+		} else {
+			tags = append(tags, []string{"p", replyToPubkey})
+		}
 	}
 
 	// Create unsigned event
@@ -669,53 +1113,131 @@ func htmlReplyHandler(w http.ResponseWriter, r *http.Request) {
 
 	signedEvent, err := session.SignEvent(ctx, event)
 	if err != nil {
-		log.Printf("Failed to sign reply: %v", err)
-		http.Redirect(w, r, "/html/thread/"+replyTo+"?error="+escapeURLParam(sanitizeErrorForUser("Sign event", err)), http.StatusSeeOther)
+		slog.Error("failed to sign reply", "error", err)
+		if isHelmRequest(r) {
+			http.Error(w, sanitizeErrorForUser("Sign event", err), http.StatusInternalServerError)
+			return
+		}
+		redirectWithError(w, r, "/html/thread/"+replyTo, sanitizeErrorForUser("Sign event", err))
 		return
 	}
 
-	// Publish to relays
-	relays := []string{
-		"wss://relay.damus.io",
-		"wss://relay.nostr.band",
-		"wss://relay.primal.net",
-		"wss://nos.lol",
+	// Publish to relays (use NIP-65 write relays if available, otherwise defaults)
+	relays := ConfigGetPublishRelays()
+	if session.UserRelayList != nil && len(session.UserRelayList.Write) > 0 {
+		relays = session.UserRelayList.Write
 	}
 
 	publishEvent(ctx, relays, signedEvent)
 
-	log.Printf("Published reply: %s (to %s)", signedEvent.ID, replyTo)
-	http.Redirect(w, r, "/html/thread/"+replyTo+"?success=Reply+published", http.StatusSeeOther)
+	// For HelmJS requests, return the cleared form + new reply as OOB
+	if isHelmRequest(r) {
+		// Generate new CSRF token
+		newCSRFToken := generateCSRFToken(session.ID)
+
+		// Build HTMLEventItem for the new reply
+		userPubkey := hex.EncodeToString(session.UserPubKey)
+		npub, _ := encodeBech32Pubkey(userPubkey)
+
+		// Get user's profile for display
+		var authorProfile *ProfileInfo
+		if profile, _, inCache := profileCache.Get(userPubkey); inCache && profile != nil {
+			authorProfile = profile
+		}
+
+		// Get user display name and avatar
+		userDisplayName := getUserDisplayName(userPubkey)
+		userAvatarURL := getUserAvatarURL(userPubkey)
+
+		// Build actions for the new reply
+		returnURL := "/html/thread/" + replyTo
+		actionCtx := ActionContext{
+			EventID:      signedEvent.ID,
+			EventPubkey:  userPubkey,
+			Kind:         1,
+			IsBookmarked: false,
+			IsReacted:    false,
+			IsReposted:   false,
+			ReplyCount:   0,
+			LoggedIn:     true,
+			HasWallet:    session.HasWallet(),
+			IsAuthor:     true,
+			CSRFToken:    newCSRFToken,
+			ReturnURL:    returnURL,
+		}
+		entity := BuildHypermediaEntity(actionCtx, signedEvent.Tags, nil)
+		actionGroups := GroupActionsForKind(entity.Actions, 1)
+
+		newReply := &HTMLEventItem{
+			ID:            signedEvent.ID,
+			Pubkey:        userPubkey,
+			Npub:          npub,
+			NpubShort:     formatNpubShort(npub),
+			Kind:          1,
+			Tags:          signedEvent.Tags,
+			Content:       content,
+			ContentHTML:   processContentToHTML(content),
+			AuthorProfile: authorProfile,
+			CreatedAt:     signedEvent.CreatedAt,
+			ActionGroups:  actionGroups,
+			LoggedIn:      true,
+		}
+
+		// Increment reply count from form (avoids relay query, matches displayed count)
+		replyCount := 1
+		if n, err := strconv.Atoi(replyCountStr); err == nil {
+			replyCount = n + 1
+		}
+
+		html, err := renderReplyResponse(newCSRFToken, replyTo, replyToPubkey, userDisplayName, userAvatarURL, npub, newReply, replyCount)
+		if err != nil {
+			slog.Error("failed to render reply response", "error", err)
+			http.Error(w, "Failed to render response", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Write([]byte(html))
+		return
+	}
+
+	redirectWithSuccess(w, r, "/html/thread/"+replyTo, "Reply published")
 }
 
 // htmlReactHandler handles adding a reaction to a note
 func htmlReactHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Redirect(w, r, "/html/timeline?kinds=1&limit=20", http.StatusSeeOther)
+		http.Redirect(w, r, DefaultTimelineURL(), http.StatusSeeOther)
 		return
 	}
 
-	session := getSessionFromRequest(r)
-	if session == nil || !session.Connected {
-		http.Redirect(w, r, "/html/login?error=Please+login+first", http.StatusSeeOther)
+	session := requireAuth(w, r)
+	if session == nil {
 		return
 	}
 
 	// Validate CSRF token
 	csrfToken := r.FormValue("csrf_token")
-	if !validateCSRFToken(session.ID, csrfToken) {
-		http.Error(w, "Invalid or expired CSRF token", http.StatusForbidden)
+	if !requireCSRF(w, session.ID, csrfToken) {
 		return
 	}
 
 	eventID := strings.TrimSpace(r.FormValue("event_id"))
 	eventPubkey := strings.TrimSpace(r.FormValue("event_pubkey"))
-	returnURL := sanitizeReturnURL(strings.TrimSpace(r.FormValue("return_url")))
+	kindStr := strings.TrimSpace(r.FormValue("kind"))
+	returnURL := sanitizeReturnURL(strings.TrimSpace(r.FormValue("return_url")), true) // logged in (requireAuth passed)
 	reaction := strings.TrimSpace(r.FormValue("reaction"))
 
 	if eventID == "" || !isValidEventID(eventID) {
-		http.Redirect(w, r, returnURL+"?error=Invalid+event+ID", http.StatusSeeOther)
+		redirectWithError(w, r, returnURL, "Invalid event ID")
 		return
+	}
+
+	// Parse kind, default to 1 if not provided
+	kind := 1
+	if kindStr != "" {
+		if parsedKind, err := strconv.Atoi(kindStr); err == nil {
+			kind = parsedKind
+		}
 	}
 
 	if reaction == "" {
@@ -725,7 +1247,10 @@ func htmlReactHandler(w http.ResponseWriter, r *http.Request) {
 	// Build tags for reaction (NIP-25)
 	tags := [][]string{
 		{"e", eventID},
-		{"k", "1"}, // Reacting to kind 1 (note)
+		{"k", kindStr}, // Kind of the event being reacted to
+	}
+	if kindStr == "" {
+		tags[1][1] = "1" // Default to kind 1
 	}
 	if eventPubkey != "" {
 		tags = append(tags, []string{"p", eventPubkey})
@@ -745,57 +1270,89 @@ func htmlReactHandler(w http.ResponseWriter, r *http.Request) {
 
 	signedEvent, err := session.SignEvent(ctx, event)
 	if err != nil {
-		log.Printf("Failed to sign reaction: %v", err)
-		separator := "?"
-		if strings.Contains(returnURL, "?") {
-			separator = "&"
+		slog.Error("failed to sign reaction", "error", err)
+		// For HelmJS requests, return an error response
+		if isHelmRequest(r) {
+			http.Error(w, sanitizeErrorForUser("Sign event", err), http.StatusInternalServerError)
+			return
 		}
-		http.Redirect(w, r, returnURL+separator+"error="+escapeURLParam(sanitizeErrorForUser("Sign event", err)), http.StatusSeeOther)
+		redirectWithError(w, r, returnURL, sanitizeErrorForUser("Sign event", err))
 		return
 	}
 
-	// Get relays to publish to
-	relays := []string{
-		"wss://relay.damus.io",
-		"wss://relay.nostr.band",
-		"wss://nos.lol",
-	}
+	// Get relays to publish to (use NIP-65 if available, otherwise defaults)
+	relays := ConfigGetPublishRelays()
 	if session.UserRelayList != nil && len(session.UserRelayList.Write) > 0 {
 		relays = session.UserRelayList.Write
 	}
 
 	publishEvent(ctx, relays, signedEvent)
 
-	log.Printf("Published reaction %s to event %s", reaction, eventID)
+	// Update session's reaction cache
+	session.mu.Lock()
+	session.ReactedEventIDs = append(session.ReactedEventIDs, eventID)
+	session.mu.Unlock()
+
+	// For HelmJS requests, return the updated footer fragment
+	if isHelmRequest(r) {
+		// Generate new CSRF token for the updated form
+		newCSRFToken := generateCSRFToken(session.ID)
+		// Get read relays to fetch existing reactions
+		readRelays := ConfigGetDefaultRelays()
+		if session.UserRelayList != nil && len(session.UserRelayList.Read) > 0 {
+			readRelays = session.UserRelayList.Read
+		}
+		// Check if user had bookmarked or reposted this event (for footer display)
+		isBookmarked := session.IsEventBookmarked(eventID)
+		isReposted := session.IsEventReposted(eventID)
+		// Pass the reaction so it shows in the UI, isReacted is true since user just reacted
+		html, err := renderFooterFragment(eventID, eventPubkey, kind, true, newCSRFToken, returnURL, isBookmarked, true, isReposted, false, session.HasWallet(), reaction, readRelays)
+		if err != nil {
+			slog.Error("failed to render footer fragment", "error", err)
+			http.Error(w, "Failed to render response", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Write([]byte(html))
+		return
+	}
+
 	http.Redirect(w, r, returnURL, http.StatusSeeOther)
 }
 
 // htmlRepostHandler handles reposting a note (kind 6)
 func htmlRepostHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Redirect(w, r, "/html/timeline?kinds=1&limit=20", http.StatusSeeOther)
+		http.Redirect(w, r, DefaultTimelineURL(), http.StatusSeeOther)
 		return
 	}
 
-	session := getSessionFromRequest(r)
-	if session == nil || !session.Connected {
-		http.Redirect(w, r, "/html/login?error=Please+login+first", http.StatusSeeOther)
+	session := requireAuth(w, r)
+	if session == nil {
 		return
 	}
 
 	// Validate CSRF token
 	csrfToken := r.FormValue("csrf_token")
-	if !validateCSRFToken(session.ID, csrfToken) {
-		http.Error(w, "Invalid or expired CSRF token", http.StatusForbidden)
+	if !requireCSRF(w, session.ID, csrfToken) {
 		return
 	}
 
 	eventID := strings.TrimSpace(r.FormValue("event_id"))
 	eventPubkey := strings.TrimSpace(r.FormValue("event_pubkey"))
-	returnURL := sanitizeReturnURL(strings.TrimSpace(r.FormValue("return_url")))
+	kindStr := strings.TrimSpace(r.FormValue("kind"))
+	returnURL := sanitizeReturnURL(strings.TrimSpace(r.FormValue("return_url")), true) // logged in (requireAuth passed)
+
+	// Parse kind, default to 1 (note) if not provided or invalid
+	kind := 1
+	if kindStr != "" {
+		if parsedKind, err := strconv.Atoi(kindStr); err == nil && parsedKind > 0 {
+			kind = parsedKind
+		}
+	}
 
 	if eventID == "" || !isValidEventID(eventID) {
-		http.Redirect(w, r, "/html/timeline?kinds=1&limit=20&error=Invalid+event+ID", http.StatusSeeOther)
+		redirectWithError(w, r, DefaultTimelineURL(), "Invalid event ID")
 		return
 	}
 
@@ -822,66 +1379,87 @@ func htmlRepostHandler(w http.ResponseWriter, r *http.Request) {
 
 	signedEvent, err := session.SignEvent(ctx, event)
 	if err != nil {
-		log.Printf("Failed to sign repost: %v", err)
-		separator := "?"
-		if strings.Contains(returnURL, "?") {
-			separator = "&"
+		slog.Error("failed to sign repost", "error", err)
+		if isHelmRequest(r) {
+			http.Error(w, sanitizeErrorForUser("Sign event", err), http.StatusInternalServerError)
+			return
 		}
-		http.Redirect(w, r, returnURL+separator+"error="+escapeURLParam(sanitizeErrorForUser("Sign event", err)), http.StatusSeeOther)
+		redirectWithError(w, r, returnURL, sanitizeErrorForUser("Sign event", err))
 		return
 	}
 
-	// Get relays to publish to
-	relays := []string{
-		"wss://relay.damus.io",
-		"wss://relay.nostr.band",
-		"wss://relay.primal.net",
-		"wss://nos.lol",
-	}
+	// Get relays to publish to (use NIP-65 if available, otherwise defaults)
+	relays := ConfigGetPublishRelays()
 	if session.UserRelayList != nil && len(session.UserRelayList.Write) > 0 {
 		relays = session.UserRelayList.Write
 	}
 
 	publishEvent(ctx, relays, signedEvent)
 
-	log.Printf("Published repost: %s (reposting %s)", signedEvent.ID, eventID)
+	// Update session cache to reflect new repost
+	session.mu.Lock()
+	session.RepostedEventIDs = append(session.RepostedEventIDs, eventID)
+	session.mu.Unlock()
 
-	// Add success message to return URL
-	if strings.Contains(returnURL, "?") {
-		returnURL += "&success=Reposted"
-	} else {
-		returnURL += "?success=Reposted"
+	// For HelmJS partial update, return updated footer
+	if isHelmRequest(r) {
+		newCSRFToken := generateCSRFToken(session.ID)
+		readRelays := ConfigGetDefaultRelays()
+		if session.UserRelayList != nil && len(session.UserRelayList.Read) > 0 {
+			readRelays = session.UserRelayList.Read
+		}
+		// Check other state for footer display
+		isBookmarked := session.IsEventBookmarked(eventID)
+		isReacted := session.IsEventReacted(eventID)
+		// isReposted is now true since user just reposted
+		html, err := renderFooterFragment(eventID, eventPubkey, kind, true, newCSRFToken, returnURL, isBookmarked, isReacted, true, false, session.HasWallet(), "", readRelays)
+		if err != nil {
+			slog.Error("failed to render footer fragment", "error", err)
+			http.Error(w, "Failed to render response", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Write([]byte(html))
+		return
 	}
-	http.Redirect(w, r, returnURL, http.StatusSeeOther)
+
+	redirectWithSuccess(w, r, returnURL, "Reposted")
 }
 
 // htmlBookmarkHandler handles adding/removing a note from user's bookmarks (kind 10003)
 func htmlBookmarkHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Redirect(w, r, "/html/timeline?kinds=1&limit=20", http.StatusSeeOther)
+		http.Redirect(w, r, DefaultTimelineURL(), http.StatusSeeOther)
 		return
 	}
 
-	session := getSessionFromRequest(r)
-	if session == nil || !session.Connected {
-		http.Redirect(w, r, "/html/login?error=Please+login+first", http.StatusSeeOther)
+	session := requireAuth(w, r)
+	if session == nil {
 		return
 	}
 
 	// Validate CSRF token
 	csrfToken := r.FormValue("csrf_token")
-	if !validateCSRFToken(session.ID, csrfToken) {
-		http.Error(w, "Invalid or expired CSRF token", http.StatusForbidden)
+	if !requireCSRF(w, session.ID, csrfToken) {
 		return
 	}
 
 	eventID := strings.TrimSpace(r.FormValue("event_id"))
+	kindStr := strings.TrimSpace(r.FormValue("kind"))
 	action := strings.TrimSpace(r.FormValue("action")) // "add" or "remove"
-	returnURL := sanitizeReturnURL(strings.TrimSpace(r.FormValue("return_url")))
+	returnURL := sanitizeReturnURL(strings.TrimSpace(r.FormValue("return_url")), true) // logged in (requireAuth passed)
 
 	if eventID == "" || !isValidEventID(eventID) {
-		http.Redirect(w, r, returnURL+"?error=Invalid+event+ID", http.StatusSeeOther)
+		redirectWithError(w, r, returnURL, "Invalid event ID")
 		return
+	}
+
+	// Parse kind, default to 1 if not provided
+	kind := 1
+	if kindStr != "" {
+		if parsedKind, err := strconv.Atoi(kindStr); err == nil {
+			kind = parsedKind
+		}
 	}
 
 	if action != "add" && action != "remove" {
@@ -893,12 +1471,8 @@ func htmlBookmarkHandler(w http.ResponseWriter, r *http.Request) {
 
 	userPubkey := hex.EncodeToString(session.UserPubKey)
 
-	// Get relays
-	relays := []string{
-		"wss://relay.damus.io",
-		"wss://relay.nostr.band",
-		"wss://nos.lol",
-	}
+	// Get relays (use NIP-65 if available, otherwise defaults)
+	relays := ConfigGetPublishRelays()
 	if session.UserRelayList != nil && len(session.UserRelayList.Write) > 0 {
 		relays = session.UserRelayList.Write
 	}
@@ -948,19 +1522,61 @@ func htmlBookmarkHandler(w http.ResponseWriter, r *http.Request) {
 	// Sign via bunker
 	signedEvent, err := session.SignEvent(ctx, event)
 	if err != nil {
-		log.Printf("Failed to sign bookmark list: %v", err)
-		separator := "?"
-		if strings.Contains(returnURL, "?") {
-			separator = "&"
+		slog.Error("failed to sign bookmark list", "error", err)
+		// For HelmJS requests, return an error response
+		if isHelmRequest(r) {
+			http.Error(w, sanitizeErrorForUser("Sign event", err), http.StatusInternalServerError)
+			return
 		}
-		http.Redirect(w, r, returnURL+separator+"error="+escapeURLParam(sanitizeErrorForUser("Sign event", err)), http.StatusSeeOther)
+		redirectWithError(w, r, returnURL, sanitizeErrorForUser("Sign event", err))
 		return
 	}
 
 	// Publish to relays
 	publishEvent(ctx, relays, signedEvent)
 
-	log.Printf("Published bookmark list update: %s (action=%s, event=%s)", signedEvent.ID, action, eventID)
+	// Update session's bookmark cache
+	session.mu.Lock()
+	if action == "add" {
+		session.BookmarkedEventIDs = append(session.BookmarkedEventIDs, eventID)
+	} else {
+		// Remove from bookmark list
+		newBookmarks := make([]string, 0, len(session.BookmarkedEventIDs))
+		for _, id := range session.BookmarkedEventIDs {
+			if id != eventID {
+				newBookmarks = append(newBookmarks, id)
+			}
+		}
+		session.BookmarkedEventIDs = newBookmarks
+	}
+	session.mu.Unlock()
+
+	// For HelmJS requests, return the updated footer fragment
+	if isHelmRequest(r) {
+		// Generate new CSRF token for the updated form
+		newCSRFToken := generateCSRFToken(session.ID)
+		// isBookmarked is now the opposite of what it was (we toggled it)
+		newBookmarkState := action == "add"
+		// Get read relays to fetch existing reactions
+		readRelays := ConfigGetDefaultRelays()
+		if session.UserRelayList != nil && len(session.UserRelayList.Read) > 0 {
+			readRelays = session.UserRelayList.Read
+		}
+		// Check if user had reacted or reposted this event (for footer display)
+		isReacted := session.IsEventReacted(eventID)
+		isReposted := session.IsEventReposted(eventID)
+		// Empty string for userReaction since this is a bookmark action
+		html, err := renderFooterFragment(eventID, "", kind, true, newCSRFToken, returnURL, newBookmarkState, isReacted, isReposted, false, session.HasWallet(), "", readRelays)
+		if err != nil {
+			slog.Error("failed to render footer fragment", "error", err)
+			http.Error(w, "Failed to render response", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Write([]byte(html))
+		return
+	}
+
 	http.Redirect(w, r, returnURL, http.StatusSeeOther)
 }
 
@@ -970,6 +1586,197 @@ func fetchKind10003(relays []string, pubkey string) []Event {
 		Kinds:   []int{10003},
 		Authors: []string{pubkey},
 		Limit:   1,
+	}
+
+	events, _ := fetchEventsFromRelays(relays, filter)
+	return events
+}
+
+// fetchKind10000 fetches the user's mute list (kind 10000)
+func fetchKind10000(relays []string, pubkey string) []Event {
+	filter := Filter{
+		Kinds:   []int{10000},
+		Authors: []string{pubkey},
+		Limit:   1,
+	}
+
+	events, _ := fetchEventsFromRelays(relays, filter)
+	return events
+}
+
+// parseMuteList extracts mute list items from a kind 10000 event
+// Returns pubkeys, eventIDs, hashtags, words
+func parseMuteList(event Event) (pubkeys []string, eventIDs []string, hashtags []string, words []string) {
+	for _, tag := range event.Tags {
+		if len(tag) < 2 {
+			continue
+		}
+		switch tag[0] {
+		case "p":
+			pubkeys = append(pubkeys, tag[1])
+		case "e":
+			eventIDs = append(eventIDs, tag[1])
+		case "t":
+			hashtags = append(hashtags, tag[1])
+		case "word":
+			words = append(words, tag[1])
+		}
+	}
+	return
+}
+
+// htmlMuteHandler handles muting/unmuting a user (kind 10000)
+func htmlMuteHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	session := requireAuth(w, r)
+	if session == nil {
+		return
+	}
+
+	// Validate CSRF token
+	csrfToken := r.FormValue("csrf_token")
+	if !requireCSRF(w, session.ID, csrfToken) {
+		return
+	}
+
+	pubkeyToMute := strings.TrimSpace(r.FormValue("pubkey"))
+	action := strings.TrimSpace(r.FormValue("action")) // "mute" or "unmute"
+	returnURL := sanitizeReturnURL(strings.TrimSpace(r.FormValue("return_url")), true) // logged in (requireAuth passed)
+
+	// Validate pubkey format (64 hex chars)
+	if pubkeyToMute == "" || len(pubkeyToMute) != 64 {
+		redirectWithError(w, r, returnURL, "Invalid pubkey")
+		return
+	}
+
+	// Don't allow muting yourself
+	userPubkey := hex.EncodeToString(session.UserPubKey)
+	if pubkeyToMute == userPubkey {
+		redirectWithError(w, r, returnURL, "Cannot mute yourself")
+		return
+	}
+
+	if action != "mute" && action != "unmute" {
+		action = "mute"
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// Get relays (use NIP-65 if available, otherwise defaults)
+	relays := ConfigGetPublishRelays()
+	if session.UserRelayList != nil && len(session.UserRelayList.Write) > 0 {
+		relays = session.UserRelayList.Write
+	}
+
+	// Fetch user's current mute list (kind 10000)
+	existingTags := [][]string{}
+	muteEvents := fetchKind10000(relays, userPubkey)
+	if len(muteEvents) > 0 {
+		existingTags = muteEvents[0].Tags
+	}
+
+	// Build new tags list
+	var newTags [][]string
+	found := false
+
+	for _, tag := range existingTags {
+		if len(tag) >= 2 && tag[0] == "p" && tag[1] == pubkeyToMute {
+			found = true
+			if action == "unmute" {
+				// Skip this tag (removes the mute)
+				continue
+			}
+		}
+		newTags = append(newTags, tag)
+	}
+
+	// If muting and not found, add new p tag
+	if action == "mute" && !found {
+		newTags = append(newTags, []string{"p", pubkeyToMute})
+	}
+
+	// If unmuting and not found, nothing to do
+	if action == "unmute" && !found {
+		http.Redirect(w, r, returnURL, http.StatusSeeOther)
+		return
+	}
+
+	// Create the kind 10000 event (replaceable)
+	event := UnsignedEvent{
+		Kind:      10000,
+		Content:   "",
+		Tags:      newTags,
+		CreatedAt: time.Now().Unix(),
+	}
+
+	// Sign via bunker
+	signedEvent, err := session.SignEvent(ctx, event)
+	if err != nil {
+		slog.Error("failed to sign mute list", "error", err)
+		if isHelmRequest(r) {
+			http.Error(w, sanitizeErrorForUser("Sign event", err), http.StatusInternalServerError)
+			return
+		}
+		redirectWithError(w, r, returnURL, sanitizeErrorForUser("Sign event", err))
+		return
+	}
+
+	// Publish to relays
+	publishEvent(ctx, relays, signedEvent)
+
+	// Update session's mute cache
+	session.mu.Lock()
+	if action == "mute" {
+		session.MutedPubkeys = append(session.MutedPubkeys, pubkeyToMute)
+		slog.Debug("muted user", "pubkey", pubkeyToMute[:12])
+	} else {
+		// Remove from mute list
+		newMuted := make([]string, 0, len(session.MutedPubkeys))
+		for _, pk := range session.MutedPubkeys {
+			if pk != pubkeyToMute {
+				newMuted = append(newMuted, pk)
+			}
+		}
+		session.MutedPubkeys = newMuted
+		slog.Debug("unmuted user", "pubkey", pubkeyToMute[:12])
+	}
+	session.mu.Unlock()
+
+	// For HelmJS requests, return empty response (h-swap="delete" removes the element)
+	if isHelmRequest(r) {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	// For unmute or non-HelmJS requests, redirect back
+	http.Redirect(w, r, returnURL, http.StatusSeeOther)
+}
+
+// fetchUserReactions fetches the user's recent reactions (kind 7)
+// Limited to recent reactions to avoid fetching entire history
+func fetchUserReactions(relays []string, pubkey string) []Event {
+	filter := Filter{
+		Kinds:   []int{7},
+		Authors: []string{pubkey},
+		Limit:   500, // Reasonable limit for recent reactions
+	}
+
+	events, _ := fetchEventsFromRelays(relays, filter)
+	return events
+}
+
+// fetchUserReposts fetches the user's recent reposts (kind 6)
+// Limited to recent reposts to avoid fetching entire history
+func fetchUserReposts(relays []string, pubkey string) []Event {
+	filter := Filter{
+		Kinds:   []int{6},
+		Authors: []string{pubkey},
+		Limit:   200, // Reasonable limit for recent reposts
 	}
 
 	events, _ := fetchEventsFromRelays(relays, filter)
@@ -994,29 +1801,38 @@ func htmlQuoteHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodPost {
 		// Handle quote submission
 		if !loggedIn {
-			http.Redirect(w, r, "/html/login?error=Please+login+first", http.StatusSeeOther)
+			redirectWithError(w, r, "/html/login", "Please login first")
 			return
 		}
 
 		// Validate CSRF token
 		csrfToken := r.FormValue("csrf_token")
-		if !validateCSRFToken(session.ID, csrfToken) {
-			http.Error(w, "Invalid or expired CSRF token", http.StatusForbidden)
+		if !requireCSRF(w, session.ID, csrfToken) {
 			return
 		}
 
 		content := strings.TrimSpace(r.FormValue("content"))
 		quotedPubkey := strings.TrimSpace(r.FormValue("quoted_pubkey"))
+		gifURL := strings.TrimSpace(r.FormValue("gif_url"))
+
+		// Append GIF URL to content if present
+		if gifURL != "" {
+			if content != "" {
+				content = content + "\n\n" + gifURL
+			} else {
+				content = gifURL
+			}
+		}
 
 		if content == "" {
-			http.Redirect(w, r, "/html/quote/"+eventID+"?error=Quote+content+is+required", http.StatusSeeOther)
+			redirectWithError(w, r, "/html/quote/"+eventID, "You cannot post an empty note!")
 			return
 		}
 
 		// Convert event ID to note1 bech32 format for embedding in content
 		noteID, err := encodeBech32EventID(eventID)
 		if err != nil {
-			log.Printf("Failed to encode event ID: %v", err)
+			slog.Error("failed to encode event ID", "error", err)
 			noteID = eventID // fallback to hex
 		}
 
@@ -1046,37 +1862,29 @@ func htmlQuoteHandler(w http.ResponseWriter, r *http.Request) {
 
 		signedEvent, err := session.SignEvent(ctx, event)
 		if err != nil {
-			log.Printf("Failed to sign quote: %v", err)
-			http.Redirect(w, r, "/html/quote/"+eventID+"?error="+escapeURLParam(sanitizeErrorForUser("Sign event", err)), http.StatusSeeOther)
+			slog.Error("failed to sign quote", "error", err)
+			if isHelmRequest(r) {
+				http.Error(w, sanitizeErrorForUser("Sign event", err), http.StatusInternalServerError)
+				return
+			}
+			redirectWithError(w, r, "/html/quote/"+eventID, sanitizeErrorForUser("Sign event", err))
 			return
 		}
 
 		// Publish to relays
-		relays := []string{
-			"wss://relay.damus.io",
-			"wss://relay.nostr.band",
-			"wss://relay.primal.net",
-			"wss://nos.lol",
-		}
+		relays := ConfigGetPublishRelays()
 		if session.UserRelayList != nil && len(session.UserRelayList.Write) > 0 {
 			relays = session.UserRelayList.Write
 		}
 
 		publishEvent(ctx, relays, signedEvent)
 
-		log.Printf("Published quote: %s (quoting %s)", signedEvent.ID, eventID)
-		http.Redirect(w, r, "/html/timeline?kinds=1&limit=20&success=Quote+published", http.StatusSeeOther)
+		redirectWithSuccess(w, r, DefaultTimelineURLLoggedIn(), "Quote published")
 		return
 	}
 
 	// GET: Show quote form with preview of the quoted note
-	relays := []string{
-		"wss://relay.damus.io",
-		"wss://relay.nostr.band",
-		"wss://relay.primal.net",
-		"wss://nos.lol",
-		"wss://nostr.mom",
-	}
+	relays := ConfigGetDefaultRelays()
 
 	// Fetch the event to be quoted
 	events := fetchEventByID(relays, eventID)
@@ -1084,17 +1892,37 @@ func htmlQuoteHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Event not found", http.StatusNotFound)
 		return
 	}
-	quotedEvent := events[0]
+	rawEvent := events[0]
 
 	// Fetch author profile
-	var authorProfile *ProfileInfo
-	profiles := fetchProfiles(relays, []string{quotedEvent.PubKey})
-	if p, ok := profiles[quotedEvent.PubKey]; ok {
-		authorProfile = p
+	profiles := fetchProfiles(relays, []string{rawEvent.PubKey})
+	authorProfile := profiles[rawEvent.PubKey]
+
+	// Build HTMLEventItem for proper rendering (with processed content)
+	npub, _ := encodeBech32Pubkey(rawEvent.PubKey)
+	resolvedRefs := batchResolveNostrRefs(extractNostrRefs([]string{rawEvent.Content}), relays)
+	linkPreviews := FetchLinkPreviews(ExtractPreviewableURLs(rawEvent.Content))
+	kindDef := GetKindDefinition(rawEvent.Kind)
+
+	quotedEventItem := HTMLEventItem{
+		ID:             rawEvent.ID,
+		Kind:           rawEvent.Kind,
+		TemplateName:   kindDef.TemplateName,
+		RenderTemplate: computeRenderTemplate(kindDef.TemplateName, rawEvent.Tags),
+		Pubkey:         rawEvent.PubKey,
+		Npub:           npub,
+		NpubShort:      formatNpubShort(npub),
+		CreatedAt:      rawEvent.CreatedAt,
+		Content:        rawEvent.Content,
+		ContentHTML:    processContentToHTMLFull(rawEvent.Content, relays, resolvedRefs, linkPreviews),
+		AuthorProfile:  authorProfile,
 	}
 
 	// Get user display name if logged in
 	userDisplayName := ""
+	userNpubShort := ""
+	userNpub := ""
+	userAvatarURL := ""
 	if loggedIn {
 		userPubkey := hex.EncodeToString(session.UserPubKey)
 		userProfiles := fetchProfiles(relays, []string{userPubkey})
@@ -1105,14 +1933,13 @@ func htmlQuoteHandler(w http.ResponseWriter, r *http.Request) {
 				userDisplayName = p.Name
 			}
 		}
+		userNpub, _ = encodeBech32Pubkey(userPubkey)
+		userNpubShort = formatNpubShort(userNpub)
+		userAvatarURL = getUserAvatarURL(userPubkey)
 		if userDisplayName == "" {
-			npub, _ := encodeBech32Pubkey(userPubkey)
-			userDisplayName = formatNpubShort(npub)
+			userDisplayName = userNpubShort
 		}
 	}
-
-	// Prepare data for template
-	npub, _ := encodeBech32Pubkey(quotedEvent.PubKey)
 
 	// Generate CSRF token for forms (use session ID if logged in)
 	var csrfToken string
@@ -1120,34 +1947,81 @@ func htmlQuoteHandler(w http.ResponseWriter, r *http.Request) {
 		csrfToken = generateCSRFToken(session.ID)
 	}
 
+	// Get flash messages from cookies
+	flash := getFlashMessages(w, r)
+
 	data := struct {
-		Title           string
-		ThemeClass      string
-		ThemeLabel      string
-		LoggedIn        bool
-		UserDisplayName string
-		QuotedEvent     Event
-		AuthorProfile   *ProfileInfo
-		NpubShort       string
-		Error           string
-		GeneratedAt     time.Time
-		CSRFToken       string
+		Title                  string
+		ThemeClass             string
+		ThemeLabel             string
+		LoggedIn               bool
+		UserDisplayName        string
+		UserNpubShort          string
+		UserNpub               string
+		UserAvatarURL          string
+		QuotedEvent            HTMLEventItem
+		Error                  string
+		Success                string
+		GeneratedAt            time.Time
+		CSRFToken              string
+		FeedModes              []FeedMode
+		KindFilters            []KindFilter
+		NavItems               []NavItem
+		SettingsItems          []SettingsItem
+		SettingsToggle         SettingsToggle
+		ActiveRelays           []string // For base template compatibility
+		ShowPostForm           bool     // For base template compatibility (always false for quote)
+		HasUnreadNotifications bool     // For base template compatibility
+		CurrentURL             string   // For base template compatibility
+		ShowGifButton          bool     // For GIF picker
 	}{
 		Title:           "Quote Note",
 		ThemeClass:      themeClass,
 		ThemeLabel:      themeLabel,
 		LoggedIn:        loggedIn,
 		UserDisplayName: userDisplayName,
-		QuotedEvent:     quotedEvent,
-		AuthorProfile:   authorProfile,
-		NpubShort:       formatNpubShort(npub),
-		Error:           r.URL.Query().Get("error"),
+		UserNpubShort:   userNpubShort,
+		UserNpub:        userNpub,
+		UserAvatarURL:   userAvatarURL,
+		QuotedEvent:     quotedEventItem,
+		Error:           flash.Error,
+		Success:         flash.Success,
 		GeneratedAt:     time.Now(),
 		CSRFToken:       csrfToken,
+		FeedModes: GetFeedModes(FeedModeContext{
+			LoggedIn:    loggedIn,
+			ActiveFeed:  "",
+			CurrentPage: "quote",
+		}),
+		KindFilters: GetKindFilters(KindFilterContext{
+			LoggedIn:    loggedIn,
+			ActiveFeed:  "",
+			ActiveKinds: "1",
+		}),
+		NavItems: GetNavItems(NavContext{
+			LoggedIn:   loggedIn,
+			ActivePage: "",
+		}),
+		SettingsItems: GetSettingsItems(SettingsContext{
+			LoggedIn:      loggedIn,
+			ThemeLabel:    themeLabel,
+			UserAvatarURL: getUserAvatarURL(hex.EncodeToString(session.UserPubKey)),
+		}),
+		SettingsToggle: GetSettingsToggle(SettingsContext{
+			LoggedIn:      loggedIn,
+			ThemeLabel:    themeLabel,
+			UserAvatarURL: getUserAvatarURL(hex.EncodeToString(session.UserPubKey)),
+		}),
+		ActiveRelays:  relays,
+		CurrentURL:    r.URL.String(),
+		ShowGifButton: GiphyEnabled(),
 	}
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	cachedQuoteTemplate.Execute(w, data)
+	if err := cachedQuoteTemplate.ExecuteTemplate(w, tmplBase, data); err != nil {
+		slog.Error("quote template error", "error", err)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+	}
 }
 
 // getSessionFromRequest retrieves the bunker session from the request cookie
@@ -1159,6 +2033,17 @@ func getSessionFromRequest(r *http.Request) *BunkerSession {
 	return bunkerSessions.Get(cookie.Value)
 }
 
+// requireAuth checks for a valid connected session and redirects to login if not found.
+// Returns the session if valid, nil if redirected (caller should return immediately).
+func requireAuth(w http.ResponseWriter, r *http.Request) *BunkerSession {
+	session := getSessionFromRequest(r)
+	if session == nil || !session.Connected {
+		redirectWithError(w, r, "/html/login", "Please login first")
+		return nil
+	}
+	return session
+}
+
 // validEventID matches a 64-character lowercase hex string (nostr event ID)
 var validEventID = regexp.MustCompile(`^[a-f0-9]{64}$`)
 
@@ -1168,13 +2053,20 @@ func isValidEventID(id string) bool {
 }
 
 // sanitizeReturnURL ensures the return URL is a local path to prevent open redirects
-func sanitizeReturnURL(returnURL string) string {
+// loggedIn determines which default timeline to use when returnURL is empty or invalid
+func sanitizeReturnURL(returnURL string, loggedIn bool) string {
 	if returnURL == "" {
-		return "/html/timeline?kinds=1&limit=20"
+		if loggedIn {
+			return DefaultTimelineURLLoggedIn()
+		}
+		return DefaultTimelineURL()
 	}
 	// Must start with / and not // (which could be protocol-relative URL)
 	if !strings.HasPrefix(returnURL, "/") || strings.HasPrefix(returnURL, "//") {
-		return "/html/timeline?kinds=1&limit=20"
+		if loggedIn {
+			return DefaultTimelineURLLoggedIn()
+		}
+		return DefaultTimelineURL()
 	}
 	return returnURL
 }
@@ -1184,14 +2076,13 @@ func escapeURLParam(s string) string {
 	return url.QueryEscape(s)
 }
 
+
 // publishEvent publishes a signed event to relays
 func publishEvent(ctx context.Context, relays []string, event *Event) {
 	for _, relay := range relays {
 		go func(relayURL string) {
 			if err := publishToRelay(ctx, relayURL, event); err != nil {
-				log.Printf("Failed to publish to %s: %v", relayURL, err)
-			} else {
-				log.Printf("Published to %s", relayURL)
+				slog.Warn("failed to publish", "relay", relayURL, "error", err)
 			}
 		}(relay)
 	}
@@ -1200,380 +2091,18 @@ func publishEvent(ctx context.Context, relays []string, event *Event) {
 }
 
 func publishToRelay(ctx context.Context, relayURL string, event *Event) error {
-	pc, err := relayPool.Get(ctx, relayURL)
+	eventMsg := []interface{}{"EVENT", event}
+
+	resp, err := relayPool.PublishEvent(ctx, relayURL, event.ID, eventMsg)
 	if err != nil {
-		return err
-	}
-	defer relayPool.Release(pc)
-
-	req := []interface{}{"EVENT", event}
-	if err := pc.WriteJSON(req); err != nil {
-		relayPool.Close(pc)
-		return fmt.Errorf("write failed: %v", err)
+		return fmt.Errorf("publish failed: %v", err)
 	}
 
-	// Wait for OK response
-	pc.SetReadDeadline(time.Now().Add(5 * time.Second))
-	var msg []interface{}
-	if err := pc.ReadJSON(&msg); err != nil {
-		relayPool.Close(pc)
-		return fmt.Errorf("read OK failed: %v", err)
+	if !resp.Success {
+		return fmt.Errorf("relay rejected event %s: %s", resp.EventID, resp.Message)
 	}
-
-	if len(msg) >= 4 {
-		msgType, _ := msg[0].(string)
-		if msgType == "OK" {
-			eventID, _ := msg[1].(string)
-			success, _ := msg[2].(bool)
-			reason := ""
-			if len(msg) > 3 {
-				reason, _ = msg[3].(string)
-			}
-			if !success {
-				return fmt.Errorf("relay rejected event %s: %s", eventID, reason)
-			}
-			log.Printf("Relay %s accepted event %s", relayURL, eventID[:16])
-		}
-	}
-
 	return nil
 }
-
-var htmlQuoteTemplate = `<!DOCTYPE html>
-<html lang="en"{{if .ThemeClass}} class="{{.ThemeClass}}"{{end}}>
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>{{.Title}} - Nostr Hypermedia</title>
-  <link rel="icon" href="/static/favicon.ico" />
-  <style>
-    :root {
-      --bg-page: #f5f5f5;
-      --bg-container: #ffffff;
-      --bg-card: #ffffff;
-      --bg-secondary: #f8f9fa;
-      --bg-input: #ffffff;
-      --text-primary: #333333;
-      --text-secondary: #666666;
-      --text-muted: #999999;
-      --text-content: #24292e;
-      --border-color: #e1e4e8;
-      --border-light: #dee2e6;
-      --accent: #667eea;
-      --accent-hover: #5568d3;
-      --accent-secondary: #764ba2;
-      --success: #2e7d32;
-      --error-bg: #fff5f5;
-      --error-border: #fecaca;
-      --error-accent: #dc2626;
-      --shadow: rgba(0,0,0,0.1);
-    }
-    @media (prefers-color-scheme: dark) {
-      :root:not(.light) {
-        --bg-page: #121212;
-        --bg-container: #1e1e1e;
-        --bg-card: #1e1e1e;
-        --bg-secondary: #252525;
-        --bg-input: #2a2a2a;
-        --text-primary: #e4e4e7;
-        --text-secondary: #a1a1aa;
-        --text-muted: #71717a;
-        --text-content: #e4e4e7;
-        --border-color: #333333;
-        --border-light: #333333;
-        --accent: #818cf8;
-        --accent-hover: #6366f1;
-        --accent-secondary: #a78bfa;
-        --success: #4ade80;
-        --error-bg: #2d1f1f;
-        --error-border: #7f1d1d;
-        --error-accent: #f87171;
-        --shadow: rgba(0,0,0,0.3);
-      }
-    }
-    html.dark {
-      --bg-page: #121212;
-      --bg-container: #1e1e1e;
-      --bg-card: #1e1e1e;
-      --bg-secondary: #252525;
-      --bg-input: #2a2a2a;
-      --text-primary: #e4e4e7;
-      --text-secondary: #a1a1aa;
-      --text-muted: #71717a;
-      --text-content: #e4e4e7;
-      --border-color: #333333;
-      --border-light: #333333;
-      --accent: #818cf8;
-      --accent-hover: #6366f1;
-      --accent-secondary: #a78bfa;
-      --success: #4ade80;
-      --error-bg: #2d1f1f;
-      --error-border: #7f1d1d;
-      --error-accent: #f87171;
-      --shadow: rgba(0,0,0,0.3);
-    }
-    html.light {
-      --bg-page: #f5f5f5;
-      --bg-container: #ffffff;
-      --bg-card: #ffffff;
-      --bg-secondary: #f8f9fa;
-      --bg-input: #ffffff;
-      --text-primary: #333333;
-      --text-secondary: #666666;
-      --text-muted: #999999;
-      --text-content: #24292e;
-      --border-color: #e1e4e8;
-      --border-light: #dee2e6;
-      --accent: #667eea;
-      --accent-hover: #5568d3;
-      --accent-secondary: #764ba2;
-      --success: #2e7d32;
-      --error-bg: #fff5f5;
-      --error-border: #fecaca;
-      --error-accent: #dc2626;
-      --shadow: rgba(0,0,0,0.1);
-    }
-    * { box-sizing: border-box; margin: 0; padding: 0; }
-    body {
-      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-      background: var(--bg-page);
-      color: var(--text-primary);
-      line-height: 1.6;
-      min-height: 100vh;
-    }
-    .container {
-      max-width: 800px;
-      margin: 0 auto;
-      background: var(--bg-container);
-      border-radius: 8px;
-      box-shadow: 0 2px 8px var(--shadow);
-    }
-    .flex-center { display: flex; align-items: center; }
-    .gap-md { gap: 12px; }
-    .text-muted { color: var(--text-muted); }
-    .text-sm { font-size: 13px; }
-    nav {
-      display: flex;
-      gap: 8px;
-      padding: 12px 16px;
-      background: var(--bg-secondary);
-      border-bottom: 1px solid var(--border-light);
-      align-items: center;
-    }
-    .nav-tab {
-      padding: 8px 16px;
-      text-decoration: none;
-      color: var(--text-secondary);
-      border-radius: 4px;
-      font-size: 14px;
-      transition: all 0.2s;
-    }
-    .nav-tab:hover { background: var(--bg-card); color: var(--text-primary); }
-    .nav-tab.active {
-      background: var(--accent);
-      color: white;
-    }
-    main { padding: 20px; overflow: hidden; }
-    .error-message {
-      background: var(--error-bg);
-      color: var(--error-accent);
-      border: 1px solid var(--error-border);
-      padding: 12px;
-      border-radius: 4px;
-      margin-bottom: 16px;
-    }
-    .quoted-note {
-      background: var(--bg-secondary);
-      border: 1px solid var(--border-color);
-      border-left: 3px solid var(--accent);
-      border-radius: 4px;
-      padding: 16px;
-      margin-bottom: 20px;
-    }
-    .quoted-author {
-      display: flex;
-      align-items: center;
-      gap: 10px;
-      margin-bottom: 10px;
-    }
-    .quoted-avatar {
-      width: 36px;
-      height: 36px;
-      border-radius: 50%;
-      object-fit: cover;
-      background: var(--bg-tertiary);
-    }
-    .quoted-name {
-      font-weight: 600;
-      color: var(--text-primary);
-    }
-    .quoted-npub {
-      font-family: monospace;
-      font-size: 11px;
-      color: var(--text-muted);
-    }
-    .quoted-content {
-      font-size: 14px;
-      line-height: 1.5;
-      color: var(--text-content);
-      white-space: pre-wrap;
-      word-wrap: break-word;
-    }
-    .quoted-meta {
-      font-size: 12px;
-      color: var(--text-muted);
-      margin-top: 10px;
-    }
-    .quote-form {
-      background: var(--bg-card);
-      padding: 16px;
-      border-radius: 8px;
-    }
-    .form-label {
-      font-size: 13px;
-      color: var(--text-secondary);
-      margin-bottom: 10px;
-    }
-    .form-label strong {
-      color: var(--success);
-      font-weight: 500;
-    }
-    textarea {
-      width: 100%;
-      padding: 12px;
-      border: 1px solid var(--border-color);
-      border-radius: 4px;
-      font-size: 14px;
-      font-family: inherit;
-      min-height: 100px;
-      resize: vertical;
-      margin-bottom: 12px;
-      background: var(--bg-input);
-      color: var(--text-primary);
-    }
-    textarea:focus {
-      outline: none;
-      border-color: var(--accent);
-    }
-    .submit-btn {
-      padding: 10px 24px;
-      background: linear-gradient(135deg, var(--accent) 0%, var(--accent-secondary) 100%);
-      color: white;
-      border: none;
-      border-radius: 4px;
-      font-size: 14px;
-      font-weight: 600;
-      cursor: pointer;
-      transition: opacity 0.2s;
-    }
-    .submit-btn:hover { opacity: 0.9; }
-    .login-prompt {
-      text-align: center;
-      padding: 40px 20px;
-      color: var(--text-secondary);
-    }
-    .login-prompt a {
-      color: var(--accent);
-      text-decoration: none;
-      font-weight: 500;
-    }
-    /* Utility classes */
-    .ml-auto { margin-left: auto; }
-    .text-xs { font-size: 12px; }
-    .inline-form { display: inline; margin: 0; }
-    .ghost-btn {
-      background: none;
-      border: none;
-      color: var(--text-secondary);
-      cursor: pointer;
-      font-family: inherit;
-      padding: 0;
-    }
-    footer {
-      text-align: center;
-      padding: 20px;
-      background: var(--bg-secondary);
-      color: var(--text-secondary);
-      font-size: 13px;
-      border-top: 1px solid var(--border-light);
-    }
-  </style>
-</head>
-<body>
-  <div class="container">
-    <nav>
-      {{if .LoggedIn}}
-      <a href="/html/timeline?kinds=1&limit=20&feed=follows" class="nav-tab">Follows</a>
-      {{end}}
-      <a href="/html/timeline?kinds=1&limit=20&feed=global" class="nav-tab">Global</a>
-      {{if .LoggedIn}}
-      <a href="/html/timeline?kinds=1&limit=20&feed=me" class="nav-tab">Me</a>
-      {{end}}
-      <div class="ml-auto flex-center gap-md">
-        {{if .LoggedIn}}
-        <a href="/html/notifications" class="text-muted text-sm" title="Notifications">🔔</a>
-        <form method="POST" action="/html/logout" class="inline-form">
-          <button type="submit" class="ghost-btn text-muted text-sm">Logout</button>
-        </form>
-        {{else}}
-        <a href="/html/login" class="text-muted text-sm">Login</a>
-        {{end}}
-      </div>
-    </nav>
-
-    <main>
-      {{if .Error}}
-      <div class="error-message">{{.Error}}</div>
-      {{end}}
-
-      <div class="quoted-note">
-        <div class="quoted-author">
-          {{if and .AuthorProfile .AuthorProfile.Picture}}
-          <img class="quoted-avatar" src="{{.AuthorProfile.Picture}}" alt="">
-          {{else}}
-          <img class="quoted-avatar" src="/static/avatar.jpg" alt="">
-          {{end}}
-          <div>
-            {{if .AuthorProfile}}
-              {{if or .AuthorProfile.DisplayName .AuthorProfile.Name}}
-              <div class="quoted-name">{{if .AuthorProfile.DisplayName}}{{.AuthorProfile.DisplayName}}{{else}}{{.AuthorProfile.Name}}{{end}}</div>
-              {{if .AuthorProfile.Nip05}}<div class="quoted-npub">{{.AuthorProfile.Nip05}}</div>{{end}}
-              {{else if .AuthorProfile.Nip05}}
-              <div class="quoted-name">{{.AuthorProfile.Nip05}}</div>
-              {{else}}
-              <div class="quoted-name">{{.NpubShort}}</div>
-              {{end}}
-            {{else}}
-              <div class="quoted-name">{{.NpubShort}}</div>
-            {{end}}
-          </div>
-        </div>
-        <div class="quoted-content">{{.QuotedEvent.Content}}</div>
-        <div class="quoted-meta">{{formatTime .QuotedEvent.CreatedAt}}</div>
-      </div>
-
-      {{if .LoggedIn}}
-      <form method="POST" class="quote-form">
-        <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
-        <input type="hidden" name="quoted_pubkey" value="{{.QuotedEvent.PubKey}}">
-        <div class="form-label">Quoting as: <strong>{{.UserDisplayName}}</strong></div>
-        <textarea name="content" placeholder="Add your commentary..." required autofocus></textarea>
-        <button type="submit" class="submit-btn">Post Commentary</button>
-      </form>
-      {{else}}
-      <div class="login-prompt">
-        <p>Please <a href="/html/login">login</a> to quote this note.</p>
-      </div>
-      {{end}}
-    </main>
-
-    <footer>
-      <p>Generated: {{.GeneratedAt.Format "15:04:05"}} · Zero-JS Hypermedia Browser</p>
-    </footer>
-  </div>
-</body>
-</html>
-`
 
 var htmlLoginTemplate = `<!DOCTYPE html>
 <html lang="en"{{if .ThemeClass}} class="{{.ThemeClass}}"{{end}}>
@@ -1910,20 +2439,20 @@ var htmlLoginTemplate = `<!DOCTYPE html>
     </header>
 
     <nav>
-      <a href="/html/timeline?kinds=1&limit=20&fast=1">Timeline</a>
+      <a href="/html/timeline?kinds=1&limit=20">Timeline</a>
     </nav>
 
     <main>
       {{if .Error}}
-      <div class="alert alert-error">{{.Error}}</div>
+      <div class="alert alert-error" role="alert">{{.Error}}</div>
       {{end}}
       {{if .Success}}
-      <div class="alert alert-success">{{.Success}}</div>
+      <div class="alert alert-success" role="alert">{{.Success}}</div>
       {{end}}
 
       {{if .NostrConnectURL}}
       <div class="login-form login-section">
-        <h3>Option 1: Scan with Signer App</h3>
+        <h2>Option 1: Scan with Signer App</h2>
         {{if .QRCodeDataURL}}
         <div class="qr-container">
           <img src="{{.QRCodeDataURL}}" alt="Scan this QR code with your signer app" class="qr-code">
@@ -1952,7 +2481,8 @@ var htmlLoginTemplate = `<!DOCTYPE html>
       {{end}}
 
       <form class="login-form login-section" method="POST" action="/html/login">
-        <h3>Option 2: Paste Bunker URL</h3>
+        <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
+        <h2>Option 2: Paste Bunker URL</h2>
         <div class="form-group">
           <label for="bunker_url">Bunker URL</label>
           <input type="text" id="bunker_url" name="bunker_url"
@@ -1970,7 +2500,8 @@ var htmlLoginTemplate = `<!DOCTYPE html>
       </div>
 
       <form class="login-form login-section" method="POST" action="/html/reconnect">
-        <h3>Option 3: Reconnect to Existing Bunker</h3>
+        <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
+        <h2>Option 3: Reconnect to Existing Bunker</h2>
         <p class="server-info">
           <strong>This server's pubkey:</strong><br>
           <code>{{.ServerPubKey}}</code><br>
@@ -1989,12 +2520,12 @@ var htmlLoginTemplate = `<!DOCTYPE html>
       </form>
 
       <div class="info-section">
-        <h3>How it works</h3>
+        <h2>How it works</h2>
         <p>
           This login uses <strong>NIP-46 (Nostr Connect)</strong> - your private key never leaves your signer app.
           The server only sees your public key and cannot sign events without your approval.
         </p>
-        <h3>Supported signers</h3>
+        <h2>Supported signers</h2>
         <ul>
           <li><a href="https://nsec.app" target="_blank">nsec.app</a> - Web-based remote signer</li>
           <li><a href="https://github.com/greenart7c3/Amber" target="_blank">Amber</a> - Android signer</li>
@@ -2019,30 +2550,28 @@ func renderLoginPage(w http.ResponseWriter, data interface{}) {
 // htmlFollowHandler handles following/unfollowing a user (kind 3 contact list)
 func htmlFollowHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Redirect(w, r, "/html/timeline?kinds=1&limit=20", http.StatusSeeOther)
+		http.Redirect(w, r, DefaultTimelineURL(), http.StatusSeeOther)
 		return
 	}
 
-	session := getSessionFromRequest(r)
-	if session == nil || !session.Connected {
-		http.Redirect(w, r, "/html/login?error=Please+login+first", http.StatusSeeOther)
+	session := requireAuth(w, r)
+	if session == nil {
 		return
 	}
 
 	// Validate CSRF token
 	csrfToken := r.FormValue("csrf_token")
-	if !validateCSRFToken(session.ID, csrfToken) {
-		http.Error(w, "Invalid or expired CSRF token", http.StatusForbidden)
+	if !requireCSRF(w, session.ID, csrfToken) {
 		return
 	}
 
 	targetPubkey := strings.TrimSpace(r.FormValue("pubkey"))
 	action := strings.TrimSpace(r.FormValue("action")) // "follow" or "unfollow"
-	returnURL := sanitizeReturnURL(strings.TrimSpace(r.FormValue("return_url")))
+	returnURL := sanitizeReturnURL(strings.TrimSpace(r.FormValue("return_url")), true) // logged in (requireAuth passed)
 
 	// Validate pubkey (same format as event IDs: 64 hex chars)
 	if targetPubkey == "" || !isValidEventID(targetPubkey) {
-		http.Redirect(w, r, returnURL+"?error=Invalid+pubkey", http.StatusSeeOther)
+		redirectWithError(w, r, returnURL, "Invalid pubkey")
 		return
 	}
 
@@ -2053,7 +2582,7 @@ func htmlFollowHandler(w http.ResponseWriter, r *http.Request) {
 	// Don't allow following yourself
 	userPubkey := hex.EncodeToString(session.UserPubKey)
 	if targetPubkey == userPubkey {
-		http.Redirect(w, r, returnURL+"?error=Cannot+follow+yourself", http.StatusSeeOther)
+		redirectWithError(w, r, returnURL, "Cannot follow yourself")
 		return
 	}
 
@@ -2061,11 +2590,7 @@ func htmlFollowHandler(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 
 	// Get relays to use
-	relays := []string{
-		"wss://relay.damus.io",
-		"wss://relay.nostr.band",
-		"wss://nos.lol",
-	}
+	relays := ConfigGetPublishRelays()
 	if session.UserRelayList != nil && len(session.UserRelayList.Write) > 0 {
 		relays = session.UserRelayList.Write
 	}
@@ -2114,12 +2639,12 @@ func htmlFollowHandler(w http.ResponseWriter, r *http.Request) {
 	// Sign via bunker
 	signedEvent, err := session.SignEvent(ctx, event)
 	if err != nil {
-		log.Printf("Failed to sign contact list: %v", err)
-		separator := "?"
-		if strings.Contains(returnURL, "?") {
-			separator = "&"
+		slog.Error("failed to sign contact list", "error", err)
+		if isHelmRequest(r) {
+			http.Error(w, sanitizeErrorForUser("Sign event", err), http.StatusInternalServerError)
+			return
 		}
-		http.Redirect(w, r, returnURL+separator+"error="+escapeURLParam(sanitizeErrorForUser("Sign event", err)), http.StatusSeeOther)
+		redirectWithError(w, r, returnURL, sanitizeErrorForUser("Sign event", err))
 		return
 	}
 
@@ -2142,7 +2667,23 @@ func htmlFollowHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	session.mu.Unlock()
 
-	log.Printf("Published contact list update: %s (action=%s, target=%s)", signedEvent.ID, action, targetPubkey[:16])
+	// For HelmJS requests, return the updated follow button fragment
+	if isHelmRequest(r) {
+		// Generate new CSRF token for the updated form
+		newCSRFToken := generateCSRFToken(session.ID)
+		// isFollowing is now the opposite of what it was (we toggled it)
+		newFollowingState := action == "follow"
+		html, err := renderFollowButtonFragment(targetPubkey, newCSRFToken, returnURL, newFollowingState)
+		if err != nil {
+			slog.Error("failed to render follow button fragment", "error", err)
+			http.Error(w, "Failed to render response", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Write([]byte(html))
+		return
+	}
+
 	http.Redirect(w, r, returnURL, http.StatusSeeOther)
 }
 
@@ -2181,7 +2722,7 @@ func htmlProfileEditHandler(w http.ResponseWriter, r *http.Request) {
 
 	userPubKeyHex := hex.EncodeToString(session.UserPubKey)
 
-	if r.Method == "GET" {
+	if r.Method == http.MethodGet {
 		// Fetch current profile
 		var relays []string
 		session.mu.Lock()
@@ -2193,7 +2734,7 @@ func htmlProfileEditHandler(w http.ResponseWriter, r *http.Request) {
 			relays = session.Relays
 		}
 		if len(relays) == 0 {
-			relays = defaultNostrConnectRelays
+			relays = defaultNostrConnectRelays()
 		}
 
 		var profile ProfileInfo
@@ -2202,7 +2743,7 @@ func htmlProfileEditHandler(w http.ResponseWriter, r *http.Request) {
 		events := fetchKind0(relays, userPubKeyHex)
 		if len(events) > 0 {
 			if err := json.Unmarshal([]byte(events[0].Content), &profile); err != nil {
-				log.Printf("Failed to parse profile: %v", err)
+				slog.Error("failed to parse profile", "error", err)
 			}
 			// Keep raw content to preserve unknown fields
 			if err := json.Unmarshal([]byte(events[0].Content), &rawContent); err != nil {
@@ -2220,6 +2761,9 @@ func htmlProfileEditHandler(w http.ResponseWriter, r *http.Request) {
 
 		themeClass, themeLabel := getThemeFromRequest(r)
 		currentURL := r.URL.String()
+
+		// Get flash messages from cookies
+		flash := getFlashMessages(w, r)
 
 		data := HTMLProfileData{
 			Title:      "Edit Profile - Nostr Hypermedia",
@@ -2240,33 +2784,58 @@ func htmlProfileEditHandler(w http.ResponseWriter, r *http.Request) {
 			// Edit mode fields
 			EditMode:   true,
 			RawContent: string(rawContentJSON),
-			Error:      r.URL.Query().Get("error"),
-			Success:    r.URL.Query().Get("success"),
+			Error:      flash.Error,
+			Success:    flash.Success,
+			// Navigation (NATEOAS)
+			FeedModes: GetFeedModes(FeedModeContext{
+				LoggedIn:    true,
+				ActiveFeed:  "me",
+				CurrentPage: "profile",
+			}),
+			KindFilters: GetKindFilters(KindFilterContext{
+				LoggedIn:    true,
+				ActiveFeed:  "me",
+				ActiveKinds: "",
+			}),
+			NavItems: GetNavItems(NavContext{
+				LoggedIn:   true,
+				ActivePage: "",
+			}),
+			SettingsItems: GetSettingsItems(SettingsContext{
+				LoggedIn:      true,
+				ThemeLabel:    themeLabel,
+				UserAvatarURL: getUserAvatarURL(userPubKeyHex),
+			}),
+			SettingsToggle: GetSettingsToggle(SettingsContext{
+				LoggedIn:      true,
+				ThemeLabel:    themeLabel,
+				UserAvatarURL: getUserAvatarURL(userPubKeyHex),
+			}),
 		}
 
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		if err := cachedProfileTemplate.Execute(w, data); err != nil {
-			log.Printf("Template error: %v", err)
+		if err := cachedProfileTemplate.ExecuteTemplate(w, tmplBase, data); err != nil {
+			slog.Error("template error", "error", err)
 			http.Error(w, "Internal server error", http.StatusInternalServerError)
 		}
 		return
 	}
 
 	// POST - save profile
-	if r.Method != "POST" {
+	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
 	// Validate CSRF
 	if err := r.ParseForm(); err != nil {
-		http.Redirect(w, r, "/html/profile/edit?error="+escapeURLParam("Invalid form data"), http.StatusSeeOther)
+		redirectWithError(w, r, "/html/profile/edit", "Invalid form data")
 		return
 	}
 
 	csrfToken := r.FormValue("csrf_token")
 	if !validateCSRFToken(session.ID, csrfToken) {
-		http.Redirect(w, r, "/html/profile/edit?error="+escapeURLParam("Invalid session, please try again"), http.StatusSeeOther)
+		redirectWithError(w, r, "/html/profile/edit", "Invalid session, please try again")
 		return
 	}
 
@@ -2283,15 +2852,15 @@ func htmlProfileEditHandler(w http.ResponseWriter, r *http.Request) {
 
 	// Basic URL validation for picture and banner
 	if picture != "" && !isValidURL(picture) {
-		http.Redirect(w, r, "/html/profile/edit?error="+escapeURLParam("Invalid picture URL"), http.StatusSeeOther)
+		redirectWithError(w, r, "/html/profile/edit", "Invalid picture URL")
 		return
 	}
 	if banner != "" && !isValidURL(banner) {
-		http.Redirect(w, r, "/html/profile/edit?error="+escapeURLParam("Invalid banner URL"), http.StatusSeeOther)
+		redirectWithError(w, r, "/html/profile/edit", "Invalid banner URL")
 		return
 	}
 	if website != "" && !isValidURL(website) {
-		http.Redirect(w, r, "/html/profile/edit?error="+escapeURLParam("Invalid website URL"), http.StatusSeeOther)
+		redirectWithError(w, r, "/html/profile/edit", "Invalid website URL")
 		return
 	}
 
@@ -2326,7 +2895,7 @@ func htmlProfileEditHandler(w http.ResponseWriter, r *http.Request) {
 	// Serialize profile content
 	contentJSON, err := json.Marshal(profileData)
 	if err != nil {
-		http.Redirect(w, r, "/html/profile/edit?error="+escapeURLParam("Failed to encode profile"), http.StatusSeeOther)
+		redirectWithError(w, r, "/html/profile/edit", "Failed to encode profile")
 		return
 	}
 
@@ -2344,8 +2913,8 @@ func htmlProfileEditHandler(w http.ResponseWriter, r *http.Request) {
 
 	signedEvent, err := session.SignEvent(ctx, event)
 	if err != nil {
-		log.Printf("Failed to sign profile update: %v", err)
-		http.Redirect(w, r, "/html/profile/edit?error="+escapeURLParam(sanitizeErrorForUser("Sign profile", err)), http.StatusSeeOther)
+		slog.Error("failed to sign profile update", "error", err)
+		redirectWithError(w, r, "/html/profile/edit", sanitizeErrorForUser("Sign profile", err))
 		return
 	}
 
@@ -2360,7 +2929,7 @@ func htmlProfileEditHandler(w http.ResponseWriter, r *http.Request) {
 		relays = session.Relays
 	}
 	if len(relays) == 0 {
-		relays = defaultNostrConnectRelays
+		relays = defaultNostrConnectRelays()
 	}
 
 	// Publish to relays
@@ -2369,8 +2938,7 @@ func htmlProfileEditHandler(w http.ResponseWriter, r *http.Request) {
 	// Invalidate cached profile
 	profileCache.Delete(userPubKeyHex)
 
-	log.Printf("Published profile update: %s (pubkey=%s)", signedEvent.ID, userPubKeyHex[:16])
-	http.Redirect(w, r, "/html/profile/"+userPubKeyHex+"?success="+escapeURLParam("Profile updated"), http.StatusSeeOther)
+	redirectWithSuccess(w, r, "/html/profile/"+userPubKeyHex, "Profile updated")
 }
 
 // isValidURL checks if a string is a valid HTTP/HTTPS URL
@@ -2380,4 +2948,677 @@ func isValidURL(s string) bool {
 		return false
 	}
 	return u.Scheme == "http" || u.Scheme == "https"
+}
+
+// htmlWalletConnectHandler handles wallet connection via NWC URI
+func htmlWalletConnectHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Redirect(w, r, "/html/wallet", http.StatusSeeOther)
+		return
+	}
+
+	session := requireAuth(w, r)
+	if session == nil {
+		return
+	}
+
+	// Validate CSRF token
+	csrfToken := r.FormValue("csrf_token")
+	if !requireCSRF(w, session.ID, csrfToken) {
+		return
+	}
+
+	// Parse NWC URI
+	nwcURI := strings.TrimSpace(r.FormValue("nwc_uri"))
+	if nwcURI == "" {
+		redirectWithError(w, r, "/html/wallet", I18n("wallet.error_empty_uri"))
+		return
+	}
+
+	config, err := ParseNWCURI(nwcURI)
+	if err != nil {
+		slog.Warn("invalid NWC URI", "error", err)
+		redirectWithError(w, r, "/html/wallet", I18n("wallet.error_invalid_uri"))
+		return
+	}
+
+	// Store wallet config in session
+	session.SetNWCConfig(config)
+
+	// Update session in store
+	bunkerSessions.Set(session)
+
+	userPubkeyHex := hex.EncodeToString(session.UserPubKey)
+	slog.Info("wallet connected", "user", userPubkeyHex[:8], "relay", config.Relay)
+
+	// Start background connection and prefetch (non-blocking)
+	// This establishes the NWC WebSocket connection and fetches balance/transactions
+	// so when user eventually visits wallet page, everything is ready
+	PrefetchWalletInfo(userPubkeyHex, config)
+
+	// Redirect to return URL or wallet page
+	returnURL := r.FormValue("return_url")
+	if returnURL == "" {
+		returnURL = "/html/wallet"
+	}
+	redirectWithSuccess(w, r, returnURL, I18n("wallet.connected_success"))
+}
+
+// htmlWalletDisconnectHandler handles wallet disconnection
+func htmlWalletDisconnectHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Redirect(w, r, "/html/wallet", http.StatusSeeOther)
+		return
+	}
+
+	session := requireAuth(w, r)
+	if session == nil {
+		return
+	}
+
+	// Validate CSRF token
+	csrfToken := r.FormValue("csrf_token")
+	if !requireCSRF(w, session.ID, csrfToken) {
+		return
+	}
+
+	// Close pooled NWC connection and clear cache
+	userPubkeyHex := hex.EncodeToString(session.UserPubKey)
+	CloseNWCPoolConnection(userPubkeyHex)
+	DeleteCachedWalletInfo(userPubkeyHex)
+
+	// Clear wallet config
+	session.ClearNWCConfig()
+
+	// Update session in store
+	bunkerSessions.Set(session)
+
+	slog.Info("wallet disconnected", "user", userPubkeyHex[:8])
+
+	// Redirect to return URL or wallet page
+	returnURL := r.FormValue("return_url")
+	if returnURL == "" {
+		returnURL = "/html/wallet"
+	}
+	redirectWithSuccess(w, r, returnURL, I18n("wallet.disconnected_success"))
+}
+
+// HTMLWalletInfoData holds data for the wallet info fragment
+type HTMLWalletInfoData struct {
+	Balance      string // Formatted balance (e.g., "⚡ 57,344")
+	BalanceMsats int64  // Raw balance in millisatoshis
+	Transactions []HTMLWalletTransaction
+	Error        string // Error message if fetch failed
+}
+
+// HTMLWalletTransaction represents a transaction for display
+type HTMLWalletTransaction struct {
+	Type        string // "incoming" or "outgoing"
+	TypeIcon    string // "↓" or "↑"
+	Amount      string // Formatted amount (e.g., "2,100")
+	AmountMsats int64  // Raw amount in millisatoshis
+	Description string // Truncated description or zap context
+	TimeAgo     string // Relative time (e.g., "2h ago")
+	CreatedAt   int64  // Unix timestamp
+	// Zap context
+	IsZap          bool
+	ZapDisplayName string // "Zapped @alice" or "From @bob"
+}
+
+func htmlWalletInfoHandler(w http.ResponseWriter, r *http.Request) {
+	session := requireAuth(w, r)
+	if session == nil {
+		return
+	}
+
+	if session.NWCConfig == nil {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Write([]byte(`<div class="wallet-info-error">` + I18n("wallet.not_connected") + `</div>`))
+		return
+	}
+
+	ctx := r.Context()
+	userPubkeyHex := hex.EncodeToString(session.UserPubKey)
+
+	// Check cache first
+	if cached, found := GetCachedWalletInfo(userPubkeyHex); found {
+		slog.Debug("wallet info: serving from cache", "user", userPubkeyHex[:16])
+		data := cachedToHTMLWalletInfo(cached)
+		html, err := renderWalletInfoFragment(data)
+		if err != nil {
+			slog.Error("wallet info: failed to render cached data", "error", err)
+			http.Error(w, "Failed to render wallet info", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Write([]byte(html))
+		return
+	}
+
+	// Check if prefetch is in progress (started by wallet page handler)
+	if result, found := WaitForWalletInfoPrefetch(userPubkeyHex, 20*time.Second); found && result != nil {
+		slog.Debug("wallet info: served from prefetch", "user", userPubkeyHex[:16])
+		data := cachedToHTMLWalletInfo(result)
+		html, err := renderWalletInfoFragment(data)
+		if err != nil {
+			slog.Error("wallet info: failed to render prefetch data", "error", err)
+			http.Error(w, "Failed to render wallet info", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Write([]byte(html))
+		return
+	}
+
+	// No cache, no prefetch - fetch directly
+	slog.Debug("wallet info: fetching from NWC", "user", userPubkeyHex[:16])
+	cached := fetchWalletInfo(ctx, userPubkeyHex, session.NWCConfig)
+	if cached == nil {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Write([]byte(`<div class="wallet-info-error">` + I18n("wallet.connection_failed") + `</div>`))
+		return
+	}
+
+	// Cache the result
+	SetCachedWalletInfo(userPubkeyHex, cached)
+
+	data := cachedToHTMLWalletInfo(cached)
+	html, err := renderWalletInfoFragment(data)
+	if err != nil {
+		slog.Error("wallet info: failed to render", "error", err)
+		http.Error(w, "Failed to render wallet info", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Write([]byte(html))
+}
+
+// fetchWalletInfo fetches balance and transactions from NWC and returns cached format
+func fetchWalletInfo(ctx context.Context, userPubkeyHex string, config *NWCConfig) *CachedWalletInfo {
+	// Get pooled NWC client
+	nwcClient, err := GetPooledNWCClient(ctx, userPubkeyHex, config)
+	if err != nil {
+		slog.Warn("fetchWalletInfo: failed to get pooled client", "error", err)
+		return nil
+	}
+
+	result := &CachedWalletInfo{}
+
+	// Get balance
+	balanceResult, err := nwcClient.GetBalance(ctx)
+	if err != nil {
+		slog.Warn("fetchWalletInfo: failed to get balance", "error", err)
+		result.Error = I18n("wallet.balance_failed")
+	} else {
+		result.BalanceMsats = balanceResult.Balance
+		sats := balanceResult.Balance / 1000
+		result.Balance = formatSatsWithCommas(sats)
+	}
+
+	// Get recent transactions (limit to 10)
+	txResult, err := nwcClient.ListTransactions(ctx, 10)
+	if err != nil {
+		slog.Debug("fetchWalletInfo: failed to get transactions", "error", err)
+		// Not critical, just don't show transactions
+	} else {
+		// First pass: parse transactions and collect pubkeys for profile fetch
+		var pubkeysToFetch []string
+		for _, tx := range txResult.Transactions {
+			cachedTx := CachedWalletTransaction{
+				Type:        tx.Type,
+				AmountMsats: tx.Amount,
+				Amount:      formatSatsWithCommas(tx.Amount / 1000),
+				Description: truncateWithEllipsis(tx.Description, 40),
+				CreatedAt:   tx.CreatedAt,
+				TimeAgo:     formatRelativeTime(tx.CreatedAt),
+			}
+			if tx.Type == "incoming" {
+				cachedTx.TypeIcon = "↓"
+			} else {
+				cachedTx.TypeIcon = "↑"
+			}
+
+			// Try to parse zap context from description
+			if zapPubkey := parseZapPubkeyFromDescription(tx.Description, tx.Type); zapPubkey != "" {
+				cachedTx.IsZap = true
+				cachedTx.ZapPubkey = zapPubkey
+				pubkeysToFetch = append(pubkeysToFetch, zapPubkey)
+			}
+
+			result.Transactions = append(result.Transactions, cachedTx)
+		}
+
+		// Batch fetch profiles for zap pubkeys
+		if len(pubkeysToFetch) > 0 {
+			relays := ConfigGetProfileRelays()
+			profiles := fetchProfiles(relays, pubkeysToFetch)
+
+			// Second pass: update transactions with display names
+			for i := range result.Transactions {
+				tx := &result.Transactions[i]
+				if tx.IsZap && tx.ZapPubkey != "" {
+					displayName := "someone"
+					if profile, ok := profiles[tx.ZapPubkey]; ok && profile != nil {
+						if profile.DisplayName != "" {
+							displayName = profile.DisplayName
+						} else if profile.Name != "" {
+							displayName = profile.Name
+						}
+					}
+					if tx.Type == "outgoing" {
+						tx.ZapDisplayName = "Zapped " + displayName
+					} else {
+						tx.ZapDisplayName = "From " + displayName
+					}
+				}
+			}
+		}
+	}
+
+	return result
+}
+
+// parseZapPubkeyFromDescription tries to parse a zap request JSON from transaction description
+// Returns the relevant pubkey (recipient for outgoing, sender for incoming) or empty string
+func parseZapPubkeyFromDescription(description string, txType string) string {
+	if description == "" {
+		return ""
+	}
+
+	// Try to parse as zap request JSON (kind 9734)
+	var zapRequest struct {
+		Kind   int        `json:"kind"`
+		PubKey string     `json:"pubkey"` // Sender of the zap
+		Tags   [][]string `json:"tags"`
+	}
+
+	if err := json.Unmarshal([]byte(description), &zapRequest); err != nil {
+		return ""
+	}
+
+	// Verify it looks like a zap request (kind 9734)
+	if zapRequest.Kind != 9734 {
+		return ""
+	}
+
+	if txType == "outgoing" {
+		// Outgoing zap: find recipient from p tag
+		for _, tag := range zapRequest.Tags {
+			if len(tag) >= 2 && tag[0] == "p" {
+				return tag[1]
+			}
+		}
+	} else {
+		// Incoming zap: sender is the pubkey of the zap request
+		return zapRequest.PubKey
+	}
+
+	return ""
+}
+
+// cachedToHTMLWalletInfo converts cached wallet info to HTML template data
+func cachedToHTMLWalletInfo(cached *CachedWalletInfo) HTMLWalletInfoData {
+	data := HTMLWalletInfoData{
+		Balance:      cached.Balance,
+		BalanceMsats: cached.BalanceMsats,
+		Error:        cached.Error,
+	}
+
+	for _, tx := range cached.Transactions {
+		data.Transactions = append(data.Transactions, HTMLWalletTransaction{
+			Type:           tx.Type,
+			TypeIcon:       tx.TypeIcon,
+			Amount:         tx.Amount,
+			AmountMsats:    tx.AmountMsats,
+			Description:    tx.Description,
+			TimeAgo:        tx.TimeAgo,
+			CreatedAt:      tx.CreatedAt,
+			IsZap:          tx.IsZap,
+			ZapDisplayName: tx.ZapDisplayName,
+		})
+	}
+
+	return data
+}
+
+// PrefetchWalletInfo starts a background fetch of wallet info
+// Called from wallet page handler to warm the cache
+func PrefetchWalletInfo(userPubkeyHex string, config *NWCConfig) {
+	// Check cache first - if already cached, no need to prefetch
+	if _, found := GetCachedWalletInfo(userPubkeyHex); found {
+		slog.Debug("wallet prefetch: already cached", "user", userPubkeyHex[:16])
+		return
+	}
+
+	// Try to start prefetch
+	resultCh := StartWalletInfoPrefetch(userPubkeyHex)
+	if resultCh == nil {
+		slog.Debug("wallet prefetch: already in progress", "user", userPubkeyHex[:16])
+		return
+	}
+
+	// Run fetch in background
+	go func() {
+		slog.Debug("wallet prefetch: starting", "user", userPubkeyHex[:16])
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+
+		result := fetchWalletInfo(ctx, userPubkeyHex, config)
+		if result != nil {
+			SetCachedWalletInfo(userPubkeyHex, result)
+			slog.Debug("wallet prefetch: complete", "user", userPubkeyHex[:16])
+		} else {
+			slog.Debug("wallet prefetch: failed", "user", userPubkeyHex[:16])
+		}
+
+		CompleteWalletInfoPrefetch(userPubkeyHex, result)
+	}()
+}
+
+// formatSatsWithCommas formats a number with comma separators
+func formatSatsWithCommas(n int64) string {
+	if n < 0 {
+		return "-" + formatSatsWithCommas(-n)
+	}
+	if n < 1000 {
+		return fmt.Sprintf("%d", n)
+	}
+	return formatSatsWithCommas(n/1000) + "," + fmt.Sprintf("%03d", n%1000)
+}
+
+// truncateWithEllipsis truncates a string to maxLen characters with ellipsis
+func truncateWithEllipsis(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	if maxLen <= 3 {
+		return s[:maxLen]
+	}
+	return s[:maxLen-3] + "..."
+}
+
+// renderWalletInfoFragment renders the wallet info HTML fragment using compiled template
+func renderWalletInfoFragment(data HTMLWalletInfoData) (string, error) {
+	var buf strings.Builder
+	if err := cachedWalletInfoFragment.ExecuteTemplate(&buf, "wallet-info", data); err != nil {
+		return "", err
+	}
+	return buf.String(), nil
+}
+
+// htmlZapHandler handles zap requests (NIP-57)
+func htmlZapHandler(w http.ResponseWriter, r *http.Request) {
+	slog.Info("=== ZAP HANDLER START ===")
+	if r.Method != http.MethodPost {
+		http.Redirect(w, r, DefaultTimelineURL(), http.StatusSeeOther)
+		return
+	}
+
+	slog.Info("zap: method is POST, checking auth")
+	session := requireAuth(w, r)
+	if session == nil {
+		slog.Info("zap: no session, returning")
+		return
+	}
+	slog.Info("zap: auth OK", "user", hex.EncodeToString(session.UserPubKey)[:16])
+
+	// Validate CSRF token
+	csrfToken := r.FormValue("csrf_token")
+	if !requireCSRF(w, session.ID, csrfToken) {
+		slog.Warn("zap: CSRF validation failed")
+		return
+	}
+	slog.Info("zap: CSRF OK")
+
+	eventID := strings.TrimSpace(r.FormValue("event_id"))
+	eventPubkey := strings.TrimSpace(r.FormValue("event_pubkey"))
+	kindStr := strings.TrimSpace(r.FormValue("kind"))
+	returnURL := sanitizeReturnURL(r.FormValue("return_url"), true)
+
+	slog.Info("zap: form values", "eventID", eventID, "eventPubkey", eventPubkey, "kind", kindStr)
+
+	if eventID == "" || !isValidEventID(eventID) {
+		slog.Warn("zap: invalid event ID", "eventID", eventID)
+		respondWithError(w, r, returnURL, "Invalid event ID")
+		return
+	}
+
+	if eventPubkey == "" || len(eventPubkey) != 64 {
+		slog.Warn("zap: invalid pubkey", "pubkey", eventPubkey, "len", len(eventPubkey))
+		respondWithError(w, r, returnURL, "Invalid recipient pubkey")
+		return
+	}
+	slog.Info("zap: validation OK")
+
+	// Parse kind for footer rendering
+	kind := 1 // Default to kind 1 (note)
+	if kindStr != "" {
+		if k, err := strconv.Atoi(kindStr); err == nil {
+			kind = k
+		}
+	}
+
+	// Helper to render footer fragment for error responses (preserves UI)
+	renderFooterForError := func() string {
+		newCSRFToken := generateCSRFToken(session.ID)
+		readRelays := ConfigGetDefaultRelays()
+		if session.UserRelayList != nil && len(session.UserRelayList.Read) > 0 {
+			readRelays = session.UserRelayList.Read
+		}
+		isBookmarked := session.IsEventBookmarked(eventID)
+		isReacted := session.IsEventReacted(eventID)
+		isReposted := session.IsEventReposted(eventID)
+		html, err := renderFooterFragment(eventID, eventPubkey, kind, true, newCSRFToken, returnURL, isBookmarked, isReacted, isReposted, false, session.HasWallet(), "", readRelays)
+		if err != nil {
+			slog.Error("failed to render footer fragment for error", "error", err)
+			return ""
+		}
+		return html
+	}
+
+	// Check wallet connection - show error with link to wallet setup
+	slog.Info("zap: checking wallet", "hasWallet", session.HasWallet())
+	if !session.HasWallet() {
+		slog.Warn("zap: no wallet connected")
+		walletURL := "/html/wallet?return=" + url.QueryEscape(returnURL)
+		if isHelmRequest(r) {
+			// For HelmJS: show error with link, keep footer intact
+			errorMsg := I18n("wallet.connect_to_zap") + ` <a href="` + template.HTMLEscapeString(walletURL) + `">` + I18n("wallet.connect") + `</a>`
+			respondWithErrorAndFragment(w, r, returnURL, errorMsg, renderFooterForError())
+		} else {
+			// For regular requests: redirect to wallet page
+			setFlashError(w, r, I18n("wallet.connect_to_zap"))
+			http.Redirect(w, r, walletURL, http.StatusSeeOther)
+		}
+		return
+	}
+	slog.Info("zap: wallet OK")
+
+	// Fetch recipient's profile to get their lightning address
+	slog.Info("zap: fetching profile", "pubkey", eventPubkey[:16])
+	relays := ConfigGetProfileRelays()
+	if session.UserRelayList != nil && len(session.UserRelayList.Read) > 0 {
+		relays = session.UserRelayList.Read
+	}
+
+	profiles := fetchProfiles(relays, []string{eventPubkey})
+	profile := profiles[eventPubkey]
+	if profile == nil {
+		slog.Warn("zap: profile not found", "pubkey", eventPubkey[:16])
+		respondWithErrorAndFragment(w, r, returnURL, "Could not find recipient's profile", renderFooterForError())
+		return
+	}
+
+	// Check if recipient can receive zaps
+	if !CanReceiveZaps(profile) {
+		slog.Warn("zap: recipient can't receive zaps", "pubkey", eventPubkey[:16])
+		respondWithErrorAndFragment(w, r, returnURL, "Recipient has no Lightning address configured", renderFooterForError())
+		return
+	}
+
+	// Resolve LNURL to get payment info
+	slog.Info("zap: resolving LNURL", "lud16", profile.Lud16)
+	lnurlInfo, err := ResolveLNURLFromProfile(profile)
+	if err != nil {
+		slog.Error("zap: failed to resolve LNURL", "error", err, "pubkey", eventPubkey[:8])
+		respondWithErrorAndFragment(w, r, returnURL, "Could not resolve recipient's Lightning address", renderFooterForError())
+		return
+	}
+	slog.Info("zap: LNURL resolved", "allowsNostr", lnurlInfo.AllowsNostr, "nostrPubkey", lnurlInfo.NostrPubkey != "")
+
+	// Fixed zap amount: 21 sats = 21000 msats
+	amountMsats := int64(21000)
+
+	// Check amount is within recipient's limits
+	if amountMsats < lnurlInfo.MinSendable {
+		respondWithErrorAndFragment(w, r, returnURL, fmt.Sprintf("Amount below minimum (%d sats)", MsatsToSats(lnurlInfo.MinSendable)), renderFooterForError())
+		return
+	}
+	if amountMsats > lnurlInfo.MaxSendable {
+		respondWithErrorAndFragment(w, r, returnURL, fmt.Sprintf("Amount above maximum (%d sats)", MsatsToSats(lnurlInfo.MaxSendable)), renderFooterForError())
+		return
+	}
+
+	// Verify LNURL endpoint supports nostr zaps
+	if !lnurlInfo.AllowsNostr {
+		slog.Warn("zap: endpoint doesn't support nostr zaps", "pubkey", eventPubkey[:16])
+		respondWithErrorAndFragment(w, r, returnURL, "Recipient's Lightning address doesn't support Nostr zaps", renderFooterForError())
+		return
+	}
+	slog.Info("zap: creating zap request event")
+
+	// Create zap request event (kind 9734)
+	// NIP-57: Zap request tags
+	zapRequestTags := [][]string{
+		{"relays"}, // Will be populated with user's write relays
+		{"amount", fmt.Sprintf("%d", amountMsats)},
+		{"p", eventPubkey},
+		{"e", eventID},
+		{"k", kindStr}, // Event kind for proper client display
+	}
+
+	// Add relays to the relays tag
+	writeRelays := ConfigGetPublishRelays()
+	if session.UserRelayList != nil && len(session.UserRelayList.Write) > 0 {
+		writeRelays = session.UserRelayList.Write
+	}
+	for _, relay := range writeRelays {
+		zapRequestTags[0] = append(zapRequestTags[0], relay)
+	}
+
+	// Note: lnurl tag omitted - we use lud16 (lightning address) which is different
+	// from bech32-encoded lnurl. The lnurl tag is optional per NIP-57.
+	lnurl := profile.Lud16
+
+	zapRequest := UnsignedEvent{
+		Kind:      9734,
+		Content:   "", // Can add optional comment in future
+		Tags:      zapRequestTags,
+		CreatedAt: time.Now().Unix(),
+	}
+
+	// Sign zap request with user's bunker
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	signedZapRequest, err := session.SignEvent(ctx, zapRequest)
+	if err != nil {
+		slog.Error("failed to sign zap request", "error", err)
+		respondWithErrorAndFragment(w, r, returnURL, sanitizeErrorForUser("Sign zap request", err), renderFooterForError())
+		return
+	}
+
+	// Convert signed event to JSON for LNURL callback
+	zapRequestJSON, err := json.Marshal(signedZapRequest)
+	if err != nil {
+		slog.Error("failed to marshal zap request", "error", err)
+		respondWithErrorAndFragment(w, r, returnURL, "Failed to create zap request", renderFooterForError())
+		return
+	}
+
+	// Request invoice from LNURL endpoint
+	invoice, err := RequestInvoice(lnurlInfo, amountMsats, string(zapRequestJSON), lnurl)
+	if err != nil {
+		slog.Error("failed to get invoice", "error", err, "pubkey", eventPubkey[:8])
+		respondWithErrorAndFragment(w, r, returnURL, "Could not get Lightning invoice from recipient", renderFooterForError())
+		return
+	}
+
+	// Get pooled NWC client (reuses existing connection if available)
+	slog.Info("zap: getting NWC client from pool")
+	userPubkeyHex := hex.EncodeToString(session.UserPubKey)
+	nwcClient, err := GetPooledNWCClient(ctx, userPubkeyHex, session.NWCConfig)
+	if err != nil {
+		slog.Error("zap: failed to get pooled client", "error", err)
+		respondWithErrorAndFragment(w, r, returnURL, "Could not connect to your wallet", renderFooterForError())
+		return
+	}
+	// Note: Do NOT close the client - it's managed by the pool
+
+	slog.Info("zap: paying invoice via NWC")
+	result, err := nwcClient.PayInvoice(ctx, invoice)
+	if err != nil {
+		slog.Error("failed to pay invoice", "error", err, "pubkey", eventPubkey[:8])
+		// Provide more specific error messages for common NWC errors
+		errMsg := err.Error()
+		footerHTML := renderFooterForError()
+		if strings.Contains(errMsg, NWCErrorInsufficientBalance) {
+			respondWithErrorAndFragment(w, r, returnURL, "Insufficient wallet balance", footerHTML)
+		} else if strings.Contains(errMsg, NWCErrorPaymentFailed) {
+			respondWithErrorAndFragment(w, r, returnURL, "Payment failed - recipient may be offline", footerHTML)
+		} else if strings.Contains(errMsg, "timeout") {
+			respondWithErrorAndFragment(w, r, returnURL, "Payment timed out - please try again", footerHTML)
+		} else {
+			respondWithErrorAndFragment(w, r, returnURL, "Payment failed", footerHTML)
+		}
+		return
+	}
+
+	slog.Info("zap sent successfully",
+		"user", hex.EncodeToString(session.UserPubKey)[:8],
+		"recipient", eventPubkey[:8],
+		"event", eventID[:8],
+		"amount_sats", MsatsToSats(amountMsats),
+		"preimage", result.Preimage[:16]+"...")
+
+	// Track this zap in the session for UI state
+	session.AddZappedEvent(eventID)
+	// Save session to persist the zapped state
+	if err := sessionStore.Set(r.Context(), session); err != nil {
+		slog.Warn("failed to save session after zap", "error", err)
+		// Don't fail the request - zap was successful
+	}
+
+	// For HelmJS requests, return the updated footer fragment
+	if isHelmRequest(r) {
+		newCSRFToken := generateCSRFToken(session.ID)
+		readRelays := ConfigGetDefaultRelays()
+		if session.UserRelayList != nil && len(session.UserRelayList.Read) > 0 {
+			readRelays = session.UserRelayList.Read
+		}
+		// Check other state for footer display
+		isBookmarked := session.IsEventBookmarked(eventID)
+		isReacted := session.IsEventReacted(eventID)
+		isReposted := session.IsEventReposted(eventID)
+		// isZapped is now true since user just zapped, hasWallet is true since we got here
+		// Note: kind was already parsed at the start of the handler
+		html, err := renderFooterFragment(eventID, eventPubkey, kind, true, newCSRFToken, returnURL, isBookmarked, isReacted, isReposted, true, true, "", readRelays)
+		if err != nil {
+			slog.Error("failed to render footer fragment", "error", err)
+			http.Error(w, "Failed to render response", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Write([]byte(html))
+		return
+	}
+
+	// Redirect with success
+	redirectWithSuccess(w, r, returnURL, "Zapped 21 sats ⚡")
 }

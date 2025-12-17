@@ -4,7 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
-	"log"
+	"log/slog"
 	"net/http"
 	"sort"
 	"strconv"
@@ -41,12 +41,13 @@ type ProfileInfo struct {
 	About       string `json:"about,omitempty"`
 	Banner      string `json:"banner,omitempty"`
 	Lud16       string `json:"lud16,omitempty"`
+	Lud06       string `json:"lud06,omitempty"`
 	Website     string `json:"website,omitempty"`
 }
 
 type ReactionsSummary struct {
-	Total   int            `json:"total"`
-	ByType  map[string]int `json:"by_type"`
+	Total  int            `json:"total"`
+	ByType map[string]int `json:"by_type"` // Kept for API compatibility and user reaction detection
 }
 
 type PageInfo struct {
@@ -73,30 +74,20 @@ type ProfileResponse struct {
 }
 
 func timelineHandler(w http.ResponseWriter, r *http.Request) {
-	// Tell browser to cache based on Accept header
 	w.Header().Set("Vary", "Accept")
 
-	// If browser navigation (Accept: text/html), serve the client app
 	accept := r.Header.Get("Accept")
 	if strings.Contains(accept, "text/html") && !strings.Contains(accept, "application/json") {
-		// Don't cache HTML - always serve fresh so JS can fetch the real data
 		w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
 		http.ServeFile(w, r, "./static/index.html")
 		return
 	}
 
-	// Parse query parameters
 	q := r.URL.Query()
 
 	relays := parseStringList(q.Get("relays"))
 	if len(relays) == 0 {
-		relays = []string{
-			"wss://relay.damus.io",
-			"wss://relay.nostr.band",
-			"wss://relay.primal.net",
-			"wss://nos.lol",
-			"wss://nostr.mom",
-		}
+		relays = ConfigGetDefaultRelays()
 	}
 
 	authors := parseStringList(q.Get("authors"))
@@ -104,9 +95,6 @@ func timelineHandler(w http.ResponseWriter, r *http.Request) {
 	limit := parseLimit(q.Get("limit"), 50)
 	since := parseInt64(q.Get("since"))
 	until := parseInt64(q.Get("until"))
-	fast := q.Get("fast") == "1" || q.Get("fast") == "true"
-
-	// Build filter
 	filter := Filter{
 		Authors: authors,
 		Kinds:   kinds,
@@ -115,54 +103,36 @@ func timelineHandler(w http.ResponseWriter, r *http.Request) {
 		Until:   until,
 	}
 
-	// Check if we should filter out replies
-	noReplies := q.Get("no_replies") != "0" // Default to filtering replies
+	noReplies := q.Get("no_replies") != "0" // Default: filter replies
 
-	// Fetch events from relays (with caching)
-	log.Printf("Fetching events: kinds=%v, authors=%v, limit=%d", kinds, authors, limit)
-	start := time.Now()
 	events, eose := fetchEventsFromRelaysCached(relays, filter)
-	log.Printf("Fetched %d events in %v (eose=%v)", len(events), time.Since(start), eose)
 
-	// Filter out replies (events with e tags) from main timeline
-	// Note: kind 6 (reposts) use e tags to reference the reposted event, not as replies
+	// Filter replies (except kinds like reposts that use e-tags for references)
 	if noReplies {
 		filtered := make([]Event, 0, len(events))
 		for _, evt := range events {
-			if !isReply(evt) || evt.Kind == 6 {
+			kindDef := GetKindDefinition(evt.Kind)
+			if !isReply(evt) || kindDef.ExcludeFromReplyFilter {
 				filtered = append(filtered, evt)
 			}
 		}
 		events = filtered
-		log.Printf("After filtering replies: %d events", len(events))
 	}
 
-	// Filter out kind 30311 (live events) that don't have a streaming or recording URL
-	// These are non-video "live activities" like game presence, not actual streams to watch
+	// Filter events missing required tags
 	{
 		filtered := make([]Event, 0, len(events))
 		for _, evt := range events {
-			if evt.Kind == 30311 {
-				hasStreamingURL := false
-				for _, tag := range evt.Tags {
-					if len(tag) >= 2 && (tag[0] == "streaming" || tag[0] == "recording") && tag[1] != "" {
-						hasStreamingURL = true
-						break
-					}
-				}
-				if !hasStreamingURL {
-					continue // Skip non-streaming live events
-				}
+			kindDef := GetKindDefinition(evt.Kind)
+			if !kindDef.HasRequiredTags(evt.Tags) {
+				continue // Skip events missing required tags
 			}
 			filtered = append(filtered, evt)
-		}
-		if len(filtered) != len(events) {
-			log.Printf("After filtering non-streaming live events: %d events (removed %d)", len(filtered), len(events)-len(filtered))
 		}
 		events = filtered
 	}
 
-	// Collect unique pubkeys and event IDs for enrichment
+	// Collect pubkeys and event IDs for profile/reaction enrichment
 	pubkeySet := make(map[string]bool)
 	eventIDs := make([]string, 0, len(events))
 	for _, evt := range events {
@@ -173,46 +143,36 @@ func timelineHandler(w http.ResponseWriter, r *http.Request) {
 	profiles := make(map[string]*ProfileInfo)
 	reactions := make(map[string]*ReactionsSummary)
 	replyCounts := make(map[string]int)
-
-	// Always fetch profiles (they're quick), only fetch reactions/replies in full mode
 	var wg sync.WaitGroup
 
 	if len(pubkeySet) > 0 {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			log.Printf("Fetching profiles for %d authors", len(pubkeySet))
 			pubkeys := make([]string, 0, len(pubkeySet))
 			for pk := range pubkeySet {
 				pubkeys = append(pubkeys, pk)
 			}
 			profiles = fetchProfiles(relays, pubkeys)
-			log.Printf("Fetched %d profiles", len(profiles))
 		}()
 	}
 
-	// Only fetch reactions and reply counts in full mode (not fast)
-	if !fast && len(eventIDs) > 0 {
+	if len(eventIDs) > 0 {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			log.Printf("Fetching reactions for %d events", len(eventIDs))
 			reactions = fetchReactions(relays, eventIDs)
-			log.Printf("Fetched reactions for %d events", len(reactions))
 		}()
 
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			log.Printf("Fetching reply counts for %d events", len(eventIDs))
 			replyCounts = fetchReplyCounts(relays, eventIDs)
-			log.Printf("Fetched reply counts: %d events have replies", len(replyCounts))
 		}()
 	}
 
 	wg.Wait()
 
-	// Build response
 	items := make([]EventItem, len(events))
 	for i, evt := range events {
 		items[i] = EventItem{
@@ -240,8 +200,7 @@ func timelineHandler(w http.ResponseWriter, r *http.Request) {
 		},
 	}
 
-	// Add pagination if we have results
-	if len(items) > 0 {
+	if len(items) > 0 { // Pagination
 		lastCreatedAt := items[len(items)-1].CreatedAt
 		resp.Page.Until = &lastCreatedAt
 		nextURL := r.URL.Path + "?relays=" + strings.Join(relays, ",") +
@@ -257,24 +216,16 @@ func timelineHandler(w http.ResponseWriter, r *http.Request) {
 			}
 			nextURL += "&kinds=" + strings.Join(kindsStr, ",")
 		}
-		// Preserve fast mode in pagination
-		if fast {
-			nextURL += "&fast=1"
-		}
 		resp.Page.Next = &nextURL
 	}
 
-	// Generate ETag from first/last ID and count
 	etag := generateETag(items)
 	w.Header().Set("ETag", etag)
-
-	// Set Last-Modified based on most recent event
 	if len(items) > 0 {
 		lastMod := time.Unix(items[0].CreatedAt, 0).UTC()
 		w.Header().Set("Last-Modified", lastMod.Format(http.TimeFormat))
 	}
 
-	// Check If-None-Match for ETag caching
 	if match := r.Header.Get("If-None-Match"); match != "" && match == etag {
 		w.WriteHeader(http.StatusNotModified)
 		return
@@ -282,14 +233,17 @@ func timelineHandler(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Cache-Control", "max-age=5")
 
-	// Check Accept header for hypermedia format
 	if strings.Contains(accept, "application/vnd.siren+json") {
 		w.Header().Set("Content-Type", "application/vnd.siren+json")
-		siren := toSirenTimeline(resp, relays, authors, kinds, limit, fast)
-		json.NewEncoder(w).Encode(siren)
+		siren := toSirenTimeline(resp, relays, authors, kinds, limit)
+		if err := json.NewEncoder(w).Encode(siren); err != nil {
+			slog.Error("failed to encode siren timeline response", "error", err)
+		}
 	} else {
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(resp)
+		if err := json.NewEncoder(w).Encode(resp); err != nil {
+			slog.Error("failed to encode timeline response", "error", err)
+		}
 	}
 }
 
@@ -351,19 +305,15 @@ func timeNow() time.Time {
 
 // threadHandler fetches a thread (root event + replies)
 func threadHandler(w http.ResponseWriter, r *http.Request) {
-	// Tell browser to cache based on Accept header
 	w.Header().Set("Vary", "Accept")
 
-	// If browser navigation (Accept: text/html), serve the client app
 	accept := r.Header.Get("Accept")
 	if strings.Contains(accept, "text/html") && !strings.Contains(accept, "application/json") {
-		// Don't cache HTML - always serve fresh so JS can fetch the real data
 		w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
 		http.ServeFile(w, r, "./static/index.html")
 		return
 	}
 
-	// Extract event ID from path: /thread/{eventId}
 	eventID := strings.TrimPrefix(r.URL.Path, "/thread/")
 	if eventID == "" {
 		http.Error(w, "Event ID required", http.StatusBadRequest)
@@ -373,23 +323,15 @@ func threadHandler(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	relays := parseStringList(q.Get("relays"))
 	if len(relays) == 0 {
-		relays = []string{
-			"wss://relay.damus.io",
-			"wss://relay.nostr.band",
-			"wss://relay.primal.net",
-			"wss://nos.lol",
-			"wss://nostr.mom",
-		}
+		relays = ConfigGetDefaultRelays()
 	}
 
-	log.Printf("Fetching thread for event: %s", eventID)
+	// Fetch thread for eventID
 
-	// Fetch the root event and replies in parallel
 	var rootEvent *Event
 	var replies []Event
 	var wg sync.WaitGroup
 
-	// Fetch root event by ID
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -399,13 +341,11 @@ func threadHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 
-	// Fetch replies (events that reference this event via #e tag)
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		replies, _ = fetchEventsFromRelaysWithETags(relays, []string{eventID})
-		// Filter to only kind 1 (notes) that are actual replies
-		filtered := make([]Event, 0)
+		filtered := make([]Event, 0) // Filter to kind 1 only
 		for _, evt := range replies {
 			if evt.Kind == 1 {
 				filtered = append(filtered, evt)
@@ -421,21 +361,18 @@ func threadHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Collect pubkeys for profile enrichment
 	pubkeySet := make(map[string]bool)
 	pubkeySet[rootEvent.PubKey] = true
 	for _, reply := range replies {
 		pubkeySet[reply.PubKey] = true
 	}
 
-	// Fetch profiles
 	pubkeys := make([]string, 0, len(pubkeySet))
 	for pk := range pubkeySet {
 		pubkeys = append(pubkeys, pk)
 	}
 	profiles := fetchProfiles(relays, pubkeys)
 
-	// Build response
 	rootItem := EventItem{
 		ID:            rootEvent.ID,
 		Kind:          rootEvent.Kind,
@@ -463,8 +400,7 @@ func threadHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Sort replies by created_at ASC (oldest first for reading order)
-	sort.Slice(replyItems, func(i, j int) bool {
+	sort.Slice(replyItems, func(i, j int) bool { // Oldest first
 		return replyItems[i].CreatedAt < replyItems[j].CreatedAt
 	})
 
@@ -480,10 +416,12 @@ func threadHandler(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Cache-Control", "max-age=10")
-	json.NewEncoder(w).Encode(resp)
+	if err := json.NewEncoder(w).Encode(resp); err != nil {
+		slog.Error("failed to encode thread response", "error", err)
+	}
 }
 
-// isReply checks if an event is a reply (has e tags)
+// isReply returns true if event has e-tags (is a reply)
 func isReply(evt Event) bool {
 	for _, tag := range evt.Tags {
 		if len(tag) >= 2 && tag[0] == "e" {
@@ -491,26 +429,4 @@ func isReply(evt Event) bool {
 		}
 	}
 	return false
-}
-
-func buildPaginationURL(path string, relays []string, authors []string, kinds []int, limit int, until int64) string {
-	parts := []string{path + "?"}
-
-	if len(relays) > 0 {
-		parts = append(parts, "relays="+strings.Join(relays, ","))
-	}
-	if len(authors) > 0 {
-		parts = append(parts, "authors="+strings.Join(authors, ","))
-	}
-	if len(kinds) > 0 {
-		kindsStr := make([]string, len(kinds))
-		for i, k := range kinds {
-			kindsStr[i] = strconv.Itoa(k)
-		}
-		parts = append(parts, "kinds="+strings.Join(kindsStr, ","))
-	}
-	parts = append(parts, "limit="+strconv.Itoa(limit))
-	parts = append(parts, "until="+strconv.FormatInt(until, 10))
-
-	return strings.Join(parts, "&")
 }

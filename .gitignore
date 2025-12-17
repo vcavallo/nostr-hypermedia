@@ -1,5 +1,6 @@
 # Build output
 nostr-server
+release/
 
 # Development secrets
 .dev-keypair
@@ -23,6 +24,14 @@ Thumbs.db
 # Test output
 coverage.out
 *.test
+
+# Compiled check tools
+/cmd/accessibility-check/accessibility-check
+/cmd/hateoas-check/hateoas-check
+/cmd/i18n-check/i18n-check
+/cmd/markup-check/markup-check
+/cmd/nateoas-check/nateoas-check
+/cmd/security-check/security-check
 
 # Temporary files
 *.tmp

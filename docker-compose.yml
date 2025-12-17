@@ -1,0 +1,65 @@
+# Nostr Hypermedia Server
+#
+# Basic usage:
+#   docker compose up                      # In-memory cache
+#   docker compose --profile redis up      # With Redis caching
+#
+# Hot-reload config:
+#   docker compose kill -s HUP app
+#
+# Environment: Copy .env.example to .env for GIPHY_API_KEY, etc.
+
+services:
+  app:
+    build: .
+    ports:
+      - "${PORT:-3000}:8080"
+    environment:
+      - PORT=8080
+      - GZIP_ENABLED=1
+      - LOG_LEVEL=${LOG_LEVEL:-info}
+      - GIPHY_API_KEY=${GIPHY_API_KEY:-}
+      - CSRF_SECRET=${CSRF_SECRET:-}
+      - REDIS_URL=${REDIS_URL:-redis://redis:6379/0}
+      - TRUSTED_PROXY_COUNT=${TRUSTED_PROXY_COUNT:-0}
+      - HSTS_ENABLED=${HSTS_ENABLED:-}
+      - HSTS_MAX_AGE=${HSTS_MAX_AGE:-}
+      - SECURE_COOKIES=${SECURE_COOKIES:-}
+      - DEV_MODE=${DEV_MODE:-}
+      # Experimental: Nostr-based action definitions (kind 39001)
+      # - NOSTR_ACTIONS_ENABLED=${NOSTR_ACTIONS_ENABLED:-}
+      # - NOSTR_ACTIONS_RELAYS=${NOSTR_ACTIONS_RELAYS:-}
+      # - NOSTR_ACTIONS_TTL=${NOSTR_ACTIONS_TTL:-}
+    volumes:
+      # Mount config for hot-reload
+      - ./config:/app/config:ro
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8080/health/ready"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+    restart: unless-stopped
+    networks:
+      - nostr-net
+
+  redis:
+    image: redis:7-alpine
+    profiles:
+      - redis
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+    networks:
+      - nostr-net
+
+networks:
+  nostr-net:
+
+volumes:
+  redis-data:

@@ -5,7 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/url"
@@ -191,7 +191,7 @@ func FetchLinkPreview(targetURL string) *LinkPreview {
 
 	// SSRF protection: validate URL before fetching
 	if !isURLSafeForSSRF(targetURL) {
-		log.Printf("Link preview blocked for SSRF risk: %s", targetURL)
+		slog.Warn("link preview blocked for SSRF risk", "url", targetURL)
 		preview.Failed = true
 		return preview
 	}
@@ -208,14 +208,14 @@ func FetchLinkPreview(targetURL string) *LinkPreview {
 
 	resp, err := previewHTTPClient.Do(req)
 	if err != nil {
-		log.Printf("Link preview fetch failed for %s: %v", targetURL, err)
+		slog.Debug("link preview fetch failed", "url", targetURL, "error", err)
 		preview.Failed = true
 		return preview
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		log.Printf("Link preview got status %d for %s", resp.StatusCode, targetURL)
+		slog.Debug("link preview got non-OK status", "url", targetURL, "status", resp.StatusCode)
 		preview.Failed = true
 		return preview
 	}
@@ -330,7 +330,10 @@ func ExtractPreviewableURLs(content string) []string {
 	seen := make(map[string]bool)
 
 	matches := urlRegex.FindAllString(content, -1)
-	for _, url := range matches {
+	for _, rawURL := range matches {
+		// Clean trailing punctuation (e.g., from markdown links or prose)
+		url := cleanURLTrailing(rawURL)
+
 		// Skip if already seen
 		if seen[url] {
 			continue
@@ -345,8 +348,12 @@ func ExtractPreviewableURLs(content string) []string {
 		if videoExtRegex.MatchString(url) {
 			continue
 		}
-		// Skip YouTube (already embedded)
+		// Skip YouTube videos (already embedded)
 		if youtubeRegex.MatchString(url) {
+			continue
+		}
+		// Skip YouTube playlists (already embedded)
+		if youtubePlaylistRegex.MatchString(url) {
 			continue
 		}
 		// Skip audio files (already embedded)

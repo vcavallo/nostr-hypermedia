@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"fmt"
+	"net/http"
 	"os"
 	"strconv"
 	"strings"
@@ -76,4 +77,14 @@ func computeCSRFSignature(sessionID string, timestamp int64) string {
 	h := hmac.New(sha256.New, secret)
 	h.Write([]byte(data))
 	return base64.URLEncoding.EncodeToString(h.Sum(nil))
+}
+
+// requireCSRF validates the CSRF token and writes an error response if invalid.
+// Returns true if valid, false if invalid (and response already written).
+func requireCSRF(w http.ResponseWriter, sessionID, token string) bool {
+	if !validateCSRFToken(sessionID, token) {
+		http.Error(w, "Invalid or expired CSRF token", http.StatusForbidden)
+		return false
+	}
+	return true
 }
