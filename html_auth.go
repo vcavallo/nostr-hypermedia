@@ -836,59 +836,17 @@ func htmlPostNoteHandler(w http.ResponseWriter, r *http.Request) {
 	relays := getPublishRelaysForEvent(session, signedEvent)
 	publishEvent(ctx, relays, signedEvent)
 
-	// For HelmJS requests, return the cleared form + new note as OOB
+	// For HelmJS requests, return the cleared form + success flash
 	if isHelmRequest(r) {
-		// Generate new CSRF token
 		newCSRFToken := generateCSRFToken(session.ID)
-
-		// Build HTMLEventItem for the new note
-		userPubkey := hex.EncodeToString(session.UserPubKey)
-		npub, _ := encodeBech32Pubkey(userPubkey)
-
-		// Get user's profile for display
-		authorProfile := getCachedProfile(userPubkey)
-
-		// Build actions for the new note
-		actionCtx := ActionContext{
-			EventID:      signedEvent.ID,
-			EventPubkey:  userPubkey,
-			Kind:         1,
-			IsBookmarked: false,
-			IsReacted:    false,
-			IsReposted:   false,
-			ReplyCount:   0,
-			LoggedIn:     true,
-			HasWallet:    session.HasWallet(),
-			IsAuthor:     true,
-			CSRFToken:    newCSRFToken,
-			ReturnURL:    DefaultTimelineURLLoggedIn(),
-		}
-		entity := BuildHypermediaEntity(actionCtx, signedEvent.Tags, nil)
-		actionGroups := GroupActionsForKind(entity.Actions, 1)
-
-		newNote := &HTMLEventItem{
-			ID:            signedEvent.ID,
-			Pubkey:        userPubkey,
-			Npub:          npub,
-			NpubShort:     formatNpubShort(npub),
-			Kind:          1,
-			Tags:          signedEvent.Tags,
-			Content:       content,
-			ContentHTML:   processContentToHTML(content),
-			AuthorProfile: authorProfile,
-			CreatedAt:     signedEvent.CreatedAt,
-			ActionGroups:  actionGroups,
-			LoggedIn:      true,
-		}
-
-		html, err := renderPostResponse(newCSRFToken, newNote)
+		html, err := renderPostResponse(newCSRFToken, nil)
 		if err != nil {
 			slog.Error("failed to render post response", "error", err)
 			util.RespondInternalError(w, "Failed to render response")
 			return
 		}
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		w.Write([]byte(html))
+		w.Write([]byte(html + renderOOBFlash("Note published", "success")))
 		return
 	}
 

@@ -223,6 +223,7 @@ func htmlTimelineHandler(w http.ResponseWriter, r *http.Request) {
 	// Bookmarks (kind 10003): fetch user's bookmark list, then fetch bookmarked events
 	var bookmarkedEventIDs []string
 	isBookmarksView := len(kinds) == 1 && kinds[0] == 10003
+	originalKinds := kinds // Preserve for pagination URL before modification
 	if isBookmarksView && session != nil && session.Connected && len(session.UserPubKey) > 0 {
 		pubkeyHex := hex.EncodeToString(session.UserPubKey)
 		bookmarkEvents := fetchKind10003(relays, pubkeyHex)
@@ -462,13 +463,15 @@ func htmlTimelineHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Pagination (subtract 1 from until - Nostr's filter is inclusive)
-	if len(items) > 0 {
+	// Only show pagination if we got a full page (more might exist)
+	// Skip for bookmarks - all bookmarks are fetched at once by event ID
+	if len(items) >= limit && !isBookmarksView {
 		lastCreatedAt := items[len(items)-1].CreatedAt
 		resp.Page.Until = &lastCreatedAt
 		// Build pagination URL params
 		params := map[string]string{
 			"feed":  feedMode,
-			"kinds": util.IntsToParam(kinds),
+			"kinds": util.IntsToParam(originalKinds),
 			"limit": strconv.Itoa(limit),
 			"until": strconv.FormatInt(lastCreatedAt-1, 10),
 		}

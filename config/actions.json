@@ -15,7 +15,7 @@
       "href": "/repost",
       "class": "action-repost",
       "rel": "repost",
-      "icon": "🚀",
+      "icon": "📢",
       "iconOnly": "always",
       "hasCount": false,
       "appliesTo": [1, 6, 20, 22, 30023],

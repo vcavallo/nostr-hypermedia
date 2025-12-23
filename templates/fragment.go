@@ -163,7 +163,7 @@ var notificationsAppendTemplate = `{{define "notifications-append"}}
   {{if .TargetEventID}}
   <a href="/thread/{{noteLink .TargetEventID}}" h-get h-target="#page-content" h-swap="inner" h-push-url h-prefetch class="notification-link" rel="related">{{i18n "nav.view_note"}} →</a>
   {{else if .Event}}
-  <a href="/thread/{{eventLink .Event.ID .Event.Kind .Event.Pubkey .Event.DTag}}" h-get h-target="#page-content" h-swap="inner" h-push-url h-prefetch class="notification-link" rel="related">{{i18n "nav.view_note"}} →</a>
+  <a href="/thread/{{noteLink .Event.ID}}" h-get h-target="#page-content" h-swap="inner" h-push-url h-prefetch class="notification-link" rel="related">{{i18n "nav.view_note"}} →</a>
   {{end}}
 </li>
 {{end}}
@@ -369,4 +369,4 @@ func GetOOBFlashTemplate() string {
 // Data fields:
 //   - Message: the message text
 //   - Type: "error" or "success"
-var oobFlashTemplate = `{{define "oob-flash"}}<div id="flash-messages" h-oob="true">{{if .Message}}<div class="alert alert-{{.Type}}">{{.Message}}</div>{{end}}</div>{{end}}`
+var oobFlashTemplate = `{{define "oob-flash"}}<div id="flash-messages" h-oob="true">{{if .Message}}<div class="{{if eq .Type "error"}}error-box{{else}}flash-message{{end}}" role="{{if eq .Type "error"}}alert{{else}}status{{end}}" aria-live="polite">{{.Message}}</div>{{end}}</div>{{end}}`

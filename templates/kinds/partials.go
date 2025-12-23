@@ -170,10 +170,11 @@ var PartialPagination = `{{define "pagination"}}
 {{end}}`
 
 // PartialFlashMessages renders error and success flash messages.
-var PartialFlashMessages = `{{define "flash-messages"}}
+// Wrapper div with id="flash-messages" enables OOB updates from HelmJS responses.
+var PartialFlashMessages = `{{define "flash-messages"}}<div id="flash-messages">
 {{if .Error}}<div class="error-box" role="alert">{{.Error}}</div>{{end}}
 {{if .Success}}<div class="flash-message" role="status" aria-live="polite">{{.Success}}</div>{{end}}
-{{end}}`
+</div>{{end}}`
 
 // PartialContentWarning wraps content in a collapsible warning for NIP-36 sensitive content.
 // Uses skeleton placeholder approach - shows fake "redacted" lines until clicked.
