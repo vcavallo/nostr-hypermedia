@@ -15,28 +15,12 @@ const (
 
 // setFlashSuccess sets a success flash message cookie
 func setFlashSuccess(w http.ResponseWriter, r *http.Request, message string) {
-	http.SetCookie(w, &http.Cookie{
-		Name:     flashSuccessCookie,
-		Value:    url.QueryEscape(message),
-		Path:     "/",
-		MaxAge:   60, // 1 minute - plenty of time for redirect
-		HttpOnly: true,
-		Secure:   shouldSecureCookie(r),
-		SameSite: http.SameSiteLaxMode,
-	})
+	SetLaxCookie(w, r, flashSuccessCookie, url.QueryEscape(message), 60)
 }
 
 // setFlashError sets an error flash message cookie
 func setFlashError(w http.ResponseWriter, r *http.Request, message string) {
-	http.SetCookie(w, &http.Cookie{
-		Name:     flashErrorCookie,
-		Value:    url.QueryEscape(message),
-		Path:     "/",
-		MaxAge:   60,
-		HttpOnly: true,
-		Secure:   shouldSecureCookie(r),
-		SameSite: http.SameSiteLaxMode,
-	})
+	SetLaxCookie(w, r, flashErrorCookie, url.QueryEscape(message), 60)
 }
 
 // FlashMessages holds success and error messages read from cookies
@@ -55,14 +39,7 @@ func getFlashMessages(w http.ResponseWriter, r *http.Request) FlashMessages {
 		if decoded, err := url.QueryUnescape(cookie.Value); err == nil {
 			messages.Success = decoded
 		}
-		// Clear the cookie
-		http.SetCookie(w, &http.Cookie{
-			Name:     flashSuccessCookie,
-			Value:    "",
-			Path:     "/",
-			MaxAge:   -1, // Delete immediately
-			HttpOnly: true,
-		})
+		DeleteCookie(w, r, flashSuccessCookie, "/")
 	}
 
 	// Read error cookie
@@ -70,14 +47,7 @@ func getFlashMessages(w http.ResponseWriter, r *http.Request) FlashMessages {
 		if decoded, err := url.QueryUnescape(cookie.Value); err == nil {
 			messages.Error = decoded
 		}
-		// Clear the cookie
-		http.SetCookie(w, &http.Cookie{
-			Name:     flashErrorCookie,
-			Value:    "",
-			Path:     "/",
-			MaxAge:   -1,
-			HttpOnly: true,
-		})
+		DeleteCookie(w, r, flashErrorCookie, "/")
 	}
 
 	return messages

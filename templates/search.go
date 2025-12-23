@@ -7,7 +7,7 @@ func GetSearchTemplate() string {
 }
 
 var searchContent = `{{define "content"}}
-<form action="/html/search" method="GET" class="search-form" h-get h-target="#search-results" h-swap="inner" h-trigger="input debounce:300 from:#search-input, submit" h-sync="abort" h-replace-url h-indicator="#search-results">
+<form action="/search" method="GET" class="search-form" h-get h-target="#search-results" h-swap="inner" h-trigger="input debounce:300 from:#search-input, submit" h-sync="abort" h-replace-url h-indicator="#search-results">
   <label for="search-input" class="sr-only">Search notes</label>
   <input type="search" id="search-input" name="q" value="{{.Query}}" placeholder="Search notes, hashtags, topics..." class="search-input" autocomplete="off" autofocus>
   <button type="submit" class="sr-only">{{i18n "btn.search"}}</button>
@@ -73,11 +73,11 @@ var searchContent = `{{define "content"}}
     {{template "author-header" .}}
     <div class="note-content">{{.ContentHTML}}</div>
     <div class="note-footer">
-      <a href="/html/thread/{{.ID}}" class="text-link" rel="related">{{i18n "nav.view_thread"}}</a>
-      {{if or (gt .ReplyCount 0) (gt .ReactionCount 0)}}
+      <a href="/thread/{{eventLink .ID .Kind .Pubkey .DTag}}" h-get h-target="#page-content" h-swap="inner" h-push-url h-prefetch class="text-link" rel="related">{{i18n "nav.view_thread"}}</a>
+      {{if or (gt .ReplyCount 0) (and .Reactions (gt .Reactions.Total 0))}}
       <span class="note-stats">
         {{if gt .ReplyCount 0}}<span class="stat-badge">💬 {{.ReplyCount}}</span>{{end}}
-        {{if gt .ReactionCount 0}}<span class="stat-badge">❤️ {{.ReactionCount}}</span>{{end}}
+        {{if and .Reactions (gt .Reactions.Total 0)}}<span class="stat-badge">❤️ {{.Reactions.Total}}</span>{{end}}
       </span>
       {{end}}
     </div>

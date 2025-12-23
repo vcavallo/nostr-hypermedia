@@ -27,7 +27,7 @@ func GetGifAttachmentTemplate() string {
 var gifsPageContent = `{{define "content"}}
 <div class="gifs-page">
   <h2>Search GIFs</h2>
-  <form action="/html/gifs" method="GET" class="gif-search-form">
+  <form action="/gifs" method="GET" class="gif-search-form">
     <label for="gif-search-input" class="sr-only">Search GIFs</label>
     <input type="search" id="gif-search-input" name="q" value="{{.Query}}" placeholder="Search for GIFs..." class="gif-search-input" autocomplete="off" autofocus>
     <button type="submit">{{i18n "btn.search"}}</button>
@@ -37,7 +37,7 @@ var gifsPageContent = `{{define "content"}}
   {{if .Query}}
     {{if .Results}}
       {{range .Results}}
-      <a href="/html/compose?media_url={{urlquery .URL}}&amp;media_thumb={{urlquery .ThumbURL}}" class="gif-item">
+      <a href="{{buildURL "/compose" "media_url" .URL "media_thumb" .ThumbURL}}" class="gif-item">
         <img src="{{.ThumbURL}}" alt="{{.Title}}" loading="lazy">
       </a>
       {{end}}
@@ -61,13 +61,13 @@ var gifsPageContent = `{{define "content"}}
 var gifPanelTemplate = `{{define "gif-panel"}}
 <aside class="gif-panel" aria-label="GIF picker">
   <header class="gif-panel-header">
-    <form action="/html/gifs/search" method="GET" class="gif-search-form" h-get h-target="#gif-results-{{.TargetID}}" h-swap="inner" h-indicator="#gif-results-{{.TargetID}}">
+    <form action="/gifs/search" method="GET" class="gif-search-form" h-get h-target="#gif-results-{{.TargetID}}" h-swap="inner" h-indicator="#gif-results-{{.TargetID}}">
       <input type="hidden" name="target" value="{{.TargetID}}">
       <label for="gif-search-{{.TargetID}}" class="sr-only">Search GIFs</label>
       <input type="search" id="gif-search-{{.TargetID}}" name="q" placeholder="Search GIFs..." class="gif-search-input" autocomplete="off" autofocus>
       <button type="submit" class="sr-only">{{i18n "btn.search"}}</button>
     </form>
-    <a href="/html/gifs/close?target={{.TargetID}}" h-get h-target="#gif-panel-{{.TargetID}}" h-swap="inner" class="gif-close-btn" aria-label="Close GIF picker">&#10005;</a>
+    <a href="{{buildURL "/gifs/close" "target" .TargetID}}" h-get h-target="#gif-panel-{{.TargetID}}" h-swap="inner" class="gif-close-btn" aria-label="Close GIF picker">&#10005;</a>
   </header>
   <section class="gif-results" id="gif-results-{{.TargetID}}" aria-label="GIF search results"></section>
 </aside>
@@ -78,7 +78,7 @@ var gifPanelTemplate = `{{define "gif-panel"}}
 var gifResultsTemplate = `{{define "gif-results"}}
 {{if .Results}}
   {{range .Results}}
-  <a href="/html/gifs/select?url={{urlquery .URL}}&amp;thumb={{urlquery .ThumbURL}}&amp;target={{$.TargetID}}"
+  <a href="{{buildURL "/gifs/select" "target" $.TargetID "url" .URL "thumb" .ThumbURL}}"
      h-get
      h-target="#gif-attachment-{{$.TargetID}}"
      h-swap="inner"
@@ -99,7 +99,7 @@ var gifAttachmentTemplate = `{{define "gif-attachment"}}
 <div class="gif-preview">
   <img src="{{.ThumbURL}}" alt="Selected GIF" loading="lazy">
   <span class="gif-url">{{truncateURL .URL 40}}</span>
-  <a href="/html/gifs/clear?target={{.TargetID}}" h-get h-target="#gif-attachment-{{.TargetID}}" h-swap="inner" class="gif-remove-btn" aria-label="Remove GIF">&#10005;</a>
+  <a href="{{buildURL "/gifs/clear" "target" .TargetID}}" h-get h-target="#gif-attachment-{{.TargetID}}" h-swap="inner" class="gif-remove-btn" aria-label="Remove GIF">&#10005;</a>
 </div>
 <div id="gif-panel-{{.TargetID}}" h-oob="inner"></div>
 {{end}}`

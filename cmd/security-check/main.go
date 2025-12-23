@@ -106,11 +106,13 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Analyze template files
+	// Analyze template files (including subdirectories like templates/kinds/)
 	templateFiles, err := filepath.Glob(filepath.Join(projectPath, "templates", "*.go"))
 	if err != nil {
 		fmt.Printf("Error finding template files: %v\n", err)
 	}
+	kindTemplates, _ := filepath.Glob(filepath.Join(projectPath, "templates", "kinds", "*.go"))
+	templateFiles = append(templateFiles, kindTemplates...)
 
 	// Analyze config files
 	configFiles, err := filepath.Glob(filepath.Join(projectPath, "config", "*.json"))
@@ -620,7 +622,8 @@ func checkGoSessionSecurity(content, filePath, fileName string) []CheckResult {
 	httpOnlyPattern := regexp.MustCompile(`HttpOnly:\s*true`)
 	// Match both static true and dynamic patterns like !isLocalhost(r) or shouldSecureCookie(r)
 	securePattern := regexp.MustCompile(`Secure:\s*(true|!isLocalhost|!isDev|isProduction|isHTTPS|shouldSecureCookie)`)
-	sameSitePattern := regexp.MustCompile(`SameSite:\s*http\.SameSite(Strict|Lax)Mode`)
+	// Match static SameSite values or variable usage (e.g., SameSite: sameSite)
+	sameSitePattern := regexp.MustCompile(`SameSite:\s*(http\.SameSite(Strict|Lax|None)Mode|sameSite)`)
 
 	hasCookies := cookiePattern.MatchString(content)
 	if hasCookies {

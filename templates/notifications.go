@@ -7,13 +7,15 @@ func GetNotificationsTemplate() string {
 }
 
 var notificationsContent = `{{define "content"}}
-<ul id="notes-list" class="notification-list">
-{{range .Items}}
+<div class="notifications-page">
+  <h1>{{i18n "notifications.title"}}</h1>
+  <ul id="notes-list" class="notification-list">
+  {{range .Items}}
 <li class="notification-item">
   <header class="notification-header">
     <span class="notification-icon">{{.TypeIcon}}</span>
     <div class="notification-meta">
-      <a href="/html/profile/{{.AuthorNpub}}" class="notification-author" rel="author">{{displayName .AuthorProfile .AuthorNpubShort}}</a>
+      <a href="/profile/{{.AuthorNpub}}" class="notification-author" rel="author">{{displayName .AuthorProfile .AuthorNpubShort}}</a>
       <span class="notification-action">{{.TypeLabel}}</span>
       <time class="notification-time" datetime="{{isoTime .Event.CreatedAt}}">{{.TimeAgo}}</time>
     </div>
@@ -26,19 +28,20 @@ var notificationsContent = `{{define "content"}}
   <div class="notification-target-content">{{.TargetContentHTML}}</div>
   {{end}}
   {{if .TargetEventID}}
-  <a href="/html/thread/{{.TargetEventID}}" class="notification-link" rel="related">{{i18n "nav.view_note"}} →</a>
+  <a href="/thread/{{noteLink .TargetEventID}}" h-get h-target="#page-content" h-swap="inner" h-push-url h-prefetch class="notification-link" rel="related">{{i18n "nav.view_note"}} →</a>
   {{else if .Event}}
-  <a href="/html/thread/{{.Event.ID}}" class="notification-link" rel="related">{{i18n "nav.view_note"}} →</a>
+  <a href="/thread/{{eventLink .Event.ID .Event.Kind .Event.Pubkey .Event.DTag}}" h-get h-target="#page-content" h-swap="inner" h-push-url h-prefetch class="notification-link" rel="related">{{i18n "nav.view_note"}} →</a>
   {{end}}
 </li>
-{{end}}
-</ul>
-{{if not .Items}}
-<div class="empty-state">
-  <div class="empty-state-icon">🔔</div>
-  <p>{{i18n "msg.no_notifications"}}</p>
-  <p class="empty-state-hint">When people mention you, reply to you, or react to your notes, you'll see it here.</p>
+  {{end}}
+  </ul>
+  {{if not .Items}}
+  <div class="empty-state">
+    <div class="empty-state-icon">🔔</div>
+    <p>{{i18n "msg.no_notifications"}}</p>
+    <p class="empty-state-hint">When people mention you, reply to you, or react to your notes, you'll see it here.</p>
+  </div>
+  {{end}}
+  {{template "pagination" .}}
 </div>
-{{end}}
-{{template "pagination" .}}
 {{end}}`

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log/slog"
 	"net"
+	"net/http"
 	"net/url"
 	"sort"
 	"strings"
@@ -12,12 +13,183 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+
+	"nostr-server/internal/config"
+	"nostr-server/internal/nostr"
+	"nostr-server/internal/util"
 )
 
 // Connection pool limits
 const (
-	maxTotalConnections = 50 // Maximum total relay connections
+	maxTotalConnections      = 150 // Maximum total relay connections (increased for outbox model)
+	lruEvictionThreshold     = 140 // Start LRU eviction when pool reaches this size
+	lruEvictionTargetFree    = 20  // Number of connections to free when evicting
+	lruEvictionMinIdleTime   = 30 * time.Second // Minimum idle time before eligible for eviction
 )
+
+// Per-relay concurrency limits to prevent "too many concurrent REQs" errors
+const (
+	maxConcurrentReqsPerRelay = 10               // Max concurrent subscriptions per relay
+	semaphoreAcquireTimeout   = 5 * time.Second  // Timeout for acquiring semaphore slot
+)
+
+// DNS cache to avoid repeated lookups for the same host
+const (
+	dnsCacheTTL     = 5 * time.Minute
+	dnsCacheMaxSize = 500 // Limit entries to prevent unbounded growth
+)
+
+type dnsCacheEntry struct {
+	ips       []net.IP
+	expiresAt time.Time
+	safe      bool // cached safety check result
+}
+
+var (
+	dnsCache   = make(map[string]*dnsCacheEntry)
+	dnsCacheMu sync.RWMutex
+)
+
+// Write-only relay detection (relays that accept EVENT but not REQ)
+const writeOnlyRelayTTL = 1 * time.Hour
+
+type writeOnlyRelayEntry struct {
+	detectedAt time.Time
+}
+
+var (
+	writeOnlyRelays   = make(map[string]*writeOnlyRelayEntry)
+	writeOnlyRelaysMu sync.RWMutex
+)
+
+// IsWriteOnlyRelay checks if a relay is known to be write-only (from config or dynamic detection)
+func IsWriteOnlyRelay(relayURL string) bool {
+	normalized := normalizeRelayURL(relayURL)
+	if normalized == "" {
+		return false
+	}
+
+	// Check static config first
+	for _, r := range config.GetWriteOnlyRelays() {
+		if normalizeRelayURL(r) == normalized {
+			return true
+		}
+	}
+
+	// Check dynamic cache
+	writeOnlyRelaysMu.RLock()
+	entry, exists := writeOnlyRelays[normalized]
+	writeOnlyRelaysMu.RUnlock()
+
+	if exists && time.Since(entry.detectedAt) < writeOnlyRelayTTL {
+		return true
+	}
+
+	return false
+}
+
+// markRelayAsWriteOnly adds a relay to the dynamic write-only cache
+func markRelayAsWriteOnly(relayURL string) {
+	normalized := normalizeRelayURL(relayURL)
+	if normalized == "" {
+		return
+	}
+
+	writeOnlyRelaysMu.Lock()
+	writeOnlyRelays[normalized] = &writeOnlyRelayEntry{
+		detectedAt: time.Now(),
+	}
+	writeOnlyRelaysMu.Unlock()
+
+	slog.Info("relay detected as write-only", "relay", normalized)
+}
+
+// lookupIPCached performs DNS lookup with caching
+func lookupIPCached(host string) ([]net.IP, error) {
+	dnsCacheMu.RLock()
+	entry, exists := dnsCache[host]
+	dnsCacheMu.RUnlock()
+
+	if exists && time.Now().Before(entry.expiresAt) {
+		return entry.ips, nil
+	}
+
+	ips, err := net.LookupIP(host)
+	if err != nil {
+		return nil, err
+	}
+
+	dnsCacheMu.Lock()
+	// Evict oldest entries if at max size
+	if len(dnsCache) >= dnsCacheMaxSize {
+		dnsCacheEvictOldest()
+	}
+	dnsCache[host] = &dnsCacheEntry{
+		ips:       ips,
+		expiresAt: time.Now().Add(dnsCacheTTL),
+	}
+	dnsCacheMu.Unlock()
+
+	return ips, nil
+}
+
+// dnsCacheEvictOldest removes 10% of oldest entries (must hold write lock)
+func dnsCacheEvictOldest() {
+	toRemove := dnsCacheMaxSize / 10
+	if toRemove < 1 {
+		toRemove = 1
+	}
+
+	type hostExpiry struct {
+		host      string
+		expiresAt time.Time
+	}
+
+	entries := make([]hostExpiry, 0, len(dnsCache))
+	for host, entry := range dnsCache {
+		entries = append(entries, hostExpiry{host, entry.expiresAt})
+	}
+
+	sort.Slice(entries, func(i, j int) bool {
+		return entries[i].expiresAt.Before(entries[j].expiresAt)
+	})
+
+	for i := 0; i < toRemove && i < len(entries); i++ {
+		delete(dnsCache, entries[i].host)
+	}
+}
+
+// Custom WebSocket dialer with proper timeouts
+var wsDialer = &websocket.Dialer{
+	Proxy:            http.ProxyFromEnvironment,
+	HandshakeTimeout: 10 * time.Second,
+	NetDialContext: (&net.Dialer{
+		Timeout:   10 * time.Second,
+		KeepAlive: 30 * time.Second,
+	}).DialContext,
+}
+
+// DNS cache cleanup goroutine
+func init() {
+	go func() {
+		ticker := time.NewTicker(5 * time.Minute)
+		defer ticker.Stop()
+		for range ticker.C {
+			dnsCacheMu.Lock()
+			now := time.Now()
+			for host, entry := range dnsCache {
+				if now.After(entry.expiresAt) {
+					delete(dnsCache, host)
+				}
+			}
+			dnsCacheMu.Unlock()
+		}
+	}()
+}
+
+// normalizeRelayURL validates and normalizes a relay URL from NIP-65 events
+// Returns empty string if URL is invalid/malformed
+var normalizeRelayURL = nostr.NormalizeRelayURL
 
 // isRelayURLSafe validates relay URL (blocks private IPs, allows localhost)
 func isRelayURLSafe(relayURL string) bool {
@@ -35,15 +207,20 @@ func isRelayURLSafe(relayURL string) bool {
 		return false
 	}
 
-	if host == "localhost" || host == "127.0.0.1" || host == "::1" {
+	// Block internal/unreachable hosts (.onion, .local, .internal)
+	if util.IsInternalHost(host) {
+		return false
+	}
+
+	// Allow localhost for development
+	if util.IsLoopbackHost(host) {
 		return true
 	}
 
-	ips, err := net.LookupIP(host)
+	ips, err := lookupIPCached(host)
 	if err != nil {
 		// Can't resolve - allow unless obviously internal
-		if len(host) > 0 && (host[len(host)-1] == '.' ||
-			strings.Contains(host, ".local") || strings.Contains(host, ".internal")) {
+		if len(host) > 0 && host[len(host)-1] == '.' {
 			return false
 		}
 		return true
@@ -117,9 +294,52 @@ func (rc *RelayConn) isClosed() bool {
 	return rc.closed
 }
 
+// relaySemaphore limits concurrent subscriptions to a single relay
+type relaySemaphore struct {
+	ch chan struct{}
+}
+
+func newRelaySemaphore(size int) *relaySemaphore {
+	return &relaySemaphore{ch: make(chan struct{}, size)}
+}
+
+// acquire blocks until a slot is available or context is cancelled
+func (s *relaySemaphore) acquire(ctx context.Context) error {
+	select {
+	case s.ch <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// tryAcquire attempts to acquire a slot with timeout
+func (s *relaySemaphore) tryAcquire(timeout time.Duration) bool {
+	select {
+	case s.ch <- struct{}{}:
+		return true
+	case <-time.After(timeout):
+		return false
+	}
+}
+
+// release returns a slot to the semaphore
+func (s *relaySemaphore) release() {
+	select {
+	case <-s.ch:
+	default:
+		// Semaphore wasn't held - log but don't panic
+		slog.Warn("relay semaphore release called without acquire")
+	}
+}
+
 type RelayPool struct {
 	mu          sync.RWMutex
 	connections map[string]*RelayConn
+	connecting  map[string]*sync.Mutex // Per-relay mutex to prevent duplicate dial attempts
+	connectMu   sync.Mutex             // Protects connecting map
+	semaphores  map[string]*relaySemaphore // Per-relay concurrency limiters
+	semMu       sync.RWMutex               // Protects semaphores map
 	stopCh      chan struct{}
 	stopOnce    sync.Once
 }
@@ -136,213 +356,40 @@ type relayStats struct {
 	lastResponse    time.Time
 }
 
-type RelayHealth struct {
-	mu       sync.RWMutex
-	failures map[string]*relayFailure
-	stats    map[string]*relayStats
-}
-
-var relayHealth = &RelayHealth{
-	failures: make(map[string]*relayFailure),
-	stats:    make(map[string]*relayStats),
-}
-
-func (h *RelayHealth) shouldSkip(relayURL string) bool {
-	h.mu.RLock()
-	defer h.mu.RUnlock()
-
-	f := h.failures[relayURL]
-	if f == nil {
-		return false
-	}
-	return time.Now().Before(f.backoffUntil)
-}
-
-func (h *RelayHealth) recordFailure(relayURL string) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-
-	f := h.failures[relayURL]
-	if f == nil {
-		f = &relayFailure{}
-		h.failures[relayURL] = f
-	}
-
-	f.lastFailure = time.Now()
-	f.failureCount++
-
-	var backoff time.Duration // Exponential: 30s, 60s, 2m, 5m max
-	switch {
-	case f.failureCount <= 1:
-		backoff = 30 * time.Second
-	case f.failureCount == 2:
-		backoff = 60 * time.Second
-	case f.failureCount == 3:
-		backoff = 2 * time.Minute
-	default:
-		backoff = 5 * time.Minute
-	}
-
-	f.backoffUntil = time.Now().Add(backoff)
-	slog.Warn("relay connection failed",
-		"relay", relayURL,
-		"failure_count", f.failureCount,
-		"backoff_until", f.backoffUntil.Format("15:04:05"))
-}
-
-func (h *RelayHealth) recordSuccess(relayURL string) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-
-	delete(h.failures, relayURL)
-}
-
-func (h *RelayHealth) recordResponseTime(relayURL string, duration time.Duration) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-
-	s := h.stats[relayURL]
-	if s == nil {
-		s = &relayStats{}
-		h.stats[relayURL] = s
-	}
-
-	// Exponential moving average (alpha=0.3)
-	if s.responseCount == 0 {
-		s.avgResponseTime = duration
-	} else {
-		alpha := 0.3
-		s.avgResponseTime = time.Duration(alpha*float64(duration) + (1-alpha)*float64(s.avgResponseTime))
-	}
-
-	s.responseCount++
-	s.lastResponse = time.Now()
-}
-
-func (h *RelayHealth) getAverageResponseTime(relayURL string) time.Duration {
-	h.mu.RLock()
-	defer h.mu.RUnlock()
-
-	s := h.stats[relayURL]
-	if s == nil || s.responseCount == 0 {
-		return 1 * time.Second
-	}
-	return s.avgResponseTime
-}
-
-// getRelayScore returns 0-100 (higher = better, factors in response time + failures)
-func (h *RelayHealth) getRelayScore(relayURL string) int {
-	h.mu.RLock()
-	defer h.mu.RUnlock()
-
-	score := 50
-
-	if s := h.stats[relayURL]; s != nil && s.responseCount > 0 {
-		avgMs := s.avgResponseTime.Milliseconds()
-		switch {
-		case avgMs < 200:
-			score = 50
-		case avgMs < 500:
-			score = 40
-		case avgMs < 1000:
-			score = 25
-		default:
-			score = 10
-		}
-
-		bonus := s.responseCount
-		if bonus > 10 {
-			bonus = 10
-		}
-		score += bonus
-	}
-
-	if f := h.failures[relayURL]; f != nil {
-		penalty := f.failureCount * 10
-		if penalty > 30 {
-			penalty = 30
-		}
-		score -= penalty
-
-		if time.Now().Before(f.backoffUntil) {
-			score -= 20
-		}
-	}
-
-	if score < 0 {
-		score = 0
-	}
-	if score > 100 {
-		score = 100
-	}
-
-	return score
-}
-
-// SortRelaysByScore returns relays sorted by score (best first)
-func (h *RelayHealth) SortRelaysByScore(relays []string) []string {
-	if len(relays) <= 1 {
-		return relays
-	}
-
-	scores := make(map[string]int, len(relays))
-	for _, relay := range relays {
-		scores[relay] = h.getRelayScore(relay)
-	}
-
-	sorted := make([]string, len(relays))
-	copy(sorted, relays)
-
-	sort.Slice(sorted, func(i, j int) bool {
-		return scores[sorted[i]] > scores[sorted[j]]
-	})
-
-	return sorted
-}
-
-// GetExpectedResponseTime returns expected time for fastest N relays (+50% buffer)
-func (h *RelayHealth) GetExpectedResponseTime(relays []string, minRelays int) time.Duration {
-	if len(relays) == 0 {
-		return 500 * time.Millisecond
-	}
-
-	times := make([]time.Duration, 0, len(relays))
-	for _, relay := range relays {
-		times = append(times, h.getAverageResponseTime(relay))
-	}
-
-	sort.Slice(times, func(i, j int) bool {
-		return times[i] < times[j]
-	})
-
-	idx := minRelays - 1
-	if idx >= len(times) {
-		idx = len(times) - 1
-	}
-	if idx < 0 {
-		idx = 0
-	}
-
-	expected := times[idx] + times[idx]/2 // +50% buffer
-	if expected < 200*time.Millisecond {
-		expected = 200 * time.Millisecond
-	}
-	if expected > 2*time.Second {
-		expected = 2 * time.Second
-	}
-
-	return expected
-}
-
 var relayPool = NewRelayPool()
 
 func NewRelayPool() *RelayPool {
 	pool := &RelayPool{
 		connections: make(map[string]*RelayConn),
+		connecting:  make(map[string]*sync.Mutex),
+		semaphores:  make(map[string]*relaySemaphore),
 		stopCh:      make(chan struct{}),
 	}
 	go pool.cleanupLoop()
 	return pool
+}
+
+// getSemaphore returns the concurrency limiter for a relay, creating one if needed
+func (p *RelayPool) getSemaphore(relayURL string) *relaySemaphore {
+	p.semMu.RLock()
+	sem := p.semaphores[relayURL]
+	p.semMu.RUnlock()
+
+	if sem != nil {
+		return sem
+	}
+
+	p.semMu.Lock()
+	defer p.semMu.Unlock()
+
+	// Double-check after acquiring write lock
+	if sem = p.semaphores[relayURL]; sem != nil {
+		return sem
+	}
+
+	sem = newRelaySemaphore(maxConcurrentReqsPerRelay)
+	p.semaphores[relayURL] = sem
+	return sem
 }
 
 // Close shuts down the relay pool and all connections
@@ -359,7 +406,30 @@ func (p *RelayPool) Close() {
 }
 
 func DefaultRelays() []string {
-	return ConfigGetDefaultRelays()
+	return config.GetDefaultRelays()
+}
+
+// IsConnected returns true if a relay connection exists and is not closed
+func (p *RelayPool) IsConnected(relayURL string) bool {
+	relayURL = strings.TrimSuffix(relayURL, "/")
+	p.mu.RLock()
+	rc := p.connections[relayURL]
+	p.mu.RUnlock()
+	return rc != nil && !rc.isClosed()
+}
+
+// GetConnectedRelays returns a list of currently connected relay URLs
+func (p *RelayPool) GetConnectedRelays() []string {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	connected := make([]string, 0, len(p.connections))
+	for url, rc := range p.connections {
+		if !rc.closed {
+			connected = append(connected, url)
+		}
+	}
+	return connected
 }
 
 // WarmupConnections pre-connects to default relays at startup
@@ -390,12 +460,35 @@ func (p *RelayPool) getOrCreateConn(ctx context.Context, relayURL string) (*Rela
 	if !isRelayURLSafe(relayURL) {
 		return nil, errors.New("relay URL blocked: unsafe destination")
 	}
-	if relayHealth.shouldSkip(relayURL) {
+	if relayHealthStore.shouldSkip(relayURL) {
 		return nil, errors.New("relay in backoff period")
 	}
 
+	// Fast path: check if connection already exists
 	p.mu.RLock()
 	rc := p.connections[relayURL]
+	p.mu.RUnlock()
+
+	if rc != nil && !rc.isClosed() {
+		return rc, nil
+	}
+
+	// Get or create per-relay connection mutex to prevent duplicate dial attempts
+	p.connectMu.Lock()
+	relayMu, exists := p.connecting[relayURL]
+	if !exists {
+		relayMu = &sync.Mutex{}
+		p.connecting[relayURL] = relayMu
+	}
+	p.connectMu.Unlock()
+
+	// Serialize connection attempts for this specific relay
+	relayMu.Lock()
+	defer relayMu.Unlock()
+
+	// Re-check after acquiring relay mutex (another goroutine may have connected)
+	p.mu.RLock()
+	rc = p.connections[relayURL]
 	p.mu.RUnlock()
 
 	if rc != nil && !rc.isClosed() {
@@ -406,14 +499,20 @@ func (p *RelayPool) getOrCreateConn(ctx context.Context, relayURL string) (*Rela
 	p.mu.RLock()
 	connCount := len(p.connections)
 	p.mu.RUnlock()
-	if connCount >= maxTotalConnections {
-		return nil, errors.New("connection pool limit reached")
+	if connCount >= lruEvictionThreshold {
+		// Try LRU eviction to make room
+		if !p.evictLRU() && connCount >= maxTotalConnections {
+			return nil, errors.New("connection pool limit reached")
+		}
 	}
 
 	slog.Debug("creating new relay connection", "relay", relayURL)
-	conn, _, err := websocket.DefaultDialer.DialContext(ctx, relayURL, nil)
+	conn, _, err := wsDialer.DialContext(ctx, relayURL, nil)
 	if err != nil {
-		relayHealth.recordFailure(relayURL)
+		// Don't penalize relay for context cancellation (early exit optimization)
+		if ctx.Err() == nil {
+			relayHealthStore.recordFailure(relayURL)
+		}
 		return nil, err
 	}
 
@@ -424,7 +523,7 @@ func (p *RelayPool) getOrCreateConn(ctx context.Context, relayURL string) (*Rela
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	// Another goroutine may have connected while we were dialing
+	// Another goroutine may have connected while we were dialing (shouldn't happen with relay mutex)
 	if existing := p.connections[relayURL]; existing != nil && !existing.closed {
 		conn.Close()
 		return existing, nil
@@ -447,7 +546,7 @@ func (p *RelayPool) getOrCreateConn(ctx context.Context, relayURL string) (*Rela
 	})
 
 	p.connections[relayURL] = rc
-	relayHealth.recordSuccess(relayURL)
+	relayHealthStore.recordSuccess(relayURL)
 
 	go rc.readLoop()
 	go rc.pingLoop()
@@ -456,6 +555,26 @@ func (p *RelayPool) getOrCreateConn(ctx context.Context, relayURL string) (*Rela
 }
 
 func (p *RelayPool) Subscribe(ctx context.Context, relayURL string, subID string, filter map[string]interface{}) (*Subscription, error) {
+	relayURL = strings.TrimSuffix(relayURL, "/")
+
+	// Acquire per-relay semaphore to limit concurrent REQs
+	sem := p.getSemaphore(relayURL)
+	if err := sem.acquire(ctx); err != nil {
+		return nil, errors.New("semaphore acquire cancelled: " + err.Error())
+	}
+
+	// Create subscription with semaphore release on close
+	sub, err := p.subscribeWithSemaphore(ctx, relayURL, subID, filter, sem)
+	if err != nil {
+		sem.release() // Release on error
+		return nil, err
+	}
+
+	return sub, nil
+}
+
+// subscribeWithSemaphore performs the actual subscription after semaphore is acquired
+func (p *RelayPool) subscribeWithSemaphore(ctx context.Context, relayURL string, subID string, filter map[string]interface{}, sem *relaySemaphore) (*Subscription, error) {
 	const maxRetries = 3
 	var rc *RelayConn
 	var err error
@@ -528,6 +647,13 @@ func (p *RelayPool) Subscribe(ctx context.Context, relayURL string, subID string
 	rc.mu.Lock()
 	rc.lastActivity = time.Now()
 	rc.mu.Unlock()
+
+	// Start goroutine to release semaphore when subscription closes
+	go func() {
+		<-sub.Done
+		sem.release()
+	}()
+
 	return sub, nil
 }
 
@@ -696,6 +822,14 @@ func (rc *RelayConn) readLoop() {
 			if len(msg) >= 2 {
 				notice, _ := msg[1].(string)
 				slog.Debug("relay NOTICE", "relay", rc.relayURL, "message", notice)
+
+				// Detect write-only relays from NOTICE messages
+				noticeLower := strings.ToLower(notice)
+				if strings.Contains(noticeLower, "does not accept req") ||
+					strings.Contains(noticeLower, "req not supported") ||
+					strings.Contains(noticeLower, "read requests disabled") {
+					markRelayAsWriteOnly(rc.relayURL)
+				}
 			}
 		}
 	}
@@ -818,6 +952,96 @@ func (p *RelayPool) cleanup() {
 		}
 		p.mu.Unlock()
 	}
+}
+
+// evictLRU removes least recently used connections when pool approaches limit
+// Returns true if eviction made room for new connections
+func (p *RelayPool) evictLRU() bool {
+	now := time.Now()
+
+	// Collect connection stats under read lock
+	p.mu.RLock()
+	connCount := len(p.connections)
+	if connCount < lruEvictionThreshold {
+		p.mu.RUnlock()
+		return true // Plenty of room
+	}
+
+	type connInfo struct {
+		url          string
+		lastActivity time.Time
+		subCount     int
+		closed       bool
+	}
+
+	candidates := make([]connInfo, 0, connCount)
+	for url, rc := range p.connections {
+		rc.mu.Lock()
+		info := connInfo{
+			url:          url,
+			lastActivity: rc.lastActivity,
+			subCount:     len(rc.subscriptions),
+			closed:       rc.closed,
+		}
+		rc.mu.Unlock()
+		candidates = append(candidates, info)
+	}
+	p.mu.RUnlock()
+
+	// Sort by eligibility for eviction:
+	// 1. Closed connections first
+	// 2. Connections with no subscriptions and old activity
+	// 3. By last activity time (oldest first)
+	sort.Slice(candidates, func(i, j int) bool {
+		ci, cj := candidates[i], candidates[j]
+
+		// Closed connections always evict first
+		if ci.closed != cj.closed {
+			return ci.closed
+		}
+
+		// Connections with no active subscriptions preferred for eviction
+		iIdle := ci.subCount == 0 && now.Sub(ci.lastActivity) > lruEvictionMinIdleTime
+		jIdle := cj.subCount == 0 && now.Sub(cj.lastActivity) > lruEvictionMinIdleTime
+		if iIdle != jIdle {
+			return iIdle
+		}
+
+		// Among idle connections, evict oldest first
+		return ci.lastActivity.Before(cj.lastActivity)
+	})
+
+	// Evict connections to reach target
+	toEvict := connCount - (maxTotalConnections - lruEvictionTargetFree)
+	if toEvict <= 0 {
+		return true
+	}
+	if toEvict > len(candidates) {
+		toEvict = len(candidates)
+	}
+
+	var evicted int
+	for i := 0; i < toEvict && i < len(candidates); i++ {
+		c := candidates[i]
+		// Only evict closed or idle connections
+		if !c.closed && (c.subCount > 0 || now.Sub(c.lastActivity) <= lruEvictionMinIdleTime) {
+			continue
+		}
+
+		p.mu.Lock()
+		if rc, exists := p.connections[c.url]; exists {
+			delete(p.connections, c.url)
+			if !rc.isClosed() {
+				rc.markClosed()
+			}
+			evicted++
+			slog.Debug("LRU evicted relay connection", "relay", c.url, "idle_time", now.Sub(c.lastActivity))
+		}
+		p.mu.Unlock()
+	}
+
+	slog.Info("LRU eviction completed", "evicted", evicted, "pool_size", connCount-evicted)
+	return evicted > 0
 }
 
 // PublishEvent sends an event to the relay and waits for OK response

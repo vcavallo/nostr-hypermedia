@@ -17,6 +17,8 @@ import (
 	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/btcsuite/btcd/btcec/v2/schnorr"
 	"github.com/gorilla/websocket"
+	"nostr-server/internal/config"
+	"nostr-server/internal/nips"
 )
 
 // Rate limiting constants for NIP-46 operations
@@ -38,6 +40,9 @@ const (
 // rate limit store (Redis) is unavailable. This ensures rate limiting still works
 // even if Redis is down, preventing complete bypass of rate limits.
 var fallbackRateLimiter = newFallbackRateLimiter()
+
+// Maximum number of rate limit buckets to prevent memory exhaustion
+const maxRateLimitBuckets = 5000
 
 type fallbackRateLimiterStore struct {
 	mu      sync.Mutex
@@ -89,6 +94,16 @@ func (f *fallbackRateLimiterStore) Allow(key string, limit int, window time.Dura
 
 	// Create new bucket or reset expired bucket
 	if !exists || now.After(bucket.resetAt) {
+		// Enforce max bucket count to prevent memory exhaustion
+		if !exists && len(f.buckets) >= maxRateLimitBuckets {
+			// Too many buckets - run emergency cleanup
+			f.cleanupLocked()
+			// If still at limit after cleanup, reject to prevent memory growth
+			if len(f.buckets) >= maxRateLimitBuckets {
+				slog.Warn("rate limiter bucket limit reached, rejecting request")
+				return false
+			}
+		}
 		f.buckets[key] = &fallbackBucket{
 			count:   1,
 			resetAt: now.Add(window),
@@ -109,7 +124,11 @@ func (f *fallbackRateLimiterStore) Allow(key string, limit int, window time.Dura
 func (f *fallbackRateLimiterStore) cleanup() {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.cleanupLocked()
+}
 
+// cleanupLocked removes expired buckets (caller must hold lock)
+func (f *fallbackRateLimiterStore) cleanupLocked() {
 	now := time.Now()
 	for key, bucket := range f.buckets {
 		if now.After(bucket.resetAt) {
@@ -314,6 +333,42 @@ func (s *BunkerSession) GetWalletRelay() string {
 	return ""
 }
 
+// GetFollowingPubkeys returns a copy of the user's following list (thread-safe).
+func (s *BunkerSession) GetFollowingPubkeys() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	result := make([]string, len(s.FollowingPubkeys))
+	copy(result, s.FollowingPubkeys)
+	return result
+}
+
+// GetMutedPubkeys returns a deduplicated copy of the user's muted pubkeys list (thread-safe).
+func (s *BunkerSession) GetMutedPubkeys() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	seen := make(map[string]bool)
+	result := make([]string, 0, len(s.MutedPubkeys))
+	for _, pk := range s.MutedPubkeys {
+		if !seen[pk] {
+			seen[pk] = true
+			result = append(result, pk)
+		}
+	}
+	return result
+}
+
+// IsFollowing checks if a pubkey is in the user's following list (thread-safe).
+func (s *BunkerSession) IsFollowing(pubkey string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, pk := range s.FollowingPubkeys {
+		if pk == pubkey {
+			return true
+		}
+	}
+	return false
+}
+
 // SetNWCConfig sets the NWC wallet configuration
 func (s *BunkerSession) SetNWCConfig(config *NWCConfig) {
 	s.mu.Lock()
@@ -445,17 +500,17 @@ func ParseBunkerURL(bunkerURL string) (*BunkerSession, error) {
 	secret := u.Query().Get("secret")
 
 	// Generate disposable client keypair
-	clientPrivKey, err := GeneratePrivateKey()
+	clientPrivKey, err := nips.GeneratePrivateKey()
 	if err != nil {
 		return nil, fmt.Errorf("failed to generate client keypair: %v", err)
 	}
-	clientPubKey, err := GetPublicKey(clientPrivKey)
+	clientPubKey, err := nips.GetPublicKey(clientPrivKey)
 	if err != nil {
 		return nil, fmt.Errorf("failed to derive public key: %v", err)
 	}
 
 	// Pre-compute conversation key
-	conversationKey, err := GetConversationKey(clientPrivKey, remoteSignerPubKey)
+	conversationKey, err := nips.GetConversationKey(clientPrivKey, remoteSignerPubKey)
 	if err != nil {
 		return nil, fmt.Errorf("failed to compute conversation key: %v", err)
 	}
@@ -535,7 +590,7 @@ func (s *BunkerSession) Connect(ctx context.Context) error {
 
 	// Fetch user's profile in background (for avatar in settings toggle)
 	go func() {
-		fetchProfilesWithOptions(ConfigGetProfileRelays(), []string{userPubKeyHex}, false)
+		fetchProfilesWithOptions(config.GetProfileRelays(), []string{userPubKeyHex}, false)
 	}()
 
 	return nil
@@ -748,7 +803,7 @@ func (rc *nip46RelayConn) handleEvent(msg []interface{}) {
 	}
 
 	// Decrypt response
-	decrypted, err := Nip44Decrypt(responseEvent.Content, rc.session.ConversationKey)
+	decrypted, err := nips.Nip44Decrypt(responseEvent.Content, rc.session.ConversationKey)
 	if err != nil {
 		slog.Error("NIP-46: failed to decrypt response", "relay", rc.url, "error", err)
 		return
@@ -920,7 +975,7 @@ func (s *BunkerSession) sendRequest(ctx context.Context, method string, params [
 	}
 
 	// Encrypt with NIP-44
-	encryptedContent, err := Nip44Encrypt(string(requestJSON), s.ConversationKey)
+	encryptedContent, err := nips.Nip44Encrypt(string(requestJSON), s.ConversationKey)
 	if err != nil {
 		return "", fmt.Errorf("encryption failed: %v", err)
 	}

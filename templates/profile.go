@@ -12,44 +12,52 @@ var profileContent = `{{define "content"}}
   <div class="profile-info">
     <div class="profile-name-row">
       <div class="profile-name">{{displayName .Profile .NpubShort}}</div>
-      {{if and .LoggedIn (not .IsSelf)}}
-      <span id="follow-btn-{{.Pubkey}}">
-      <form method="POST" action="/html/follow" class="inline-form" h-post h-target="#follow-btn-{{.Pubkey}}" h-swap="inner"{{if .IsFollowing}} h-confirm="Unfollow this user?"{{end}}>
-        <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
-        <input type="hidden" name="pubkey" value="{{.Pubkey}}">
-        <input type="hidden" name="return_url" value="{{.CurrentURL}}">
-        {{if .IsFollowing}}
-        <input type="hidden" name="action" value="unfollow">
-        <button type="submit" class="follow-btn unfollow">{{i18n "btn.unfollow"}}</button>
-        {{else}}
-        <input type="hidden" name="action" value="follow">
-        <button type="submit" class="follow-btn follow">{{i18n "btn.follow"}}</button>
-        {{end}}
-      </form>
-      </span>
-      <form method="POST" action="/html/mute" class="inline-form"{{if .IsMuted}} h-confirm="Unmute this user?"{{else}} h-confirm="Mute this user? Their content will be hidden from your timeline."{{end}}>
-        <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
-        <input type="hidden" name="pubkey" value="{{.Pubkey}}">
-        <input type="hidden" name="return_url" value="{{.CurrentURL}}">
-        {{if .IsMuted}}
-        <input type="hidden" name="action" value="unmute">
-        <button type="submit" class="mute-btn unmute">{{i18n "action.unmute"}}</button>
-        {{else}}
-        <input type="hidden" name="action" value="mute">
-        <button type="submit" class="mute-btn mute">{{i18n "action.mute"}}</button>
-        {{end}}
-      </form>
-      {{end}}
-      {{if and .LoggedIn .IsSelf (not .EditMode)}}
-      <a href="/html/profile/edit" class="edit-profile-btn">{{i18n "label.edit_profile"}}</a>
-      {{end}}
     </div>
-    {{if and .Profile .Profile.Nip05}}
+    {{if and .Profile .Profile.NIP05Verified}}
+    <div class="profile-nip05"><a href="{{nip05URL .Profile.Nip05}}" target="_blank" rel="noopener" class="nip05-verified">{{nip05Badge}} {{.Profile.NIP05Domain}}</a></div>
+    {{else if and .Profile .Profile.Nip05}}
     <div class="profile-nip05">{{.Profile.Nip05}}</div>
     {{end}}
     <div class="profile-npub" title="{{.Pubkey}}">{{.NpubShort}}</div>
     {{if and .Profile .Profile.About}}
     <div class="profile-about">{{.Profile.About}}</div>
+    {{end}}
+    {{if or (and .LoggedIn (not .IsSelf)) (and .LoggedIn .IsSelf (not .EditMode))}}
+    <div class="profile-actions">
+      {{if and .LoggedIn (not .IsSelf)}}
+      <span id="follow-btn-{{.Pubkey}}">
+      <form method="POST" action="/follow" class="inline-form" h-post h-target="#follow-btn-{{.Pubkey}}" h-swap="inner" h-indicator="#follow-spinner-{{.Pubkey}}"{{if .IsFollowing}} h-confirm="Unfollow this user?"{{end}}>
+        <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
+        <input type="hidden" name="pubkey" value="{{.Pubkey}}">
+        <input type="hidden" name="return_url" value="{{.CurrentURL}}">
+        {{if .IsFollowing}}
+        <input type="hidden" name="action" value="unfollow">
+        <button type="submit" class="follow-btn unfollow">{{i18n "btn.unfollow"}} <span id="follow-spinner-{{.Pubkey}}" class="h-indicator"><span class="h-spinner"></span></span></button>
+        {{else}}
+        <input type="hidden" name="action" value="follow">
+        <button type="submit" class="follow-btn follow">{{i18n "btn.follow"}} <span id="follow-spinner-{{.Pubkey}}" class="h-indicator"><span class="h-spinner"></span></span></button>
+        {{end}}
+      </form>
+      </span>
+      <span id="mute-btn-{{.Pubkey}}">
+      <form method="POST" action="/mute" class="inline-form" h-post h-target="#mute-btn-{{.Pubkey}}" h-swap="inner" h-indicator="#mute-spinner-{{.Pubkey}}"{{if .IsMuted}} h-confirm="Unmute this user?"{{else}} h-confirm="Mute this user? Their content will be hidden from your timeline."{{end}}>
+        <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
+        <input type="hidden" name="pubkey" value="{{.Pubkey}}">
+        <input type="hidden" name="return_url" value="{{.CurrentURL}}">
+        {{if .IsMuted}}
+        <input type="hidden" name="action" value="unmute">
+        <button type="submit" class="mute-btn unmute">{{i18n "action.unmute"}} <span id="mute-spinner-{{.Pubkey}}" class="h-indicator"><span class="h-spinner"></span></span></button>
+        {{else}}
+        <input type="hidden" name="action" value="mute">
+        <button type="submit" class="mute-btn mute">{{i18n "action.mute"}} <span id="mute-spinner-{{.Pubkey}}" class="h-indicator"><span class="h-spinner"></span></span></button>
+        {{end}}
+      </form>
+      </span>
+      {{end}}
+      {{if and .LoggedIn .IsSelf (not .EditMode)}}
+      <a href="/profile/edit" class="edit-profile-btn">{{i18n "label.edit_profile"}}</a>
+      {{end}}
+    </div>
     {{end}}
   </div>
 </div>
@@ -63,7 +71,7 @@ var profileContent = `{{define "content"}}
   {{if .Success}}
   <div class="flash-message" role="status" aria-live="polite">{{.Success}}</div>
   {{end}}
-  <form method="POST" action="/html/profile/edit">
+  <form method="POST" action="/profile/edit">
     <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
     <input type="hidden" name="raw_content" value="{{.RawContent}}">
     <div class="edit-form-group">
@@ -105,7 +113,7 @@ var profileContent = `{{define "content"}}
     </div>
     <div class="edit-form-buttons">
       <button type="submit" class="submit-btn">{{i18n "btn.save_profile"}}</button>
-      <a href="/html/profile/{{.Npub}}" class="edit-form-btn edit-form-btn-secondary">{{i18n "btn.cancel"}}</a>
+      <a href="/profile/{{.Npub}}" class="edit-form-btn edit-form-btn-secondary">{{i18n "btn.cancel"}}</a>
     </div>
   </form>
 </div>
@@ -114,17 +122,22 @@ var profileContent = `{{define "content"}}
   {{range .Items}}
   <article class="note" aria-label="Note by {{displayName $.Profile $.NpubShort}}">
     <div class="note-author">
-      <a href="/html/profile/{{$.Npub}}" class="text-muted" rel="author">
+      <a href="/profile/{{$.Npub}}" class="text-muted" rel="author">
       <img class="author-avatar" src="{{if and $.Profile $.Profile.Picture}}{{avatarURL $.Profile.Picture}}{{else}}/static/avatar.jpg{{end}}" alt="{{displayName $.Profile "User"}}'s avatar" loading="lazy">
       </a>
       <div class="author-info">
-        <a href="/html/profile/{{$.Npub}}" class="text-muted" rel="author">
+        <a href="/profile/{{$.Npub}}" class="text-muted" rel="author">
         <span class="author-name">{{displayName $.Profile $.NpubShort}}</span>
         </a>
         <time class="author-time" datetime="{{isoTime .CreatedAt}}">{{formatTime .CreatedAt}}</time>
       </div>
     </div>
+    {{if .HasContentWarning}}<details class="content-warning">
+      <summary class="content-warning-label">{{if .ContentWarning}}{{.ContentWarning}}{{else}}{{i18n "label.sensitive_content"}}{{end}}</summary>
+      <div class="content-warning-body">{{end}}
     <div class="note-content">{{.ContentHTML}}</div>
+    {{if .HasContentWarning}}</div>
+    </details>{{end}}
     {{template "note-footer" .}}
   </article>
   {{end}}

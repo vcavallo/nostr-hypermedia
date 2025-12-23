@@ -9,8 +9,22 @@ func GetTimelineTemplate() string {
 var timelineContent = `{{define "content"}}
 {{template "flash-messages" .}}
 
+{{if .DVMMetadata}}
+<div class="dvm-header">
+  {{if .DVMMetadata.Image}}
+  <img src="{{.DVMMetadata.Image}}" alt="{{.DVMMetadata.Name}}" class="dvm-header-image" loading="lazy">
+  {{end}}
+  <div class="dvm-header-info">
+    <div class="dvm-header-name">{{.DVMMetadata.Name}}</div>
+    {{if .DVMMetadata.Description}}
+    <div class="dvm-header-description">{{.DVMMetadata.Description}}</div>
+    {{end}}
+  </div>
+</div>
+{{end}}
+
 {{if and .LoggedIn .NewestTimestamp (eq .FeedMode "follows")}}
-<div id="new-notes-indicator" h-poll="/html/timeline/check-new?since={{.NewestTimestamp}}&amp;kinds={{.KindsParam}}&amp;filter={{.KindFilter}}&amp;url={{urlquery .CurrentURL}} 30s" h-target="#new-notes-indicator" h-swap="outer" h-poll-pause-hidden></div>
+<div id="new-notes-indicator" h-poll="{{buildURL "/timeline/check-new" "kinds" .KindsParam "filter" .KindFilter "since" .NewestTimestamp "url" .CurrentURL}} 30s" h-target="#new-notes-indicator" h-swap="outer" h-poll-pause-hidden></div>
 {{end}}
 
 <div id="notes-list">
@@ -33,7 +47,7 @@ var timelineContent = `{{define "content"}}
   <a href="{{.Pagination.Prev}}" h-get h-target="#page-content" h-swap="inner" h-push-url h-scroll="top" h-indicator="#nav-loading" class="link" rel="prev">← Newer</a>
   {{end}}
   {{if .Pagination.Next}}
-  <a href="{{.Pagination.Next}}&append=1" h-get h-target="#pagination" h-swap="outer" h-push-url h-trigger="intersect once" h-disabled class="link load-more-btn" rel="next"><span class="load-more-text">{{i18n "nav.load_more"}} →</span><span class="load-more-loading"><span class="h-spinner"></span> {{i18n "status.loading"}}...</span></a>
+  <a href="{{.Pagination.Next}}&append=1" h-get h-target="#pagination" h-swap="outer" h-push-url h-trigger="intersect once" h-prefetch="intersect 30s" h-disabled class="link load-more-btn" rel="next"><span class="load-more-text">{{i18n "nav.load_more"}} →</span><span class="load-more-loading"><span class="h-spinner"></span> {{i18n "status.loading"}}...</span></a>
   {{end}}
 </div>
 {{end}}

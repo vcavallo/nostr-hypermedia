@@ -7,7 +7,7 @@ func GetWalletTemplate() string {
 }
 
 // GetWalletInfoTemplate returns the wallet info fragment template.
-// Used by /html/wallet/info endpoint for lazy-loading wallet balance and transactions.
+// Used by /wallet/info endpoint for lazy-loading wallet balance and transactions.
 func GetWalletInfoTemplate() string {
 	return walletInfoContent
 }
@@ -24,7 +24,7 @@ var walletContent = `{{define "content"}}
     </div>
 
     <div id="wallet-info" class="wallet-info-container">
-      <a href="/html/wallet/info"
+      <a href="/wallet/info"
          h-get
          h-target="#wallet-info"
          h-swap="inner"
@@ -38,7 +38,7 @@ var walletContent = `{{define "content"}}
       </a>
     </div>
 
-    <form method="POST" action="/html/wallet/disconnect" class="wallet-disconnect-form">
+    <form method="POST" action="/wallet/disconnect" class="wallet-disconnect-form">
       <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
       <input type="hidden" name="return_url" value="{{.ReturnURL}}">
       <button type="submit" class="btn-secondary btn-block" h-confirm="{{i18n "confirm.disconnect_wallet"}}">
@@ -54,7 +54,7 @@ var walletContent = `{{define "content"}}
     </div>
     <p class="wallet-intro-text">{{i18n "wallet.setup_desc"}}</p>
 
-    <form method="POST" action="/html/wallet/connect" class="wallet-connect-form">
+    <form method="POST" action="/wallet/connect" class="wallet-connect-form">
       <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
       <input type="hidden" name="return_url" value="{{.ReturnURL}}">
       <div class="wallet-input-group">

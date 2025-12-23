@@ -86,12 +86,13 @@ type FormInfo struct {
 
 // InputInfo captures form input details
 type InputInfo struct {
-	Type        string
-	Name        string
-	ID          string
-	HasLabel    bool
-	Placeholder string
-	Line        int
+	Type             string
+	Name             string
+	ID               string
+	HasLabel         bool
+	HasWrappingLabel bool // Input is wrapped inside a <label> element
+	Placeholder      string
+	Line             int
 }
 
 // Report contains the full compliance report
@@ -118,29 +119,29 @@ var (
 
 	// Known routes extracted from main.go
 	knownRoutes = []string{
-		"/html/timeline",
-		"/html/thread/",
-		"/html/profile/edit",
-		"/html/profile/",
-		"/html/login",
-		"/html/logout",
-		"/html/post",
-		"/html/reply",
-		"/html/react",
-		"/html/bookmark",
-		"/html/mute",
-		"/html/mutes",
-		"/html/repost",
-		"/html/follow",
-		"/html/quote/",
-		"/html/check-connection",
-		"/html/reconnect",
-		"/html/theme",
-		"/html/notifications",
+		"/timeline",
+		"/thread/",
+		"/profile/edit",
+		"/profile/",
+		"/login",
+		"/logout",
+		"/post",
+		"/reply",
+		"/react",
+		"/bookmark",
+		"/mute",
+		"/mutes",
+		"/repost",
+		"/follow",
+		"/quote/",
+		"/check-connection",
+		"/reconnect",
+		"/theme",
+		"/notifications",
 		"/stream/notifications",
-		"/html/search",
-		"/html/timeline/check-new",
-		"/html/event/",
+		"/search",
+		"/timeline/check-new",
+		"/event/",
 		"/static/",
 		"/",
 	}
@@ -163,13 +164,16 @@ func main() {
 		Summary:     make(map[string]CategorySummary),
 	}
 
-	// Find all template files
+	// Find all template files (including subdirectories like templates/kinds/)
 	templatesDir := filepath.Join(projectPath, "templates")
 	templateFiles, err := filepath.Glob(filepath.Join(templatesDir, "*.go"))
 	if err != nil {
 		fmt.Printf("Error finding templates: %v\n", err)
 		os.Exit(1)
 	}
+	// Also include templates/kinds/*.go
+	kindTemplates, _ := filepath.Glob(filepath.Join(templatesDir, "kinds", "*.go"))
+	templateFiles = append(templateFiles, kindTemplates...)
 
 	if len(templateFiles) == 0 {
 		fmt.Printf("No template files found in %s\n", templatesDir)
@@ -300,6 +304,8 @@ func analyzeTemplate(content string, filePath string, templateName string) Templ
 		strings.HasPrefix(templateName, "quoted-") ||
 		strings.HasPrefix(templateName, "flash-") ||
 		strings.HasPrefix(templateName, "new-notes-") ||
+		strings.HasPrefix(templateName, "gif-") ||
+		strings.HasPrefix(templateName, "mentions-") ||
 		strings.HasPrefix(templateName, "oob-") ||
 		strings.HasSuffix(templateName, "-append") ||
 		strings.HasSuffix(templateName, "-response") ||
@@ -309,10 +315,13 @@ func analyzeTemplate(content string, filePath string, templateName string) Templ
 		templateName == "footer" ||
 		templateName == "pagination" ||
 		templateName == "follow-button" ||
+		templateName == "mute-button" ||
 		templateName == "nav-oob" ||
 		templateName == "event-dispatcher" ||
 		templateName == "fragment" ||
-		templateName == "wallet-info"
+		templateName == "wallet-info" ||
+		templateName == "wavlake-player" ||
+		templateName == "link-preview"
 
 	analysis := TemplateAnalysis{
 		File:           filePath,
@@ -466,20 +475,31 @@ func hasConfirmAttr(n *html.Node) bool {
 }
 
 func extractInputs(n *html.Node, originalContent string) []InputInfo {
+	return extractInputsWithContext(n, originalContent, false)
+}
+
+func extractInputsWithContext(n *html.Node, originalContent string, insideLabel bool) []InputInfo {
 	var inputs []InputInfo
+
+	// Track if we're inside a label element
+	if n.Type == html.ElementNode && n.Data == "label" {
+		insideLabel = true
+	}
+
 	if n.Type == html.ElementNode && (n.Data == "input" || n.Data == "textarea" || n.Data == "select") {
 		input := InputInfo{
-			Type:        getAttr(n, "type"),
-			Name:        getAttr(n, "name"),
-			ID:          getAttr(n, "id"),
-			HasLabel:    hasAttr(n, "aria-label") || hasAttr(n, "aria-labelledby"),
-			Placeholder: getAttr(n, "placeholder"),
-			Line:        findLineNumber(originalContent, n),
+			Type:             getAttr(n, "type"),
+			Name:             getAttr(n, "name"),
+			ID:               getAttr(n, "id"),
+			HasLabel:         hasAttr(n, "aria-label") || hasAttr(n, "aria-labelledby"),
+			HasWrappingLabel: insideLabel,
+			Placeholder:      getAttr(n, "placeholder"),
+			Line:             findLineNumber(originalContent, n),
 		}
 		inputs = append(inputs, input)
 	}
 	for c := n.FirstChild; c != nil; c = c.NextSibling {
-		inputs = append(inputs, extractInputs(c, originalContent)...)
+		inputs = append(inputs, extractInputsWithContext(c, originalContent, insideLabel)...)
 	}
 	return inputs
 }
@@ -550,7 +570,7 @@ func runChecks(analysis *TemplateAnalysis, originalContent string) {
 	// Skip for partial templates as they're embedded in pages that have navigation
 	navLinks := 0
 	for _, link := range analysis.Links {
-		if strings.HasPrefix(link.Href, "/html/") || link.Href == "/" {
+		if strings.HasPrefix(link.Href, "/") || link.Href == "/" {
 			navLinks++
 		}
 	}
@@ -797,7 +817,7 @@ func runChecks(analysis *TemplateAnalysis, originalContent string) {
 	navLinksWithRel := 0
 	totalNavLinks := 0
 	for _, link := range analysis.Links {
-		if strings.HasPrefix(link.Href, "/html/") && !strings.Contains(link.Href, "placeholder") {
+		if strings.HasPrefix(link.Href, "/") && !strings.Contains(link.Href, "placeholder") {
 			totalNavLinks++
 			if link.HasRel {
 				navLinksWithRel++
@@ -930,7 +950,8 @@ func runChecks(analysis *TemplateAnalysis, originalContent string) {
 				continue
 			}
 			totalInputs++
-			if input.HasLabel || input.Placeholder != "" || input.ID != "" {
+			// Input has accessible name if: wrapped in label, has aria-label, has placeholder, or has id (for external label)
+			if input.HasWrappingLabel || input.HasLabel || input.Placeholder != "" || input.ID != "" {
 				inputsWithLabels++
 			}
 		}
@@ -1259,7 +1280,7 @@ func isValidRoute(path string) bool {
 		if strings.HasSuffix(route, "/") && strings.HasPrefix(path, route) {
 			return true
 		}
-		// Route pattern match (e.g., /html/thread/ matches /html/thread/abc123)
+		// Route pattern match (e.g., /thread/ matches /thread/abc123)
 		if strings.HasSuffix(route, "/") && strings.HasPrefix(path, strings.TrimSuffix(route, "/")) {
 			return true
 		}

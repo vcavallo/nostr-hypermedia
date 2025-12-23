@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"sort"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -509,4 +510,557 @@ func (s *RedisNotificationCacheStore) Set(ctx context.Context, pubkey string, ca
 		slog.Error("Redis notification cache set error", "error", err)
 	}
 	return err
+}
+
+// RedisEventCache implements EventCacheStore using Redis
+type RedisEventCache struct {
+	client *redis.Client
+	prefix string
+}
+
+// NewRedisEventCache creates a new Redis event cache
+func NewRedisEventCache(client *redis.Client, prefix string) *RedisEventCache {
+	return &RedisEventCache{
+		client: client,
+		prefix: prefix + "events:",
+	}
+}
+
+func (c *RedisEventCache) Get(relays []string, filter Filter) ([]Event, bool, bool) {
+	key := c.prefix + buildEventCacheKey(relays, filter)
+	ctx := context.Background()
+
+	data, err := c.client.Get(ctx, key).Bytes()
+	if err == redis.Nil {
+		return nil, false, false
+	}
+	if err != nil {
+		slog.Debug("Redis event cache get error", "error", err)
+		return nil, false, false
+	}
+
+	var cached CachedEventResult
+	if err := json.Unmarshal(data, &cached); err != nil {
+		slog.Debug("Redis event cache unmarshal error", "error", err)
+		return nil, false, false
+	}
+
+	return cached.Events, cached.EOSE, true
+}
+
+func (c *RedisEventCache) Set(relays []string, filter Filter, events []Event, eose bool) {
+	key := c.prefix + buildEventCacheKey(relays, filter)
+	ttl := getEventTTL(filter)
+	ctx := context.Background()
+
+	cached := CachedEventResult{
+		Events:   events,
+		EOSE:     eose,
+		CachedAt: time.Now().Unix(),
+	}
+
+	data, err := json.Marshal(cached)
+	if err != nil {
+		slog.Debug("Redis event cache marshal error", "error", err)
+		return
+	}
+
+	if err := c.client.Set(ctx, key, data, ttl).Err(); err != nil {
+		slog.Debug("Redis event cache set error", "error", err)
+	}
+}
+
+func (c *RedisEventCache) Close() {
+	// Redis client is shared, don't close it here
+}
+
+// RedisDVMCacheStore implements DVMCacheStore using Redis
+type RedisDVMCacheStore struct {
+	client *redis.Client
+	prefix string
+}
+
+// NewRedisDVMCacheStore creates a new Redis DVM cache store
+func NewRedisDVMCacheStore(client *redis.Client, prefix string) *RedisDVMCacheStore {
+	return &RedisDVMCacheStore{
+		client: client,
+		prefix: prefix + "dvm:",
+	}
+}
+
+func (s *RedisDVMCacheStore) Get(ctx context.Context, key string) (*CachedDVMResult, bool, error) {
+	data, err := s.client.Get(ctx, s.prefix+key).Bytes()
+	if err == redis.Nil {
+		return nil, false, nil
+	}
+	if err != nil {
+		slog.Debug("Redis DVM cache get error", "error", err)
+		return nil, false, nil
+	}
+
+	var cached CachedDVMResult
+	if err := json.Unmarshal(data, &cached); err != nil {
+		slog.Debug("Redis DVM cache unmarshal error", "error", err)
+		return nil, false, nil
+	}
+
+	return &cached, true, nil
+}
+
+func (s *RedisDVMCacheStore) Set(ctx context.Context, key string, result *CachedDVMResult, ttl time.Duration) error {
+	data, err := json.Marshal(result)
+	if err != nil {
+		return err
+	}
+
+	if err := s.client.Set(ctx, s.prefix+key, data, ttl).Err(); err != nil {
+		slog.Debug("Redis DVM cache set error", "error", err)
+		return err
+	}
+	return nil
+}
+
+// RedisDVMMetaCacheStore implements DVMMetaCacheStore using Redis
+type RedisDVMMetaCacheStore struct {
+	client *redis.Client
+	prefix string
+}
+
+// NewRedisDVMMetaCacheStore creates a new Redis DVM metadata cache store
+func NewRedisDVMMetaCacheStore(client *redis.Client, prefix string) *RedisDVMMetaCacheStore {
+	return &RedisDVMMetaCacheStore{
+		client: client,
+		prefix: prefix + "dvm_meta:",
+	}
+}
+
+func (s *RedisDVMMetaCacheStore) Get(ctx context.Context, key string) (*DVMMetadata, bool, error) {
+	data, err := s.client.Get(ctx, s.prefix+key).Bytes()
+	if err == redis.Nil {
+		return nil, false, nil
+	}
+	if err != nil {
+		slog.Debug("Redis DVM meta cache get error", "error", err)
+		return nil, false, nil
+	}
+
+	var cached DVMMetadata
+	if err := json.Unmarshal(data, &cached); err != nil {
+		slog.Debug("Redis DVM meta cache unmarshal error", "error", err)
+		return nil, false, nil
+	}
+
+	return &cached, true, nil
+}
+
+func (s *RedisDVMMetaCacheStore) Set(ctx context.Context, key string, meta *DVMMetadata, ttl time.Duration) error {
+	data, err := json.Marshal(meta)
+	if err != nil {
+		return err
+	}
+
+	if err := s.client.Set(ctx, s.prefix+key, data, ttl).Err(); err != nil {
+		slog.Debug("Redis DVM meta cache set error", "error", err)
+		return err
+	}
+	return nil
+}
+
+// RedisNIP05Cache implements NIP-05 caching using Redis
+type RedisNIP05Cache struct {
+	client *redis.Client
+	prefix string
+	ttl    time.Duration
+}
+
+// NewRedisNIP05Cache creates a new Redis NIP-05 cache
+func NewRedisNIP05Cache(client *redis.Client, prefix string, ttl time.Duration) *RedisNIP05Cache {
+	return &RedisNIP05Cache{
+		client: client,
+		prefix: prefix + "nip05:",
+		ttl:    ttl,
+	}
+}
+
+func (c *RedisNIP05Cache) Get(identifier string) (*NIP05Result, bool) {
+	ctx := context.Background()
+	data, err := c.client.Get(ctx, c.prefix+identifier).Bytes()
+	if err == redis.Nil {
+		return nil, false
+	}
+	if err != nil {
+		slog.Debug("Redis NIP-05 cache get error", "error", err)
+		return nil, false
+	}
+
+	var cached NIP05Result
+	if err := json.Unmarshal(data, &cached); err != nil {
+		slog.Debug("Redis NIP-05 cache unmarshal error", "error", err)
+		return nil, false
+	}
+
+	return &cached, true
+}
+
+func (c *RedisNIP05Cache) Set(identifier string, result *NIP05Result) {
+	ctx := context.Background()
+	data, err := json.Marshal(result)
+	if err != nil {
+		slog.Debug("Redis NIP-05 cache marshal error", "error", err)
+		return
+	}
+
+	if err := c.client.Set(ctx, c.prefix+identifier, data, c.ttl).Err(); err != nil {
+		slog.Debug("Redis NIP-05 cache set error", "error", err)
+	}
+}
+
+// RedisRelayHealth implements relay health tracking using Redis
+type RedisRelayHealth struct {
+	client *redis.Client
+	prefix string
+}
+
+// NewRedisRelayHealth creates a new Redis relay health tracker
+func NewRedisRelayHealth(client *redis.Client, prefix string) *RedisRelayHealth {
+	return &RedisRelayHealth{
+		client: client,
+		prefix: prefix + "relay_health:",
+	}
+}
+
+type redisRelayStats struct {
+	AvgResponseTimeMs int64 `json:"avg_ms"`
+	ResponseCount     int   `json:"count"`
+	LastResponse      int64 `json:"last"`
+	FailureCount      int   `json:"failures"`
+	BackoffUntil      int64 `json:"backoff_until"`
+}
+
+func (h *RedisRelayHealth) getStats(relayURL string) *redisRelayStats {
+	ctx := context.Background()
+	data, err := h.client.Get(ctx, h.prefix+relayURL).Bytes()
+	if err != nil {
+		return &redisRelayStats{}
+	}
+
+	var stats redisRelayStats
+	if err := json.Unmarshal(data, &stats); err != nil {
+		return &redisRelayStats{}
+	}
+	return &stats
+}
+
+func (h *RedisRelayHealth) setStats(relayURL string, stats *redisRelayStats) {
+	ctx := context.Background()
+	data, err := json.Marshal(stats)
+	if err != nil {
+		return
+	}
+	// Keep stats for 1 hour
+	h.client.Set(ctx, h.prefix+relayURL, data, 1*time.Hour)
+}
+
+func (h *RedisRelayHealth) shouldSkip(relayURL string) bool {
+	stats := h.getStats(relayURL)
+	return stats.BackoffUntil > 0 && time.Now().Unix() < stats.BackoffUntil
+}
+
+func (h *RedisRelayHealth) recordFailure(relayURL string) {
+	stats := h.getStats(relayURL)
+	stats.FailureCount++
+
+	var backoff time.Duration
+	switch {
+	case stats.FailureCount <= 1:
+		backoff = 30 * time.Second
+	case stats.FailureCount == 2:
+		backoff = 60 * time.Second
+	case stats.FailureCount == 3:
+		backoff = 2 * time.Minute
+	default:
+		backoff = 5 * time.Minute
+	}
+
+	stats.BackoffUntil = time.Now().Add(backoff).Unix()
+	h.setStats(relayURL, stats)
+
+	slog.Warn("relay connection failed",
+		"relay", relayURL,
+		"failure_count", stats.FailureCount,
+		"backoff_until", time.Unix(stats.BackoffUntil, 0).Format("15:04:05"))
+}
+
+func (h *RedisRelayHealth) recordSuccess(relayURL string) {
+	stats := h.getStats(relayURL)
+	stats.FailureCount = 0
+	stats.BackoffUntil = 0
+	h.setStats(relayURL, stats)
+}
+
+func (h *RedisRelayHealth) recordResponseTime(relayURL string, duration time.Duration) {
+	stats := h.getStats(relayURL)
+
+	// Exponential moving average (alpha=0.3)
+	durationMs := duration.Milliseconds()
+	if stats.ResponseCount == 0 {
+		stats.AvgResponseTimeMs = durationMs
+	} else {
+		alpha := 0.3
+		stats.AvgResponseTimeMs = int64(alpha*float64(durationMs) + (1-alpha)*float64(stats.AvgResponseTimeMs))
+	}
+
+	stats.ResponseCount++
+	stats.LastResponse = time.Now().Unix()
+	h.setStats(relayURL, stats)
+}
+
+func (h *RedisRelayHealth) getAverageResponseTime(relayURL string) time.Duration {
+	stats := h.getStats(relayURL)
+	if stats.ResponseCount == 0 {
+		return 1 * time.Second
+	}
+	return time.Duration(stats.AvgResponseTimeMs) * time.Millisecond
+}
+
+func (h *RedisRelayHealth) getRelayScore(relayURL string) int {
+	stats := h.getStats(relayURL)
+	score := 50
+
+	if stats.ResponseCount > 0 {
+		switch {
+		case stats.AvgResponseTimeMs < 200:
+			score = 50
+		case stats.AvgResponseTimeMs < 500:
+			score = 40
+		case stats.AvgResponseTimeMs < 1000:
+			score = 25
+		default:
+			score = 10
+		}
+
+		bonus := stats.ResponseCount
+		if bonus > 10 {
+			bonus = 10
+		}
+		score += bonus
+	}
+
+	penalty := stats.FailureCount * 10
+	if penalty > 30 {
+		penalty = 30
+	}
+	score -= penalty
+
+	if stats.BackoffUntil > 0 && time.Now().Unix() < stats.BackoffUntil {
+		score -= 20
+	}
+
+	if score < 0 {
+		score = 0
+	}
+	if score > 100 {
+		score = 100
+	}
+
+	return score
+}
+
+func (h *RedisRelayHealth) SortRelaysByScore(relays []string) []string {
+	if len(relays) <= 1 {
+		return relays
+	}
+
+	scores := make(map[string]int, len(relays))
+	for _, relay := range relays {
+		scores[relay] = h.getRelayScore(relay)
+	}
+
+	sorted := make([]string, len(relays))
+	copy(sorted, relays)
+
+	sort.Slice(sorted, func(i, j int) bool {
+		return scores[sorted[i]] > scores[sorted[j]]
+	})
+
+	return sorted
+}
+
+func (h *RedisRelayHealth) GetExpectedResponseTime(relays []string, minRelays int) time.Duration {
+	if len(relays) == 0 {
+		return 500 * time.Millisecond
+	}
+
+	times := make([]time.Duration, 0, len(relays))
+	for _, relay := range relays {
+		times = append(times, h.getAverageResponseTime(relay))
+	}
+
+	sort.Slice(times, func(i, j int) bool {
+		return times[i] < times[j]
+	})
+
+	idx := minRelays - 1
+	if idx >= len(times) {
+		idx = len(times) - 1
+	}
+	if idx < 0 {
+		idx = 0
+	}
+
+	expected := times[idx] + times[idx]/2 // +50% buffer
+	if expected < 200*time.Millisecond {
+		expected = 200 * time.Millisecond
+	}
+	if expected > 2*time.Second {
+		expected = 2 * time.Second
+	}
+
+	return expected
+}
+
+func (h *RedisRelayHealth) GetRelayHealthStats() (healthy int, unhealthy int, avgResponseMs int64) {
+	ctx := context.Background()
+	// Get all relay health keys
+	keys, err := h.client.Keys(ctx, h.prefix+"*").Result()
+	if err != nil {
+		return 0, 0, 0
+	}
+
+	var totalMs int64
+	var count int
+
+	for _, key := range keys {
+		relayURL := key[len(h.prefix):]
+		stats := h.getStats(relayURL)
+		if stats.ResponseCount > 0 {
+			if stats.FailureCount > 0 {
+				unhealthy++
+			} else {
+				healthy++
+			}
+			totalMs += stats.AvgResponseTimeMs
+			count++
+		}
+	}
+
+	if count > 0 {
+		avgResponseMs = totalMs / int64(count)
+	}
+
+	return healthy, unhealthy, avgResponseMs
+}
+
+func (h *RedisRelayHealth) GetRelayHealthDetails() []RelayHealthDetail {
+	ctx := context.Background()
+	// Get all relay health keys
+	keys, err := h.client.Keys(ctx, h.prefix+"*").Result()
+	if err != nil {
+		return nil
+	}
+
+	details := make([]RelayHealthDetail, 0, len(keys))
+	for _, key := range keys {
+		relayURL := key[len(h.prefix):]
+		stats := h.getStats(relayURL)
+		if stats.ResponseCount > 0 {
+			status := "healthy"
+			if stats.FailureCount > 0 {
+				status = "unhealthy"
+			}
+			details = append(details, RelayHealthDetail{
+				URL:           relayURL,
+				Status:        status,
+				AvgResponseMs: stats.AvgResponseTimeMs,
+				RequestCount:  int64(stats.ResponseCount),
+			})
+		}
+	}
+	return details
+}
+
+// --- Redis LNURL Cache ---
+
+// RedisLNURLCache implements LNURLCacheStore using Redis
+type RedisLNURLCache struct {
+	client *redis.Client
+	prefix string
+	ttl    time.Duration
+}
+
+// cachedLNURLInfo stores LNURL pay info with not-found state
+type cachedLNURLInfo struct {
+	Info     *LNURLPayInfo `json:"info"`
+	NotFound bool          `json:"not_found"`
+}
+
+// NewRedisLNURLCache creates a new Redis LNURL cache
+func NewRedisLNURLCache(client *redis.Client, prefix string, ttl time.Duration) *RedisLNURLCache {
+	return &RedisLNURLCache{
+		client: client,
+		prefix: prefix + "lnurl:",
+		ttl:    ttl,
+	}
+}
+
+// Get retrieves cached LNURL pay info
+func (c *RedisLNURLCache) Get(pubkey string) (*LNURLPayInfo, bool) {
+	ctx := context.Background()
+	data, err := c.client.Get(ctx, c.prefix+pubkey).Bytes()
+	if err == redis.Nil {
+		return nil, false
+	}
+	if err != nil {
+		slog.Debug("Redis LNURL cache get error", "error", err)
+		return nil, false
+	}
+
+	var cached cachedLNURLInfo
+	if err := json.Unmarshal(data, &cached); err != nil {
+		slog.Debug("Redis LNURL cache unmarshal error", "error", err)
+		return nil, false
+	}
+
+	// Return nil for "not found" entries but still return true (was cached)
+	if cached.NotFound {
+		return nil, true
+	}
+
+	return cached.Info, true
+}
+
+// Set stores LNURL pay info in the cache
+func (c *RedisLNURLCache) Set(pubkey string, info *LNURLPayInfo) {
+	ctx := context.Background()
+	cached := cachedLNURLInfo{
+		Info:     info,
+		NotFound: false,
+	}
+	data, err := json.Marshal(cached)
+	if err != nil {
+		slog.Debug("Redis LNURL cache marshal error", "error", err)
+		return
+	}
+
+	if err := c.client.Set(ctx, c.prefix+pubkey, data, c.ttl).Err(); err != nil {
+		slog.Debug("Redis LNURL cache set error", "error", err)
+	}
+}
+
+// SetNotFound marks a pubkey as having no LNURL
+func (c *RedisLNURLCache) SetNotFound(pubkey string) {
+	ctx := context.Background()
+	cached := cachedLNURLInfo{
+		Info:     nil,
+		NotFound: true,
+	}
+	data, err := json.Marshal(cached)
+	if err != nil {
+		slog.Debug("Redis LNURL cache marshal error", "error", err)
+		return
+	}
+
+	if err := c.client.Set(ctx, c.prefix+pubkey, data, c.ttl).Err(); err != nil {
+		slog.Debug("Redis LNURL cache set error", "error", err)
+	}
 }

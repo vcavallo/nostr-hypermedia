@@ -19,11 +19,6 @@ var (
 	droppedEventCount atomic.Int64
 )
 
-// DroppedEventCount returns the total number of events dropped due to full channels
-func DroppedEventCount() int64 {
-	return droppedEventCount.Load()
-}
-
 // Cache metrics
 var (
 	cacheHitsTotal   atomic.Int64
@@ -61,63 +56,12 @@ func (p *RelayPool) GetConnectionStats() (active int, max int) {
 	return len(p.connections), maxTotalConnections
 }
 
-// GetRelayHealthStats returns stats about relay connections for metrics
-func (h *RelayHealth) GetRelayHealthStats() (healthy int, unhealthy int, avgResponseMs int64) {
-	h.mu.RLock()
-	defer h.mu.RUnlock()
-
-	var totalMs int64
-	var count int
-
-	for relay, stats := range h.stats {
-		if stats.responseCount > 0 {
-			// Check if this relay is in backoff
-			if f := h.failures[relay]; f != nil && f.failureCount > 0 {
-				unhealthy++
-			} else {
-				healthy++
-			}
-			totalMs += stats.avgResponseTime.Milliseconds()
-			count++
-		}
-	}
-
-	if count > 0 {
-		avgResponseMs = totalMs / int64(count)
-	}
-
-	return healthy, unhealthy, avgResponseMs
-}
-
 // RelayHealthDetail holds per-relay health information
 type RelayHealthDetail struct {
 	URL           string `json:"url"`
 	Status        string `json:"status"` // "healthy" or "unhealthy"
 	AvgResponseMs int64  `json:"avg_response_ms"`
 	RequestCount  int64  `json:"request_count"`
-}
-
-// GetRelayHealthDetails returns per-relay health information for verbose health checks
-func (h *RelayHealth) GetRelayHealthDetails() []RelayHealthDetail {
-	h.mu.RLock()
-	defer h.mu.RUnlock()
-
-	details := make([]RelayHealthDetail, 0, len(h.stats))
-	for relay, stats := range h.stats {
-		if stats.responseCount > 0 {
-			status := "healthy"
-			if f := h.failures[relay]; f != nil && f.failureCount > 0 {
-				status = "unhealthy"
-			}
-			details = append(details, RelayHealthDetail{
-				URL:           relay,
-				Status:        status,
-				AvgResponseMs: stats.avgResponseTime.Milliseconds(),
-				RequestCount:  int64(stats.responseCount),
-			})
-		}
-	}
-	return details
 }
 
 // metricsHandler serves Prometheus-compatible metrics
@@ -191,7 +135,7 @@ func metricsHandler(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "nostr_relay_connections_max %d\n\n", maxConns)
 
 	// Relay health summary
-	healthy, unhealthy, avgMs := relayHealth.GetRelayHealthStats()
+	healthy, unhealthy, avgMs := relayHealthStore.GetRelayHealthStats()
 	fmt.Fprintf(w, "# HELP nostr_relays_healthy Number of healthy relays\n")
 	fmt.Fprintf(w, "# TYPE nostr_relays_healthy gauge\n")
 	fmt.Fprintf(w, "nostr_relays_healthy %d\n\n", healthy)
@@ -205,7 +149,7 @@ func metricsHandler(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "nostr_relay_avg_response_ms %d\n\n", avgMs)
 
 	// Per-relay metrics with labels
-	relayDetails := relayHealth.GetRelayHealthDetails()
+	relayDetails := relayHealthStore.GetRelayHealthDetails()
 	if len(relayDetails) > 0 {
 		fmt.Fprintf(w, "# HELP nostr_relay_response_ms Response time per relay in milliseconds\n")
 		fmt.Fprintf(w, "# TYPE nostr_relay_response_ms gauge\n")

@@ -6,6 +6,8 @@ import (
 	"log/slog"
 	"os"
 	"sync"
+
+	cfgpkg "nostr-server/internal/config"
 )
 
 // ActionsConfig represents the JSON configuration for actions
@@ -31,6 +33,7 @@ type ActionConfig struct {
 	Toggleable     bool     `json:"toggleable,omitempty"`     // Can toggle off on re-click (bookmark, mute)
 	GroupWith      string   `json:"groupWith,omitempty"`      // Appears in another action's dropdown
 	RequiresWallet bool     `json:"requiresWallet,omitempty"` // Requires wallet connection (zap)
+	Amounts        []int    `json:"amounts,omitempty"`        // Preset amounts for zap action (in sats)
 }
 
 // GetTitleKey returns the i18n key, deriving from action name if not explicitly set
@@ -112,40 +115,40 @@ func getDefaultActionsConfig() *ActionsConfig {
 		Actions: map[string]ActionConfig{
 			"reply": {
 				Method:    "GET",
-				Href:      "/html/thread/{event_id}",
+				Href:      "/thread/{event_id}",
 				Class:     "action-reply",
 				AppliesTo: []int{1, 20, 9735, 30311},
 			},
 			"repost": {
 				Method:    "POST",
-				Href:      "/html/repost",
+				Href:      "/repost",
 				Class:     "action-repost",
 				AppliesTo: []int{1, 20},
 				Fields:    []string{"csrf_token", "event_id", "event_pubkey", "return_url"},
 			},
 			"quote": {
 				Method:    "GET",
-				Href:      "/html/quote/{event_id}",
+				Href:      "/quote/{event_id}",
 				Class:     "action-quote",
 				AppliesTo: []int{1, 20},
 			},
 			"react": {
 				Method:    "POST",
-				Href:      "/html/react",
+				Href:      "/react",
 				Class:     "action-react",
 				AppliesTo: []int{1, 20, 9735, 30311},
 				Fields:    []string{"csrf_token", "event_id", "event_pubkey", "return_url", "reaction"},
 			},
 			"bookmark": {
 				Method:    "POST",
-				Href:      "/html/bookmark",
+				Href:      "/bookmark",
 				Class:     "action-bookmark",
 				AppliesTo: []int{1, 20, 30023},
 				Fields:    []string{"csrf_token", "event_id", "return_url", "action"},
 			},
 			"read": {
 				Method:    "GET",
-				Href:      "/html/thread/{event_id}",
+				Href:      "/thread/{event_id}",
 				Class:     "action-read",
 				AppliesTo: []int{30023},
 			},
@@ -232,12 +235,12 @@ func ConfigBuildAction(actionName string, ctx ActionContext) ActionDefinition {
 	href := replaceActionPlaceholders(actionCfg.Href, ctx)
 
 	// Build title (translate from i18n key, then apply dynamic modifications for toggleable actions)
-	title := I18n(actionCfg.GetTitleKey(actionName))
+	title := cfgpkg.I18n(actionCfg.GetTitleKey(actionName))
 	if actionCfg.Toggleable && actionName == "bookmark" && ctx.IsBookmarked {
-		title = I18n("action.unbookmark")
+		title = cfgpkg.I18n("action.unbookmark")
 	}
 	if actionCfg.Toggleable && actionName == "mute" && ctx.IsMuted {
-		title = I18n("action.unmute")
+		title = cfgpkg.I18n("action.unmute")
 	}
 
 	// Don't show mute action for user's own events
@@ -303,6 +306,7 @@ func ConfigBuildAction(actionName string, ctx ActionContext) ActionDefinition {
 		Count:     count,
 		HasCount:  actionCfg.HasCount,
 		GroupWith: actionCfg.GroupWith,
+		Amounts:   actionCfg.Amounts,
 	}
 }
 
@@ -319,7 +323,7 @@ func ConfigBuildLoggedOutAction(actionName string, ctx ActionContext) ActionDefi
 		return ActionDefinition{}
 	}
 
-	title := I18n(actionCfg.GetTitleKey(actionName))
+	title := cfgpkg.I18n(actionCfg.GetTitleKey(actionName))
 
 	return ActionDefinition{
 		Name:      actionName,

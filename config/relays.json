@@ -1,25 +1,37 @@
 {
+  "writeOnlyRelays": [
+    "wss://sendit.nosflare.com",
+    "wss://nostr.mutinywallet.com"
+  ],
   "defaultRelays": [
-    "wss://relay.damus.io",
     "wss://relay.nostr.band",
     "wss://relay.primal.net",
+    "wss://relay.damus.io",
     "wss://nos.lol",
     "wss://nostr.mom"
   ],
   "nostrConnectRelays": [
     "wss://relay.nsec.app",
+    "wss://relay.primal.net",
     "wss://relay.damus.io"
   ],
-  "searchRelays": [
-    "wss://relay.nostr.band"
-  ],
+  "searchRelays": ["wss://relay.nostr.band"],
   "publishRelays": [
-    "wss://relay.damus.io",
     "wss://relay.nostr.band",
-    "wss://relay.primal.net"
+    "wss://relay.primal.net",
+    "wss://relay.damus.io"
   ],
   "profileRelays": [
+    "wss://purplepag.es",
     "wss://relay.nostr.band",
-    "wss://purplepag.es"
+    "wss://relay.primal.net",
+    "wss://relay.damus.io",
+    "wss://nos.lol"
+  ],
+  "handlerRelays": ["wss://relay.nostr.band"],
+  "blossomServers": [
+    "https://blossom.primal.net",
+    "https://blossom.nostr.build",
+    "https://cdn.satellite.earth"
   ]
 }

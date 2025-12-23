@@ -1,0 +1,22 @@
+/* Comment (kind 1111) styles */
+.comment-context {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 12px;
+  padding: 10px 12px;
+  background: var(--bg-secondary);
+  border-radius: 6px;
+  font-size: 13px;
+  color: var(--text-muted);
+}
+.comment-context-icon {
+  font-size: 14px;
+}
+.comment-context-link {
+  color: var(--accent);
+  text-decoration: none;
+}
+.comment-context-link:hover {
+  text-decoration: underline;
+}

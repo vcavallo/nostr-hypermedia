@@ -21,13 +21,35 @@ import (
 	"github.com/microcosm-cc/bluemonday"
 	"github.com/yuin/goldmark"
 
-	"nostr-hypermedia/templates"
+	"nostr-server/internal/config"
+	"nostr-server/internal/nips"
+	"nostr-server/internal/util"
+	"nostr-server/templates"
 )
 
 // markdownSanitizer is a bluemonday policy for sanitizing markdown-rendered HTML.
 // UGCPolicy allows common formatting (links, images, bold, italic, lists, tables, code)
 // while blocking dangerous elements (scripts, event handlers, javascript: URLs).
 var markdownSanitizer = bluemonday.UGCPolicy()
+
+// bufferPool reduces allocation overhead for template execution buffers.
+// Buffers are reused across requests instead of allocating new ones.
+var bufferPool = sync.Pool{
+	New: func() interface{} {
+		return new(strings.Builder)
+	},
+}
+
+// getBuffer retrieves a strings.Builder from the pool
+func getBuffer() *strings.Builder {
+	return bufferPool.Get().(*strings.Builder)
+}
+
+// putBuffer resets and returns a strings.Builder to the pool
+func putBuffer(buf *strings.Builder) {
+	buf.Reset()
+	bufferPool.Put(buf)
+}
 
 // Template name constants - use these instead of string literals to catch typos at compile time
 const (
@@ -57,6 +79,7 @@ var (
 	cachedMutesTemplate         *template.Template
 	cachedSearchTemplate        *template.Template
 	cachedQuoteTemplate         *template.Template
+	cachedReportTemplate        *template.Template
 	cachedWalletTemplate        *template.Template
 	// Fragment templates for HelmJS partial updates
 	cachedTimelineFragment      *template.Template
@@ -66,9 +89,12 @@ var (
 	cachedMutesFragment         *template.Template
 	cachedSearchFragment        *template.Template
 	cachedWalletFragment        *template.Template
+	cachedReportFragment        *template.Template
+	cachedQuoteFragment         *template.Template
 	cachedWalletInfoFragment       *template.Template
 	cachedNewNotesIndicator        *template.Template
 	cachedLinkPreview              *template.Template
+	cachedWavlakePlayer            *template.Template
 	cachedOOBFlash                 *template.Template
 	// Action fragment templates for HelmJS inline updates
 	cachedFooterFragment            *template.Template
@@ -85,6 +111,9 @@ var (
 	cachedGifResults                *template.Template
 	cachedGifAttachment             *template.Template
 	cachedComposeTemplate           *template.Template
+	// Mention autocomplete templates
+	cachedMentionsDropdown          *template.Template
+	cachedMentionsSelectResponse    *template.Template
 	templateFuncMap                 template.FuncMap
 )
 
@@ -173,11 +202,32 @@ func renderFooterFragment(eventID string, eventPubkey string, kind int, loggedIn
 		LoggedIn:     loggedIn,
 	}
 
-	var buf strings.Builder
-	if err := cachedFooterFragment.ExecuteTemplate(&buf, tmplFooterFragment, data); err != nil {
+	buf := getBuffer()
+	defer putBuffer(buf)
+	if err := cachedFooterFragment.ExecuteTemplate(buf, tmplFooterFragment, data); err != nil {
 		return "", err
 	}
 	return buf.String(), nil
+}
+
+// renderFooterFragmentWithError renders a footer fragment with error state for SSE corrections.
+// The returned HTML includes h-oob="outer" for self-targeting and an error class.
+func renderFooterFragmentWithError(eventID string, eventPubkey string, kind int, loggedIn bool, csrfToken, returnURL string, isBookmarked bool, isReacted bool, isReposted bool, isZapped bool, hasWallet bool, userReaction string, relays []string) (string, error) {
+	// Render the normal footer first
+	html, err := renderFooterFragment(eventID, eventPubkey, kind, loggedIn, csrfToken, returnURL, isBookmarked, isReacted, isReposted, isZapped, hasWallet, userReaction, relays)
+	if err != nil {
+		return "", err
+	}
+
+	// Add h-oob="outer" for self-targeting SSE update and error class
+	// Transform: <footer class="note-footer" id="footer-xxx">
+	// To: <footer class="note-footer action-error" id="footer-xxx" h-oob="outer">
+	html = strings.Replace(html,
+		`class="note-footer"`,
+		`class="note-footer action-error" h-oob="outer"`,
+		1)
+
+	return html, nil
 }
 
 // renderFollowButtonFragment renders just the follow button for HelmJS partial updates
@@ -194,11 +244,44 @@ func renderFollowButtonFragment(pubkey, csrfToken, returnURL string, isFollowing
 		IsFollowing: isFollowing,
 	}
 
-	var buf strings.Builder
-	if err := cachedFollowButtonFragment.ExecuteTemplate(&buf, tmplFollowButton, data); err != nil {
+	buf := getBuffer()
+	defer putBuffer(buf)
+	if err := cachedFollowButtonFragment.ExecuteTemplate(buf, tmplFollowButton, data); err != nil {
 		return "", err
 	}
 	return buf.String(), nil
+}
+
+// renderMuteButtonWithError renders a mute button with error state for SSE corrections.
+// The returned HTML includes h-oob="inner" for self-targeting and an error indicator.
+func renderMuteButtonWithError(pubkey, csrfToken, returnURL string, isMuted bool) (string, error) {
+	data := struct {
+		Pubkey    string
+		CSRFToken string
+		ReturnURL string
+		IsMuted   bool
+	}{
+		Pubkey:    pubkey,
+		CSRFToken: csrfToken,
+		ReturnURL: returnURL,
+		IsMuted:   isMuted,
+	}
+
+	tmpl := util.MustCompileTemplate("mute-button", templateFuncMap, templates.GetMuteButtonTemplate())
+	buf := getBuffer()
+	defer putBuffer(buf)
+	if err := tmpl.ExecuteTemplate(buf, "mute-button", data); err != nil {
+		return "", err
+	}
+
+	html := buf.String()
+
+	// Add h-oob="inner" for self-targeting SSE update
+	// The mute button form targets #mute-btn-{pubkey} with h-swap="inner"
+	// We wrap the content with an error indicator span
+	html = `<span h-oob="inner">` + html + ` <span class="action-error-indicator">⚠️</span></span>`
+
+	return html, nil
 }
 
 // renderPostResponse renders the cleared post form plus the new note as OOB prepend
@@ -213,19 +296,22 @@ func renderPostResponse(csrfToken string, newNote *HTMLEventItem) (string, error
 		ShowGifButton: GiphyEnabled(),
 	}
 
-	var buf strings.Builder
-	if err := cachedPostResponse.ExecuteTemplate(&buf, tmplPostResponse, data); err != nil {
+	buf := getBuffer()
+	defer putBuffer(buf)
+	if err := cachedPostResponse.ExecuteTemplate(buf, tmplPostResponse, data); err != nil {
 		return "", err
 	}
 	return buf.String(), nil
 }
 
 // renderReplyResponse renders the cleared reply form plus the new reply as OOB prepend
-func renderReplyResponse(csrfToken, replyTo, replyToPubkey, userDisplayName, userAvatarURL, userNpub string, newReply *HTMLEventItem, replyCount int) (string, error) {
+func renderReplyResponse(csrfToken, replyTo, replyToPubkey string, replyToKind int, replyToDTag string, userDisplayName, userAvatarURL, userNpub string, newReply *HTMLEventItem, replyCount int) (string, error) {
 	data := struct {
 		CSRFToken       string
 		ReplyTo         string
 		ReplyToPubkey   string
+		ReplyToKind     int
+		ReplyToDTag     string
 		UserDisplayName string
 		UserAvatarURL   string
 		UserNpub        string
@@ -236,6 +322,8 @@ func renderReplyResponse(csrfToken, replyTo, replyToPubkey, userDisplayName, use
 		CSRFToken:       csrfToken,
 		ReplyTo:         replyTo,
 		ReplyToPubkey:   replyToPubkey,
+		ReplyToKind:     replyToKind,
+		ReplyToDTag:     replyToDTag,
 		UserDisplayName: userDisplayName,
 		UserAvatarURL:   userAvatarURL,
 		UserNpub:        userNpub,
@@ -244,8 +332,9 @@ func renderReplyResponse(csrfToken, replyTo, replyToPubkey, userDisplayName, use
 		ShowGifButton:   GiphyEnabled(),
 	}
 
-	var buf strings.Builder
-	if err := cachedReplyResponse.ExecuteTemplate(&buf, tmplReplyResponse, data); err != nil {
+	buf := getBuffer()
+	defer putBuffer(buf)
+	if err := cachedReplyResponse.ExecuteTemplate(buf, tmplReplyResponse, data); err != nil {
 		return "", err
 	}
 	return buf.String(), nil
@@ -259,8 +348,9 @@ func renderGifPanel(targetID string) (string, error) {
 		TargetID: targetID,
 	}
 
-	var buf strings.Builder
-	if err := cachedGifPanel.ExecuteTemplate(&buf, tmplGifPanel, data); err != nil {
+	buf := getBuffer()
+	defer putBuffer(buf)
+	if err := cachedGifPanel.ExecuteTemplate(buf, tmplGifPanel, data); err != nil {
 		return "", err
 	}
 	return buf.String(), nil
@@ -278,8 +368,9 @@ func renderGifResults(results []GifResult, query, targetID string) (string, erro
 		TargetID: targetID,
 	}
 
-	var buf strings.Builder
-	if err := cachedGifResults.ExecuteTemplate(&buf, tmplGifResults, data); err != nil {
+	buf := getBuffer()
+	defer putBuffer(buf)
+	if err := cachedGifResults.ExecuteTemplate(buf, tmplGifResults, data); err != nil {
 		return "", err
 	}
 	return buf.String(), nil
@@ -297,8 +388,9 @@ func renderGifAttachment(url, thumbURL, targetID string) (string, error) {
 		TargetID: targetID,
 	}
 
-	var buf strings.Builder
-	if err := cachedGifAttachment.ExecuteTemplate(&buf, tmplGifAttachment, data); err != nil {
+	buf := getBuffer()
+	defer putBuffer(buf)
+	if err := cachedGifAttachment.ExecuteTemplate(buf, tmplGifAttachment, data); err != nil {
 		return "", err
 	}
 	return buf.String(), nil
@@ -340,9 +432,9 @@ func formatRelativeTime(ts int64) string {
 		return fmt.Sprintf("%d days ago", days)
 	case weeks == 1:
 		return "1 week ago"
-	case weeks < 4:
+	case weeks < 5:
 		return fmt.Sprintf("%d weeks ago", weeks)
-	case months == 1:
+	case months <= 1:
 		return "1 month ago"
 	case months < 12:
 		return fmt.Sprintf("%d months ago", months)
@@ -412,10 +504,40 @@ func initTemplates() {
 		},
 		"timeAgo":   formatTimeAgo,
 		"avatarURL": GetValidatedAvatarURL,
+		// eventLink returns a bech32 identifier for an event (note1, nevent1, or naddr1)
+		// For addressable events (kind 30xxx): returns naddr1 with kind, pubkey, d-tag
+		// For regular events: returns note1 (simple event ID encoding)
+		"eventLink": func(id string, kind int, pubkey string, dtag string) string {
+			// Addressable events (kind 30xxx) use naddr1
+			if kind >= 30000 && kind < 40000 && dtag != "" {
+				naddr, err := nips.EncodeNAddr(uint32(kind), pubkey, dtag)
+				if err == nil {
+					return naddr
+				}
+				// Fall back to hex ID on error
+				return id
+			}
+			// Regular events use note1
+			note, err := nips.EncodeEventID(id)
+			if err == nil {
+				return note
+			}
+			// Fall back to hex ID on error
+			return id
+		},
+		// noteLink returns a note1 bech32 identifier for an event ID
+		// Use this when you only have the event ID (e.g., for parent links)
+		"noteLink": func(id string) string {
+			note, err := nips.EncodeEventID(id)
+			if err == nil {
+				return note
+			}
+			return id
+		},
 		"isoTime": func(ts int64) string {
 			return time.Unix(ts, 0).UTC().Format(time.RFC3339)
 		},
-		"i18n": I18n,
+		"i18n": config.I18n,
 		"truncateURL": func(url string, maxLen int) string {
 			if len(url) <= maxLen {
 				return url
@@ -452,232 +574,105 @@ func initTemplates() {
 		"safeHTML": func(s string) template.HTML {
 			return template.HTML(s)
 		},
-		"siteConfig": func() *SiteConfig {
-			return GetSiteConfig()
+		"siteConfig": func() *config.SiteConfig {
+			return config.GetSiteConfig()
+		},
+		"buildURL": func(path string, args ...any) (string, error) {
+			if len(args)%2 != 0 {
+				return "", fmt.Errorf("buildURL requires key-value pairs")
+			}
+			params := make(map[string]string, len(args)/2)
+			for i := 0; i < len(args); i += 2 {
+				key, ok := args[i].(string)
+				if !ok {
+					return "", fmt.Errorf("buildURL keys must be strings")
+				}
+				// Convert value to string based on type
+				var val string
+				switch v := args[i+1].(type) {
+				case string:
+					val = v
+				case int:
+					val = strconv.Itoa(v)
+				case int64:
+					val = strconv.FormatInt(v, 10)
+				case []int:
+					val = util.IntsToParam(v)
+				case []string:
+					val = strings.Join(v, ",")
+				default:
+					val = fmt.Sprintf("%v", v)
+				}
+				if val != "" {
+					params[key] = val
+				}
+			}
+			return util.BuildURL(path, params), nil
+		},
+		"nip05URL": func(nip05 string) string {
+			return GetNIP05VerificationURL(nip05)
+		},
+		"nip05Badge": func() string {
+			return config.GetNIP05Badge()
 		},
 	}
-
-	var err error
 
 	// Get shared templates from templates package
 	baseTemplates := templates.GetBaseTemplates()
 	kindTemplates := templates.GetKindTemplates()
 	fragmentTemplate := templates.GetFragmentTemplate()
 
-	// Compile timeline template: base + timeline content + kind sub-templates
-	cachedHTMLTemplate, err = template.New("timeline").Funcs(templateFuncMap).Parse(
-		baseTemplates + templates.GetTimelineTemplate() + kindTemplates)
-	if err != nil {
-		slog.Error("failed to compile timeline template", "error", err); os.Exit(1)
-	}
+	// Compile full page templates (base + content + kinds)
+	cachedHTMLTemplate = util.MustCompileTemplate("timeline", templateFuncMap, baseTemplates+templates.GetTimelineTemplate()+kindTemplates)
+	cachedThreadTemplate = util.MustCompileTemplate("thread", templateFuncMap, baseTemplates+templates.GetThreadTemplate()+kindTemplates)
+	cachedProfileTemplate = util.MustCompileTemplate("profile", templateFuncMap, baseTemplates+templates.GetProfileTemplate()+kindTemplates)
+	cachedNotificationsTemplate = util.MustCompileTemplate("notifications", templateFuncMap, baseTemplates+templates.GetNotificationsTemplate()+kindTemplates)
+	cachedMutesTemplate = util.MustCompileTemplate("mutes", templateFuncMap, baseTemplates+templates.GetMutesTemplate())
+	cachedSearchTemplate = util.MustCompileTemplate("search", templateFuncMap, baseTemplates+templates.GetSearchTemplate()+kindTemplates)
+	cachedQuoteTemplate = util.MustCompileTemplate("quote", templateFuncMap, baseTemplates+templates.GetQuoteTemplate()+kindTemplates)
+	cachedReportTemplate = util.MustCompileTemplate("report", templateFuncMap, baseTemplates+templates.GetReportTemplate()+kindTemplates)
+	cachedWalletTemplate = util.MustCompileTemplate("wallet", templateFuncMap, baseTemplates+templates.GetWalletTemplate()+kindTemplates)
+	cachedGifsTemplate = util.MustCompileTemplate("gifs", templateFuncMap, baseTemplates+templates.GetGifsPageTemplate())
+	cachedComposeTemplate = util.MustCompileTemplate("compose", templateFuncMap, baseTemplates+templates.GetComposeTemplate())
 
-	// Compile thread template: base + thread content + kind sub-templates
-	cachedThreadTemplate, err = template.New("thread").Funcs(templateFuncMap).Parse(
-		baseTemplates + templates.GetThreadTemplate() + kindTemplates)
-	if err != nil {
-		slog.Error("failed to compile thread template", "error", err); os.Exit(1)
-	}
+	// Compile fragment templates for HelmJS partial updates (fragment + content + kinds)
+	cachedTimelineFragment = util.MustCompileTemplate("timeline-fragment", templateFuncMap, fragmentTemplate+templates.GetTimelineTemplate()+kindTemplates)
+	cachedThreadFragment = util.MustCompileTemplate("thread-fragment", templateFuncMap, fragmentTemplate+templates.GetThreadTemplate()+kindTemplates)
+	cachedProfileFragment = util.MustCompileTemplate("profile-fragment", templateFuncMap, fragmentTemplate+templates.GetProfileTemplate()+kindTemplates)
+	cachedNotificationsFragment = util.MustCompileTemplate("notifications-fragment", templateFuncMap, fragmentTemplate+templates.GetNotificationsTemplate()+kindTemplates)
+	cachedMutesFragment = util.MustCompileTemplate("mutes-fragment", templateFuncMap, fragmentTemplate+templates.GetMutesTemplate())
+	cachedSearchFragment = util.MustCompileTemplate("search-fragment", templateFuncMap, fragmentTemplate+templates.GetSearchTemplate()+kindTemplates)
+	cachedWalletFragment = util.MustCompileTemplate("wallet-fragment", templateFuncMap, fragmentTemplate+templates.GetWalletTemplate()+kindTemplates)
+	cachedReportFragment = util.MustCompileTemplate("report-fragment", templateFuncMap, fragmentTemplate+templates.GetReportTemplate()+kindTemplates)
+	cachedQuoteFragment = util.MustCompileTemplate("quote-fragment", templateFuncMap, fragmentTemplate+templates.GetQuoteTemplate()+kindTemplates)
 
-	// Compile profile template: base + profile content + kind sub-templates
-	cachedProfileTemplate, err = template.New("profile").Funcs(templateFuncMap).Parse(
-		baseTemplates + templates.GetProfileTemplate() + kindTemplates)
-	if err != nil {
-		slog.Error("failed to compile profile template", "error", err); os.Exit(1)
-	}
+	// Compile append fragment templates for HelmJS "Load More" responses
+	cachedAppendFragment = util.MustCompileTemplate("append-fragment", templateFuncMap, templates.GetAppendFragmentTemplate()+kindTemplates)
+	cachedNotificationsAppend = util.MustCompileTemplate("notifications-append", templateFuncMap, templates.GetNotificationsAppendTemplate()+kindTemplates)
+	cachedSearchAppend = util.MustCompileTemplate("search-append", templateFuncMap, templates.GetSearchAppendTemplate()+kindTemplates)
+	cachedProfileAppend = util.MustCompileTemplate("profile-append", templateFuncMap, templates.GetProfileAppendTemplate()+kindTemplates)
 
-	// Compile notifications template: base + notifications content + kind sub-templates (for pagination, quoted-note)
-	cachedNotificationsTemplate, err = template.New("notifications").Funcs(templateFuncMap).Parse(
-		baseTemplates + templates.GetNotificationsTemplate() + kindTemplates)
-	if err != nil {
-		slog.Error("failed to compile notifications template", "error", err); os.Exit(1)
-	}
+	// Compile action response templates for HelmJS OOB updates
+	cachedFooterFragment = util.MustCompileTemplate("footer-fragment", templateFuncMap, templates.GetFooterFragmentTemplate()+kindTemplates)
+	cachedFollowButtonFragment = util.MustCompileTemplate("follow-button", templateFuncMap, templates.GetFollowButtonTemplate())
+	cachedPostResponse = util.MustCompileTemplate("post-response", templateFuncMap, templates.GetPostResponseTemplate()+kindTemplates)
+	cachedReplyResponse = util.MustCompileTemplate("reply-response", templateFuncMap, templates.GetReplyResponseTemplate()+kindTemplates)
 
-	// Compile mutes template: base + mutes content
-	cachedMutesTemplate, err = template.New("mutes").Funcs(templateFuncMap).Parse(
-		baseTemplates + templates.GetMutesTemplate())
-	if err != nil {
-		slog.Error("failed to compile mutes template", "error", err); os.Exit(1)
-	}
-
-	// Compile search template: base + search content + kind sub-templates (for author-header)
-	cachedSearchTemplate, err = template.New("search").Funcs(templateFuncMap).Parse(
-		baseTemplates + templates.GetSearchTemplate() + kindTemplates)
-	if err != nil {
-		slog.Error("failed to compile search template", "error", err); os.Exit(1)
-	}
-
-	// Compile quote template: base + quote content + kind templates (for flash-messages)
-	cachedQuoteTemplate, err = template.New("quote").Funcs(templateFuncMap).Parse(
-		baseTemplates + templates.GetQuoteTemplate() + kindTemplates)
-	if err != nil {
-		slog.Error("failed to compile quote template", "error", err); os.Exit(1)
-	}
-
-	// Compile wallet template: base + wallet content + kind templates (for flash-messages)
-	cachedWalletTemplate, err = template.New("wallet").Funcs(templateFuncMap).Parse(
-		baseTemplates + templates.GetWalletTemplate() + kindTemplates)
-	if err != nil {
-		slog.Error("failed to compile wallet template", "error", err); os.Exit(1)
-	}
-
-	// Compile fragment templates for HelmJS partial updates
-	// These render just the content block without the base wrapper
-	cachedTimelineFragment, err = template.New("timeline-fragment").Funcs(templateFuncMap).Parse(
-		fragmentTemplate + templates.GetTimelineTemplate() + kindTemplates)
-	if err != nil {
-		slog.Error("failed to compile timeline fragment template", "error", err); os.Exit(1)
-	}
-
-	cachedThreadFragment, err = template.New("thread-fragment").Funcs(templateFuncMap).Parse(
-		fragmentTemplate + templates.GetThreadTemplate() + kindTemplates)
-	if err != nil {
-		slog.Error("failed to compile thread fragment template", "error", err); os.Exit(1)
-	}
-
-	cachedProfileFragment, err = template.New("profile-fragment").Funcs(templateFuncMap).Parse(
-		fragmentTemplate + templates.GetProfileTemplate() + kindTemplates)
-	if err != nil {
-		slog.Error("failed to compile profile fragment template", "error", err); os.Exit(1)
-	}
-
-	cachedNotificationsFragment, err = template.New("notifications-fragment").Funcs(templateFuncMap).Parse(
-		fragmentTemplate + templates.GetNotificationsTemplate() + kindTemplates)
-	if err != nil {
-		slog.Error("failed to compile notifications fragment template", "error", err); os.Exit(1)
-	}
-
-	cachedMutesFragment, err = template.New("mutes-fragment").Funcs(templateFuncMap).Parse(
-		fragmentTemplate + templates.GetMutesTemplate())
-	if err != nil {
-		slog.Error("failed to compile mutes fragment template", "error", err); os.Exit(1)
-	}
-
-	cachedSearchFragment, err = template.New("search-fragment").Funcs(templateFuncMap).Parse(
-		fragmentTemplate + templates.GetSearchTemplate() + kindTemplates)
-	if err != nil {
-		slog.Error("failed to compile search fragment template", "error", err); os.Exit(1)
-	}
-
-	cachedWalletFragment, err = template.New("wallet-fragment").Funcs(templateFuncMap).Parse(
-		fragmentTemplate + templates.GetWalletTemplate() + kindTemplates)
-	if err != nil {
-		slog.Error("failed to compile wallet fragment template", "error", err); os.Exit(1)
-	}
-
-	// Compile wallet info fragment template for lazy-loaded balance/transactions
-	cachedWalletInfoFragment, err = template.New("wallet-info").Funcs(templateFuncMap).Parse(
-		templates.GetWalletInfoTemplate())
-	if err != nil {
-		slog.Error("failed to compile wallet info fragment template", "error", err); os.Exit(1)
-	}
-
-	// Compile new notes indicator template for timeline polling
-	cachedNewNotesIndicator, err = template.New("new-notes-indicator").Funcs(templateFuncMap).Parse(
-		templates.GetNewNotesIndicatorTemplate())
-	if err != nil {
-		slog.Error("failed to compile new notes indicator template", "error", err); os.Exit(1)
-	}
-
-	// Compile link preview template for Open Graph cards
-	cachedLinkPreview, err = template.New("link-preview").Funcs(templateFuncMap).Parse(
-		templates.GetLinkPreviewTemplate())
-	if err != nil {
-		slog.Error("failed to compile link preview template", "error", err); os.Exit(1)
-	}
-
-	// Compile OOB flash message template for HelmJS error responses
-	cachedOOBFlash, err = template.New("oob-flash").Funcs(templateFuncMap).Parse(
-		templates.GetOOBFlashTemplate())
-	if err != nil {
-		slog.Error("failed to compile OOB flash template", "error", err); os.Exit(1)
-	}
-
-	// Compile footer fragment template for HelmJS action responses (react, bookmark)
-	cachedFooterFragment, err = template.New("footer-fragment").Funcs(templateFuncMap).Parse(
-		templates.GetFooterFragmentTemplate() + kindTemplates)
-	if err != nil {
-		slog.Error("failed to compile footer fragment template", "error", err); os.Exit(1)
-	}
-
-	// Compile follow button fragment template for HelmJS action responses
-	cachedFollowButtonFragment, err = template.New("follow-button").Funcs(templateFuncMap).Parse(
-		templates.GetFollowButtonTemplate())
-	if err != nil {
-		slog.Error("failed to compile follow button fragment template", "error", err); os.Exit(1)
-	}
-
-	// Compile append fragment template for HelmJS "Load More" responses
-	cachedAppendFragment, err = template.New("append-fragment").Funcs(templateFuncMap).Parse(
-		templates.GetAppendFragmentTemplate() + kindTemplates)
-	if err != nil {
-		slog.Error("failed to compile append fragment template", "error", err); os.Exit(1)
-	}
-
-	// Compile notifications append fragment template
-	cachedNotificationsAppend, err = template.New("notifications-append").Funcs(templateFuncMap).Parse(
-		templates.GetNotificationsAppendTemplate() + kindTemplates)
-	if err != nil {
-		slog.Error("failed to compile notifications append fragment template", "error", err); os.Exit(1)
-	}
-
-	// Compile search append fragment template
-	cachedSearchAppend, err = template.New("search-append").Funcs(templateFuncMap).Parse(
-		templates.GetSearchAppendTemplate() + kindTemplates)
-	if err != nil {
-		slog.Error("failed to compile search append fragment template", "error", err); os.Exit(1)
-	}
-
-	// Compile profile append fragment template
-	cachedProfileAppend, err = template.New("profile-append").Funcs(templateFuncMap).Parse(
-		templates.GetProfileAppendTemplate())
-	if err != nil {
-		slog.Error("failed to compile profile append fragment template", "error", err); os.Exit(1)
-	}
-
-	// Compile post response template for HelmJS OOB updates
-	cachedPostResponse, err = template.New("post-response").Funcs(templateFuncMap).Parse(
-		templates.GetPostResponseTemplate() + kindTemplates)
-	if err != nil {
-		slog.Error("failed to compile post response template", "error", err); os.Exit(1)
-	}
-
-	// Compile reply response template for HelmJS OOB updates
-	cachedReplyResponse, err = template.New("reply-response").Funcs(templateFuncMap).Parse(
-		templates.GetReplyResponseTemplate() + kindTemplates)
-	if err != nil {
-		slog.Error("failed to compile reply response template", "error", err); os.Exit(1)
-	}
+	// Compile standalone fragment templates
+	cachedWalletInfoFragment = util.MustCompileTemplate("wallet-info", templateFuncMap, templates.GetWalletInfoTemplate())
+	cachedNewNotesIndicator = util.MustCompileTemplate("new-notes-indicator", templateFuncMap, templates.GetNewNotesIndicatorTemplate())
+	cachedLinkPreview = util.MustCompileTemplate("link-preview", templateFuncMap, templates.GetLinkPreviewTemplate())
+	cachedWavlakePlayer = util.MustCompileTemplate("wavlake-player", templateFuncMap, templates.GetWavlakePlayerTemplate())
+	cachedOOBFlash = util.MustCompileTemplate("oob-flash", templateFuncMap, templates.GetOOBFlashTemplate())
 
 	// Compile GIF picker templates
-	cachedGifsTemplate, err = template.New("gifs").Funcs(templateFuncMap).Parse(
-		baseTemplates + templates.GetGifsPageTemplate())
-	if err != nil {
-		slog.Error("failed to compile gifs page template", "error", err); os.Exit(1)
-	}
+	cachedGifPanel = util.MustCompileTemplate("gif-panel", templateFuncMap, templates.GetGifPanelTemplate())
+	cachedGifResults = util.MustCompileTemplate("gif-results", templateFuncMap, templates.GetGifResultsTemplate())
+	cachedGifAttachment = util.MustCompileTemplate("gif-attachment", templateFuncMap, templates.GetGifAttachmentTemplate())
 
-	cachedGifPanel, err = template.New("gif-panel").Funcs(templateFuncMap).Parse(
-		templates.GetGifPanelTemplate())
-	if err != nil {
-		slog.Error("failed to compile gif panel template", "error", err); os.Exit(1)
-	}
-
-	cachedGifResults, err = template.New("gif-results").Funcs(templateFuncMap).Parse(
-		templates.GetGifResultsTemplate())
-	if err != nil {
-		slog.Error("failed to compile gif results template", "error", err); os.Exit(1)
-	}
-
-	cachedGifAttachment, err = template.New("gif-attachment").Funcs(templateFuncMap).Parse(
-		templates.GetGifAttachmentTemplate())
-	if err != nil {
-		slog.Error("failed to compile gif attachment template", "error", err); os.Exit(1)
-	}
-
-	cachedComposeTemplate, err = template.New("compose").Funcs(templateFuncMap).Parse(
-		baseTemplates + templates.GetComposeTemplate())
-	if err != nil {
-		slog.Error("failed to compile compose template", "error", err); os.Exit(1)
-	}
+	// Compile mention autocomplete templates
+	cachedMentionsDropdown = util.MustCompileTemplate("mentions-dropdown", templateFuncMap, templates.GetMentionsDropdownTemplate())
+	cachedMentionsSelectResponse = util.MustCompileTemplate("mentions-select-response", templateFuncMap, templates.GetMentionsSelectResponseTemplate())
 
 	slog.Info("all HTML templates compiled successfully")
 
@@ -731,11 +726,11 @@ func getThemeFromRequest(r *http.Request) (string, string) {
 
 	switch theme {
 	case "dark":
-		return "dark", I18n("theme.dark")
+		return "dark", config.I18n("theme.dark")
 	case "light":
-		return "light", I18n("theme.light")
+		return "light", config.I18n("theme.light")
 	default:
-		return "", I18n("theme.auto")
+		return "", config.I18n("theme.auto")
 	}
 }
 
@@ -773,6 +768,8 @@ type HTMLPageData struct {
 	NavItems       []NavItem       // Navigation items (search, notifications)
 	SettingsItems  []SettingsItem  // Settings dropdown items
 	SettingsToggle SettingsToggle  // Settings toggle button config
+	// DVM metadata (for DVM-powered feeds)
+	DVMMetadata *DVMMetadata // DVM display info (name, image, description)
 }
 
 type HTMLEventItem struct {
@@ -788,13 +785,16 @@ type HTMLEventItem struct {
 	Content       string
 	ContentHTML   template.HTML
 	ImagesHTML    template.HTML // Pre-rendered images from imeta tags (kind 20)
+	ImageCount    int           // Number of images (for conditional styling)
 	Title         string        // Title from title tag (kind 20, 30023)
 	Summary       string        // Summary from summary tag (kind 30023)
 	HeaderImage   string        // Header image URL from image tag (kind 30023)
 	PublishedAt   int64         // Published timestamp from published_at tag (kind 30023)
+	DTag          string        // d-tag for addressable events (kind 30xxx)
 	RelaysSeen    []string
-	Links         []string
-	AuthorProfile *ProfileInfo
+	Links          []string
+	AuthorProfile  *ProfileInfo
+	ProfileMissing bool // True when profile fetch timed out - triggers lazy loading
 	Reactions     *ReactionsSummary
 	ReplyCount    int
 	ParentID      string         // ID of parent event if this is a reply
@@ -847,6 +847,9 @@ type HTMLEventItem struct {
 	IsReposted          bool          // Whether logged-in user has reposted this item
 	IsZapped            bool          // Whether logged-in user has zapped this item
 	IsMuted             bool          // Whether the event's author is in user's mute list
+	// NIP-36 content warning fields
+	HasContentWarning   bool          // Whether event has content-warning tag
+	ContentWarning      string        // Content warning reason (may be empty)
 	// Kind 30402 classified listing fields (NIP-99)
 	ClassifiedPrice       string   // Formatted price display (e.g., "€15/month")
 	ClassifiedPriceAmount string   // Numeric price amount
@@ -857,19 +860,142 @@ type HTMLEventItem struct {
 	ClassifiedStatus      string   // "active" or "sold"
 	ClassifiedPublishedAt int64    // Published timestamp
 	ClassifiedImages      []string // Image URLs from image tags
-	// Kind 22 short-form video fields (NIP-71)
-	VideoURL       string // Video URL from imeta tag
-	VideoThumbnail string // Thumbnail image URL from imeta tag (image field)
-	VideoDuration  int    // Duration in seconds from imeta tag
-	VideoDimension string // Dimensions (e.g., "1080x1920") from imeta tag
-	VideoMimeType  string // MIME type from imeta tag
-	VideoTitle     string // Title from title tag
+	// Kind 22/30 video fields (NIP-71)
+	VideoURL       string   // Video URL from imeta tag
+	VideoThumbnail string   // Thumbnail image URL from imeta tag (image field)
+	VideoDuration  string   // Formatted duration (e.g., "1:23:45")
+	VideoDimension string   // Dimensions (e.g., "1080x1920") from imeta tag
+	VideoMimeType  string   // MIME type from imeta tag
+	VideoTitle     string   // Title from title tag
+	VideoHashtags  []string // Hashtags from t tags
+	// Kind 32123 audio/track fields (NOM - Nostr Open Media)
+	AudioTitle     string // Track title from NOM content
+	AudioCreator   string // Artist/creator name from NOM content
+	AudioURL       string // Audio stream URL from NOM enclosure
+	AudioDuration  string // Formatted duration (e.g., "3:45")
+	AudioPageURL   string // Link to track page (e.g., Wavlake)
+	AudioThumbnail string // Album art/thumbnail from imeta or external
+	AudioMimeType  string // MIME type (e.g., "audio/mpeg")
+	// Kind 1111 comment fields (NIP-22)
+	CommentRootKind   int    // Kind of the root event (from K tag)
+	CommentRootID     string // Root event ID (from E tag) or naddr (from A tag)
+	CommentRootURL    string // External URL if commenting on web content (from I tag)
+	CommentRootLabel  string // Human-readable label for root (e.g., "article", "photo", "video")
+	CommentParentKind int    // Kind of parent event (from k tag)
+	CommentParentID   string // Parent event ID (from e tag) or naddr (from a tag)
+	CommentIsNested   bool   // True if this is a reply to another comment (root != parent)
+	// Kind 31922/31923 calendar event fields (NIP-52)
+	CalendarStartDate   string              // Start date (YYYY-MM-DD or formatted)
+	CalendarStartMonth  string              // Start month name (e.g., "Dec")
+	CalendarStartDay    string              // Start day number (e.g., "25")
+	CalendarStartTime   string              // Start time (e.g., "14:00")
+	CalendarEndDate     string              // End date
+	CalendarEndMonth    string              // End month name
+	CalendarEndDay      string              // End day number
+	CalendarEndTime     string              // End time
+	CalendarIsAllDay    bool                // True for date-based events (kind 31922)
+	CalendarLocation    string              // Location from location tag
+	CalendarGeohash     string              // Geohash from g tag
+	CalendarImage       string              // Event image from image tag
+	CalendarHashtags    []string            // Hashtags from t tags
+	CalendarParticipants []CalendarParticipant // Participants from p tags
+	// Kind 1063 file metadata fields (NIP-94)
+	FileURL        string // File URL from url tag
+	FileMimeType   string // MIME type from m tag
+	FileSize       string // Formatted file size
+	FileDimensions string // Dimensions from dim tag
+	FileThumbnail  string // Thumbnail URL from thumb tag
+	FileAlt        string // Alt text from alt tag
+	FileTitle      string // Title/filename
+	FileIsImage    bool   // Whether file is an image
+	FileIsVideo    bool   // Whether file is a video
+	FileIsAudio    bool   // Whether file is audio
+	// Kind 30017 stall fields (NIP-15)
+	StallName          string         // Stall name
+	StallDescription   string         // Stall description
+	StallCurrency      string         // Currency used
+	StallShippingZones []ShippingZone // Shipping zones
+	// Kind 30018 product fields (NIP-15)
+	ProductName        string        // Product name
+	ProductDescription string        // Product description
+	ProductPrice       string        // Formatted price
+	ProductCurrency    string        // Currency
+	ProductQuantity    string        // Available quantity
+	ProductImages      []string      // Image URLs
+	ProductCategories  []string      // Category tags
+	ProductSpecs       []ProductSpec // Specifications
+	ProductStallID     string        // Associated stall ID
+	// Kind 30315 user status fields (NIP-38)
+	StatusType string // Status type (general, music, etc.)
+	StatusLink string // Associated URL
+	// Kind 34550 community fields (NIP-72)
+	CommunityName        string   // Community name
+	CommunityDescription string   // Community description
+	CommunityImage       string   // Community image
+	CommunityModerators  []string // Moderator pubkeys
+	// Kind 30009 badge definition fields (NIP-58)
+	BadgeName        string // Badge name
+	BadgeDescription string // Badge description
+	BadgeImage       string // Badge image URL
+	BadgeThumbnail   string // Badge thumbnail URL
+	// Kind 8 badge award fields (NIP-58)
+	BadgeAwardees []string // Pubkeys awarded the badge
+	// Kind 1984 report fields (NIP-56)
+	ReportType string // Report type (spam, nudity, etc.)
+	// Kind 1311 live chat fields (NIP-53)
+	LiveEventRef   string // Reference to live event (naddr)
+	LiveEventTitle string // Title of the live event
+	ReplyToID      string // ID of message being replied to
+	// Kind 31925 calendar RSVP fields (NIP-52)
+	RSVPStatus        string // accepted, declined, tentative
+	RSVPFreebusy      string // free or busy
+	CalendarEventRef  string // Reference to calendar event (naddr)
+	CalendarEventTitle string // Title of the calendar event
+	// Kind 1985 label fields (NIP-32)
+	Labels       []LabelInfo   // Labels with namespace and value
+	LabelTargets []LabelTarget // What the labels are applied to
+	// Kind 30617 repository fields (NIP-34)
+	RepoID          string           // Repository identifier (d-tag)
+	RepoName        string           // Human-readable name
+	RepoDescription string           // Description
+	RepoWebURLs     []string         // Web browsing URLs
+	RepoCloneURLs   []string         // Git clone URLs
+	RepoMaintainers []RepoMaintainer // Maintainer profiles
+	RepoHashtags    []string         // Repository hashtags
 	// Actions available for this event (populated by BuildHypermediaEntity)
 	ActionGroups []HTMLActionGroup // Grouped actions for pill layout
 	// Login state for rendering in sub-templates
 	LoggedIn            bool          // Whether user is logged in (needed for sub-templates)
 	// Used for new notes feature - marks the oldest new note for scrolling
 	IsScrollTarget      bool          // Whether to add scroll target ID
+	// NIP-89 handler discovery for unknown kinds
+	Handlers            []AppHandler  // Discovered app handlers for this kind
+	// Kind 31990 handler definition fields (NIP-89)
+	HandlerName    string   // Handler app name (from JSON content)
+	HandlerAbout   string   // Handler description (from JSON content)
+	HandlerPicture string   // Handler icon URL (from JSON content)
+	HandlerWebsite string   // Handler website URL (from JSON content)
+	HandlerKinds   []int    // Kinds this handler supports (from k tags)
+	// Kind 31989 recommendation fields (NIP-89)
+	RecommendedHandler *RecommendedHandler // The handler being recommended
+	RecommendedForKind int                 // The kind this recommendation is for
+}
+
+// AppHandler represents an app that can handle a specific event kind (NIP-89)
+type AppHandler struct {
+	Name             string // App name
+	Picture          string // App icon URL
+	URL              string // URL with bech32 replaced
+	Bech32Type       string // Internal: bech32 type hint from web tag (nevent, naddr, or empty for note)
+	RecommendedBy    int    // Number of followed users who recommended this handler
+}
+
+// RecommendedHandler represents a handler referenced in a 31989 recommendation
+type RecommendedHandler struct {
+	Name    string // Handler app name
+	Picture string // Handler icon URL
+	Pubkey  string // Handler publisher pubkey (hex)
+	DTag    string // Handler d-tag identifier (fallback name)
 }
 
 // LiveParticipant represents a participant in a live event
@@ -879,6 +1005,50 @@ type LiveParticipant struct {
 	NpubShort string
 	Role      string       // Host, Speaker, Participant, etc.
 	Profile   *ProfileInfo
+}
+
+// CalendarParticipant represents a participant in a calendar event
+type CalendarParticipant struct {
+	Pubkey    string
+	Npub      string
+	NpubShort string
+	Role      string       // host, attendee, etc.
+	Profile   *ProfileInfo
+}
+
+// ShippingZone represents a shipping zone for marketplace stalls
+type ShippingZone struct {
+	ID      string
+	Name    string
+	Cost    string
+	Regions string
+}
+
+// ProductSpec represents a product specification key-value pair
+type ProductSpec struct {
+	Key   string
+	Value string
+}
+
+// LabelInfo represents a label with optional namespace (NIP-32)
+type LabelInfo struct {
+	Namespace string // Label namespace (e.g., "ugc", "com.example")
+	Value     string // Label value
+}
+
+// LabelTarget represents what a label is applied to
+type LabelTarget struct {
+	Type string // "event", "profile", "relay", "topic"
+	URL  string // Link to the target
+}
+
+// RepoMaintainer represents a repository maintainer
+type RepoMaintainer struct {
+	Pubkey      string // Hex pubkey
+	Npub        string // Bech32 npub
+	NpubShort   string // Truncated npub for display
+	DisplayName string // Profile display name
+	Picture     string // Profile picture URL
 }
 
 // computeRenderTemplate returns the template name for rendering an event.
@@ -912,11 +1082,11 @@ type HTMLAction struct {
 	IconOnly  string      // "always", "mobile", "desktop", or "" (never) - controls icon-only display
 	CSRFToken string      // CSRF token (extracted from Fields for explicit rendering)
 	Fields    []HTMLField // Form fields for POST actions (excludes csrf_token)
-	Disabled  bool        // If true, render as non-interactive text (deprecated, use Completed)
 	Completed bool        // If true, action already performed (filled pill style)
 	Count     int         // Count to display (if HasCount is true)
 	HasCount  bool        // Whether to show count
 	GroupWith string      // If set, this action appears in another action's dropdown
+	Amounts   []int       // Preset amounts for zap dropdown (in sats)
 }
 
 type HTMLField struct {
@@ -930,6 +1100,42 @@ var imageExtRegex = regexp.MustCompile(`(?i)\.(jpg|jpeg|png|gif|webp)(\?.*)?$`)
 var videoExtRegex = regexp.MustCompile(`(?i)\.(mp4|webm|mov|m4v)(\?.*)?$`)
 // Audio extension regex
 var audioExtRegex = regexp.MustCompile(`(?i)\.(mp3|wav|ogg|flac|m4a|aac)(\?.*)?$`)
+// File extension regex - matches common downloadable file types (non-media)
+var fileExtRegex = regexp.MustCompile(`(?i)\.(pdf|doc|docx|xls|xlsx|csv|zip|tar|gz|7z|rar|txt|md|json|xml|bin|exe|dmg|apk|iso)(\?.*)?$`)
+
+// getFileIcon returns an emoji icon based on file extension
+func getFileIcon(ext string) string {
+	ext = strings.ToLower(ext)
+	switch ext {
+	case ".pdf":
+		return "📄"
+	case ".doc", ".docx", ".odt", ".rtf":
+		return "📝"
+	case ".xls", ".xlsx", ".csv":
+		return "📊"
+	case ".zip", ".tar", ".gz", ".7z", ".rar", ".tgz":
+		return "📦"
+	case ".txt", ".md", ".json", ".xml":
+		return "📃"
+	default:
+		return "💾"
+	}
+}
+
+// extractFileExt extracts the file extension from a URL (including the dot)
+func extractFileExt(url string) string {
+	// Remove query string for extension detection
+	cleanURL := url
+	if idx := strings.Index(url, "?"); idx != -1 {
+		cleanURL = url[:idx]
+	}
+	// Find last dot
+	if idx := strings.LastIndex(cleanURL, "."); idx != -1 {
+		return strings.ToLower(cleanURL[idx:])
+	}
+	return ""
+}
+
 // YouTube URL regex - matches youtube.com/watch?v=ID, youtu.be/ID, youtube.com/shorts/ID
 var youtubeRegex = regexp.MustCompile(`(?i)(?:youtube\.com/watch\?v=|youtu\.be/|youtube\.com/shorts/)([a-zA-Z0-9_-]{11})`)
 
@@ -940,6 +1146,15 @@ var urlRegex = regexp.MustCompile(`https?://[^\s<>"]+`)
 // cleanURLTrailing removes trailing punctuation that's likely not part of the URL
 // Handles common cases like URLs in parentheses "(https://example.com)" or markdown links
 func cleanURLTrailing(url string) string {
+	// First, handle markdown link artifacts like "url](other_url)" or "url)[text]"
+	// These patterns indicate broken markdown extraction
+	if idx := strings.Index(url, "]("); idx != -1 {
+		url = url[:idx]
+	}
+	if idx := strings.Index(url, ")["); idx != -1 {
+		url = url[:idx]
+	}
+
 	// Remove trailing punctuation that's unlikely to be part of a URL
 	// Be careful: ) can be part of URLs (e.g., Wikipedia), so only strip if unbalanced
 	for len(url) > 0 {
@@ -973,6 +1188,15 @@ func cleanURLTrailing(url string) string {
 			} else {
 				return url
 			}
+		case ']':
+			// Only strip ] if brackets are unbalanced (markdown link artifacts)
+			opens := strings.Count(url, "[")
+			closes := strings.Count(url, "]")
+			if closes > opens {
+				url = url[:len(url)-1]
+			} else {
+				return url
+			}
 		default:
 			return url
 		}
@@ -986,16 +1210,17 @@ var mediaURLRegex = regexp.MustCompile(`(?i)(\n\s*)+\n(https?://[^\s<>"]+\.(jpg|
 // consecutiveImgRegex matches 2+ consecutive <img> tags (with optional whitespace between)
 var consecutiveImgRegex = regexp.MustCompile(`(<img [^>]+>)(\s*<img [^>]+>)+`)
 
-// imgTagRegex matches individual <img> tags for counting
-var imgTagRegex = regexp.MustCompile(`<img [^>]+>`)
+// gifPatternRegex detects GIF images by extension or known GIF hosting services
+var gifPatternRegex = regexp.MustCompile(`(?i)\.gif[\s"?]|giphy\.com|tenor\.com|/gif/`)
 
-// wrapConsecutiveImages wraps groups of 2+ consecutive images in a gallery div
-// Uses "image-gallery-odd" class when there's an odd number of images (first image full width)
+// wrapConsecutiveImages wraps groups of 2+ consecutive images in a gallery or stack div.
+// If any image is a GIF (detected by extension or known hosts), uses stacked layout
+// to preserve the "setup → reaction" flow typical of image+GIF posts.
 func wrapConsecutiveImages(html string) string {
 	return consecutiveImgRegex.ReplaceAllStringFunc(html, func(match string) string {
-		imgCount := len(imgTagRegex.FindAllString(match, -1))
-		if imgCount%2 == 1 {
-			return `<div class="image-gallery image-gallery-odd">` + match + `</div>`
+		// Check if any image in the group is a GIF
+		if gifPatternRegex.MatchString(match) {
+			return `<div class="image-stack">` + match + `</div>`
 		}
 		return `<div class="image-gallery">` + match + `</div>`
 	})
@@ -1003,6 +1228,94 @@ func wrapConsecutiveImages(html string) string {
 
 // Nostr reference regex - matches nostr:nevent1..., nostr:note1..., nostr:nprofile1..., nostr:naddr1..., nostr:npub1...
 var nostrRefRegex = regexp.MustCompile(`nostr:(nevent1[a-z0-9]+|note1[a-z0-9]+|nprofile1[a-z0-9]+|naddr1[a-z0-9]+|npub1[a-z0-9]+)`)
+
+// Blossom URI regex - matches blossom:<sha256>.<ext>[?params] per BUD-10
+// See: https://github.com/hzrd149/blossom/blob/master/buds/10.md
+var blossomURIRegex = regexp.MustCompile(`blossom:([a-f0-9]{64})\.(\w+)(?:\?([^\s<>"]+))?`)
+
+// BlossomInfo holds parsed blossom URI metadata
+type BlossomInfo struct {
+	URL      string // Resolved HTTPS URL
+	Hash     string // SHA256 hash (first 8 chars for display)
+	Ext      string // File extension
+	Size     int64  // File size in bytes (0 if not specified)
+	FullHash string // Full SHA256 hash
+}
+
+// parseBlossomURI parses a blossom: URI and returns metadata
+func parseBlossomURI(uri string) *BlossomInfo {
+	matches := blossomURIRegex.FindStringSubmatch(uri)
+	if matches == nil {
+		return nil
+	}
+
+	hash := matches[1]
+	ext := matches[2]
+	queryStr := matches[3]
+
+	info := &BlossomInfo{
+		Hash:     hash[:8], // First 8 chars for display
+		FullHash: hash,
+		Ext:      "." + ext,
+	}
+
+	var server string
+
+	// Parse query params for xs (server hint) and sz (size)
+	if queryStr != "" {
+		params, err := url.ParseQuery(queryStr)
+		if err == nil {
+			// Server hint
+			if hints := params["xs"]; len(hints) > 0 {
+				hint := hints[0]
+				if !strings.HasPrefix(hint, "http://") && !strings.HasPrefix(hint, "https://") {
+					hint = "https://" + hint
+				}
+				server = hint
+			}
+			// File size
+			if sizes := params["sz"]; len(sizes) > 0 {
+				if sz, err := strconv.ParseInt(sizes[0], 10, 64); err == nil {
+					info.Size = sz
+				}
+			}
+		}
+	}
+
+	// Fall back to configured blossom server
+	if server == "" {
+		blossomServers := config.GetBlossomServers()
+		if len(blossomServers) > 0 {
+			server = blossomServers[0]
+		}
+	}
+
+	if server != "" {
+		info.URL = fmt.Sprintf("%s/%s.%s", server, hash, ext)
+	}
+
+	return info
+}
+
+// renderBlossomLink renders a blossom URI as an HTML file link
+// Note: uses formatFileSize from kinds_appliers.go
+func renderBlossomLink(uri string) string {
+	info := parseBlossomURI(uri)
+	if info == nil || info.URL == "" {
+		return uri // Return original if can't parse or no server
+	}
+
+	icon := getFileIcon(info.Ext)
+	filename := html.EscapeString(info.Hash + info.Ext)
+
+	var sizeHTML string
+	if info.Size > 0 {
+		sizeHTML = fmt.Sprintf(` <span class="file-size">(%s)</span>`, formatFileSize(info.Size))
+	}
+
+	return fmt.Sprintf(`<a href="%s" class="file-link" target="_blank" rel="noopener"><span class="file-icon">%s</span> Click to download: <span class="file-name">%s</span>%s</a>`,
+		html.EscapeString(info.URL), icon, filename, sizeHTML)
+}
 
 // ResolvedRef holds a pre-resolved nostr reference
 type ResolvedRef struct {
@@ -1108,7 +1421,8 @@ func parseImetaTag(tag []string) *ImetaImage {
 }
 
 // extractImetaImages extracts all imeta tags from event tags and renders them as HTML
-func extractImetaImages(tags [][]string) template.HTML {
+// Returns the HTML and the image count
+func extractImetaImages(tags [][]string) (template.HTML, int) {
 	var images []*ImetaImage
 	for _, tag := range tags {
 		if img := parseImetaTag(tag); img != nil {
@@ -1117,10 +1431,11 @@ func extractImetaImages(tags [][]string) template.HTML {
 	}
 
 	if len(images) == 0 {
-		return ""
+		return "", 0
 	}
 
 	var sb strings.Builder
+	isSingle := len(images) == 1
 	for _, img := range images {
 		alt := img.Alt
 		if alt == "" {
@@ -1130,10 +1445,14 @@ func extractImetaImages(tags [][]string) template.HTML {
 		sb.WriteString(html.EscapeString(img.URL))
 		sb.WriteString(`" alt="`)
 		sb.WriteString(html.EscapeString(alt))
-		sb.WriteString(`" loading="lazy" class="picture-image">`)
+		if isSingle {
+			sb.WriteString(`" loading="lazy" class="picture-image picture-single">`)
+		} else {
+			sb.WriteString(`" loading="lazy" class="picture-image">`)
+		}
 	}
 
-	return template.HTML(sb.String())
+	return template.HTML(sb.String()), len(images)
 }
 
 // extractTitle extracts the title tag value from event tags
@@ -1191,13 +1510,14 @@ func renderMarkdown(content string) template.HTML {
 	return template.HTML(sanitized)
 }
 
-// extractRepostEventIDs extracts referenced event IDs from kind 6 reposts that have empty content.
+// extractRepostEventIDs extracts referenced event IDs from repost kinds (6, 16) that have empty content.
 // These are "reference-only" reposts per NIP-18 that need the referenced event fetched from relays.
 // Returns a map of repost event ID -> referenced event ID for reposts needing fetch.
 func extractRepostEventIDs(events []Event) map[string]string {
 	result := make(map[string]string)
 	for _, evt := range events {
-		if evt.Kind == 6 && strings.TrimSpace(evt.Content) == "" {
+		kindDef := GetKindDefinition(evt.Kind)
+		if kindDef.IsRepost && strings.TrimSpace(evt.Content) == "" {
 			// Find the e tag (referenced event ID)
 			for _, tag := range evt.Tags {
 				if len(tag) >= 2 && tag[0] == "e" {
@@ -1210,26 +1530,9 @@ func extractRepostEventIDs(events []Event) map[string]string {
 	return result
 }
 
-// extractRepostEventIDsFromItems extracts referenced event IDs from EventItem slice
-func extractRepostEventIDsFromItems(items []EventItem) map[string]string {
-	result := make(map[string]string)
-	for _, item := range items {
-		if item.Kind == 6 && strings.TrimSpace(item.Content) == "" {
-			// Find the e tag (referenced event ID)
-			for _, tag := range item.Tags {
-				if len(tag) >= 2 && tag[0] == "e" {
-					result[item.ID] = tag[1]
-					break
-				}
-			}
-		}
-	}
-	return result
-}
-
-// parseRepostedEvent parses the embedded event JSON from a kind 6 repost's content field.
+// parseRepostedEvent parses the embedded event JSON from a repost's content field.
 // If content is empty (reference-only repost), it looks up the event from repostEvents map.
-func parseRepostedEvent(content string, tags [][]string, relays []string, resolvedRefs map[string]string, linkPreviews map[string]*LinkPreview, profiles map[string]*ProfileInfo, repostEvents map[string]*Event) *HTMLEventItem {
+func parseRepostedEvent(content string, tags [][]string, relays []string, resolvedRefs map[string]string, linkPreviews map[string]*LinkPreview, profiles map[string]*ProfileInfo, repostEvents map[string]*Event, quotedEvents map[string]*Event, quotedEventProfiles map[string]*ProfileInfo) *HTMLEventItem {
 	// Try to parse embedded JSON from content first
 	if content != "" {
 		var embeddedEvent struct {
@@ -1245,7 +1548,7 @@ func parseRepostedEvent(content string, tags [][]string, relays []string, resolv
 		if err := json.Unmarshal([]byte(content), &embeddedEvent); err == nil {
 			return buildRepostedEventItem(embeddedEvent.ID, embeddedEvent.PubKey, embeddedEvent.CreatedAt,
 				embeddedEvent.Kind, embeddedEvent.Tags, embeddedEvent.Content,
-				relays, resolvedRefs, linkPreviews, profiles)
+				relays, resolvedRefs, linkPreviews, profiles, quotedEvents, quotedEventProfiles)
 		}
 	}
 
@@ -1257,7 +1560,7 @@ func parseRepostedEvent(content string, tags [][]string, relays []string, resolv
 				if evt, ok := repostEvents[tag[1]]; ok {
 					return buildRepostedEventItem(evt.ID, evt.PubKey, evt.CreatedAt,
 						evt.Kind, evt.Tags, evt.Content,
-						relays, resolvedRefs, linkPreviews, profiles)
+						relays, resolvedRefs, linkPreviews, profiles, quotedEvents, quotedEventProfiles)
 				}
 				break
 			}
@@ -1268,9 +1571,31 @@ func parseRepostedEvent(content string, tags [][]string, relays []string, resolv
 }
 
 // buildRepostedEventItem creates an HTMLEventItem from event data
-func buildRepostedEventItem(id, pubkey string, createdAt int64, kind int, tags [][]string, content string, relays []string, resolvedRefs map[string]string, linkPreviews map[string]*LinkPreview, profiles map[string]*ProfileInfo) *HTMLEventItem {
+func buildRepostedEventItem(id, pubkey string, createdAt int64, kind int, tags [][]string, content string, relays []string, resolvedRefs map[string]string, linkPreviews map[string]*LinkPreview, profiles map[string]*ProfileInfo, quotedEvents map[string]*Event, quotedEventProfiles map[string]*ProfileInfo) *HTMLEventItem {
 	npub, _ := encodeBech32Pubkey(pubkey)
 	kindDef := GetKindDefinition(kind)
+
+	// Check if the reposted event has a q tag (quote post)
+	// If so, strip the nostr reference from content and build the quoted event
+	processedContent := content
+	var quotedEvent *HTMLEventItem
+	var quotedEventID string
+
+	if kindDef.SupportsQuotePosts {
+		for _, tag := range tags {
+			if len(tag) >= 2 && tag[0] == "q" {
+				qTagValue := tag[1]
+				quotedEventID = qTagValue
+				// Strip the nostr reference from content since we'll render the quoted-note box
+				processedContent = stripQuotedNostrRef(content, qTagValue)
+				// Build the quoted event if we have it
+				if qev, ok := quotedEvents[qTagValue]; ok {
+					quotedEvent = buildQuotedEventItem(qev, quotedEventProfiles[qev.PubKey], relays, resolvedRefs, linkPreviews)
+				}
+				break
+			}
+		}
+	}
 
 	reposted := &HTMLEventItem{
 		ID:             id,
@@ -1282,17 +1607,25 @@ func buildRepostedEventItem(id, pubkey string, createdAt int64, kind int, tags [
 		Npub:           npub,
 		NpubShort:      formatNpubShort(npub),
 		CreatedAt:      createdAt,
-		Content:        content,
-		ContentHTML:    processContentToHTMLFull(content, relays, resolvedRefs, linkPreviews),
+		Content:        processedContent,
+		ContentHTML:    processContentToHTMLFull(processedContent, relays, resolvedRefs, linkPreviews),
 		AuthorProfile:  profiles[pubkey],
+		QuotedEvent:    quotedEvent,
+		QuotedEventID:  quotedEventID,
 	}
 
 	// Extract kind-specific metadata
 	if kindDef.ExtractImages {
-		reposted.ImagesHTML = extractImetaImages(tags)
+		reposted.ImagesHTML, reposted.ImageCount = extractImetaImages(tags)
 	}
 	if kindDef.ExtractTitle {
 		reposted.Title = extractTitle(tags)
+	}
+
+	// Extract content warning (NIP-36)
+	if util.HasTag(tags, "content-warning") {
+		reposted.HasContentWarning = true
+		reposted.ContentWarning = util.GetTagValue(tags, "content-warning")
 	}
 
 	return reposted
@@ -1578,12 +1911,13 @@ func formatClassifiedPrice(amount, currency, frequency string) string {
 
 // VideoInfo holds parsed data from a kind 22 short-form video event (NIP-71)
 type VideoInfo struct {
-	Title     string // From title tag
-	URL       string // Video URL from imeta tag
-	Thumbnail string // Thumbnail image from imeta tag (image field)
-	Duration  int    // Duration in seconds from imeta tag
-	Dimension string // Dimensions (e.g., "1080x1920") from imeta tag
-	MimeType  string // MIME type from imeta tag
+	Title     string   // From title tag
+	URL       string   // Video URL from imeta tag
+	Thumbnail string   // Thumbnail image from imeta tag (image field)
+	Duration  int      // Duration in seconds from imeta tag
+	Dimension string   // Dimensions (e.g., "1080x1920") from imeta tag
+	MimeType  string   // MIME type from imeta tag
+	Hashtags  []string // Hashtags from t tags
 }
 
 // parseVideo extracts video information from a kind 22 event's tags (NIP-71)
@@ -1598,6 +1932,8 @@ func parseVideo(tags [][]string) *VideoInfo {
 		switch tag[0] {
 		case "title":
 			info.Title = tag[1]
+		case "t":
+			info.Hashtags = append(info.Hashtags, tag[1])
 		case "imeta":
 			// Parse imeta tag fields (each field is "key value" format)
 			for _, field := range tag[1:] {
@@ -1642,7 +1978,7 @@ func processContentToHTMLFull(content string, relays []string, resolvedRefs map[
 	// Collapse multiple newlines before media URLs to just a single newline
 	content = mediaURLRegex.ReplaceAllString(content, "\n$2")
 
-	// Use placeholders for nostr: references to avoid URL regex matching their HTML
+	// Use placeholders for special references to avoid URL regex matching their HTML
 	type placeholder struct {
 		key   string
 		value string
@@ -1650,8 +1986,17 @@ func processContentToHTMLFull(content string, relays []string, resolvedRefs map[
 	var placeholders []placeholder
 	placeholderIndex := 0
 
-	// First, extract nostr: references and replace with placeholders (before escaping)
-	processedContent := nostrRefRegex.ReplaceAllStringFunc(content, func(match string) string {
+	// Process blossom: URIs and replace with placeholders (before escaping)
+	processedContent := blossomURIRegex.ReplaceAllStringFunc(content, func(match string) string {
+		rendered := renderBlossomLink(match)
+		key := fmt.Sprintf("\x00BLOSSOM_%d\x00", placeholderIndex)
+		placeholderIndex++
+		placeholders = append(placeholders, placeholder{key: key, value: rendered})
+		return key
+	})
+
+	// Extract nostr: references and replace with placeholders (before escaping)
+	processedContent = nostrRefRegex.ReplaceAllStringFunc(processedContent, func(match string) string {
 		identifier := strings.TrimPrefix(match, "nostr:")
 
 		var resolved string
@@ -1700,11 +2045,29 @@ func processContentToHTMLFull(content string, relays []string, resolvedRefs map[
 		}
 		if match := youtubeRegex.FindStringSubmatch(url); len(match) > 1 {
 			videoID := match[1]
-			return fmt.Sprintf(`<iframe class="youtube-embed" src="https://www.youtube-nocookie.com/embed/%s" allow="accelerometer; clipboard-write; encrypted-media; gyroscope; picture-in-picture" allowfullscreen></iframe>`, html.EscapeString(videoID)) + html.EscapeString(trailing)
+			return fmt.Sprintf(`<iframe class="youtube-embed" src="%s/%s" allow="accelerometer; clipboard-write; encrypted-media; gyroscope; picture-in-picture" allowfullscreen></iframe>`, util.YouTubeEmbedBaseURL, html.EscapeString(videoID)) + html.EscapeString(trailing)
 		}
 		if match := youtubePlaylistRegex.FindStringSubmatch(url); len(match) > 1 {
 			playlistID := match[1]
-			return fmt.Sprintf(`<iframe class="youtube-embed" src="https://www.youtube-nocookie.com/embed/videoseries?list=%s" allow="accelerometer; clipboard-write; encrypted-media; gyroscope; picture-in-picture" allowfullscreen></iframe>`, html.EscapeString(playlistID)) + html.EscapeString(trailing)
+			return fmt.Sprintf(`<iframe class="youtube-embed" src="%s/videoseries?list=%s" allow="accelerometer; clipboard-write; encrypted-media; gyroscope; picture-in-picture" allowfullscreen></iframe>`, util.YouTubeEmbedBaseURL, html.EscapeString(playlistID)) + html.EscapeString(trailing)
+		}
+		// Check for Wavlake track URLs and render native audio player
+		// Only tracks have NOM events; playlists/albums/artists fall through to link preview
+		if wavlakeURL := ParseWavlakeURL(url); wavlakeURL != nil && wavlakeURL.Type == WavlakeTypeTrack {
+			track, err := FetchWavlakeTrack(wavlakeURL)
+			if err != nil {
+				slog.Debug("wavlake fetch failed", "url", url, "id", wavlakeURL.ID, "error", err)
+			}
+			if err == nil && track.AudioURL != "" {
+				return renderWavlakePlayer(track) + html.EscapeString(trailing)
+			}
+			// Fallback to link if NOM fetch fails (don't block link preview)
+		}
+		// Check for downloadable file types (PDF, ZIP, etc.)
+		if fileExtRegex.MatchString(url) {
+			ext := extractFileExt(url)
+			icon := getFileIcon(ext)
+			return fmt.Sprintf(`<a href="%s" class="file-link" target="_blank" rel="noopener"><span class="file-icon">%s</span><span class="file-ext">%s</span></a>`, html.EscapeString(url), icon, html.EscapeString(ext)) + html.EscapeString(trailing)
 		}
 		// Check for link preview (try both cleaned and raw URL for cache lookup)
 		if linkPreviews != nil {
@@ -1752,9 +2115,40 @@ func renderLinkPreview(url string, preview *LinkPreview) string {
 		Description: desc,
 	}
 
-	var buf strings.Builder
-	if err := cachedLinkPreview.ExecuteTemplate(&buf, "link-preview", data); err != nil {
+	buf := getBuffer()
+	defer putBuffer(buf)
+	if err := cachedLinkPreview.ExecuteTemplate(buf, "link-preview", data); err != nil {
 		slog.Error("failed to render link preview", "error", err, "url", url)
+		return ""
+	}
+	return buf.String()
+}
+
+// WavlakePlayerData holds data for the Wavlake player template.
+type WavlakePlayerData struct {
+	Icon     string
+	Title    string
+	Creator  string
+	Duration string
+	AudioURL string
+	PageURL  string
+}
+
+// renderWavlakePlayer creates an HTML audio player for a Wavlake track
+func renderWavlakePlayer(track *WavlakeTrack) string {
+	data := WavlakePlayerData{
+		Icon:     GetWavlakeIcon(track.ContentType),
+		Title:    track.Title,
+		Creator:  track.Creator,
+		Duration: FormatDuration(track.Duration),
+		AudioURL: track.AudioURL,
+		PageURL:  track.PageURL,
+	}
+
+	buf := getBuffer()
+	defer putBuffer(buf)
+	if err := cachedWavlakePlayer.ExecuteTemplate(buf, "wavlake-player", data); err != nil {
+		slog.Error("failed to render wavlake player", "error", err, "track", track.ID)
 		return ""
 	}
 	return buf.String()
@@ -1780,7 +2174,7 @@ func ExtractMentionedPubkeys(contents []string) []string {
 					pubkey = pk
 				}
 			} else if strings.HasPrefix(identifier, "nprofile1") {
-				np, err := DecodeNProfile(identifier)
+				np, err := nips.DecodeNProfile(identifier)
 				if err == nil {
 					pubkey = np.Pubkey
 				}
@@ -1833,16 +2227,16 @@ func parseQuotedRef(qTagValue string) QuotedRef {
 
 	switch {
 	case strings.HasPrefix(qTagValue, "naddr1"):
-		if na, err := DecodeNAddr(qTagValue); err == nil {
+		if na, err := nips.DecodeNAddr(qTagValue); err == nil {
 			ref.IsNAddr = true
 			ref.ATag = fmt.Sprintf("%d:%s:%s", na.Kind, na.Author, na.DTag)
 		}
 	case strings.HasPrefix(qTagValue, "nevent1"):
-		if ne, err := DecodeNEvent(qTagValue); err == nil {
+		if ne, err := nips.DecodeNEvent(qTagValue); err == nil {
 			ref.EventID = ne.EventID
 		}
 	case strings.HasPrefix(qTagValue, "note1"):
-		if id, err := DecodeNote(qTagValue); err == nil {
+		if id, err := nips.DecodeNote(qTagValue); err == nil {
 			ref.EventID = id
 		}
 	default:
@@ -1866,7 +2260,7 @@ func parseQuotedRef(qTagValue string) QuotedRef {
 
 // fetchQuotedEvents fetches quoted events from q tags, handling both regular event IDs and naddr references
 // Returns maps keyed by the original q tag value for easy lookup
-// Note: Uses defaultRelays (aggregators) since quoted events can reference events from anywhere on Nostr
+// Uses outbox model when author is known (from nevent/naddr), plus relay hints and default relays
 func fetchQuotedEvents(qTagValues []string) (map[string]*Event, map[string]*ProfileInfo) {
 	quotedEvents := make(map[string]*Event)
 	quotedEventProfiles := make(map[string]*ProfileInfo)
@@ -1875,14 +2269,46 @@ func fetchQuotedEvents(qTagValues []string) (map[string]*Event, map[string]*Prof
 		return quotedEvents, quotedEventProfiles
 	}
 
-	// Use defaultRelays (aggregators) for quoted events since they can reference any event
-	relays := ConfigGetDefaultRelays()
+	// Collect relay hints and author pubkeys from nevent/naddr q tags
+	var hintRelays []string
+	authorPubkeys := make(map[string]bool)
+	for _, qVal := range qTagValues {
+		if strings.HasPrefix(qVal, "nevent1") {
+			if ne, err := nips.DecodeNEvent(qVal); err == nil {
+				if len(ne.RelayHints) > 0 {
+					hintRelays = append(hintRelays, ne.RelayHints...)
+				}
+				if ne.Author != "" {
+					authorPubkeys[ne.Author] = true
+				}
+			}
+		} else if strings.HasPrefix(qVal, "naddr1") {
+			if na, err := nips.DecodeNAddr(qVal); err == nil {
+				if len(na.RelayHints) > 0 {
+					hintRelays = append(hintRelays, na.RelayHints...)
+				}
+				if na.Author != "" {
+					authorPubkeys[na.Author] = true
+				}
+			}
+		}
+	}
+
+	// Fetch relay lists for known authors (outbox model)
+	outboxRelays := buildOutboxRelays(util.MapKeys(authorPubkeys), 2)
+	if len(outboxRelays) > 0 {
+		slog.Debug("using outbox for quoted events", "authors", len(authorPubkeys), "outbox_relays", len(outboxRelays))
+	}
+
+	// Combine outbox relays, hint relays, and default relays (outbox first for priority)
+	relays := append(outboxRelays, hintRelays...)
+	relays = append(relays, config.GetDefaultRelays()...)
 
 	// Parse all q tag values and categorize them
-	var eventIDs []string
-	var aTags []string
-	refsByEventID := make(map[string][]string)  // eventID -> original q tag values
-	refsByATag := make(map[string][]string)     // aTag -> original q tag values
+	eventIDs := make([]string, 0, len(qTagValues))
+	aTags := make([]string, 0, len(qTagValues))
+	refsByEventID := make(map[string][]string, len(qTagValues)) // eventID -> original q tag values
+	refsByATag := make(map[string][]string, len(qTagValues))    // aTag -> original q tag values
 
 	for _, qVal := range qTagValues {
 		ref := parseQuotedRef(qVal)
@@ -1895,7 +2321,7 @@ func fetchQuotedEvents(qTagValues []string) (map[string]*Event, map[string]*Prof
 		}
 	}
 
-	pubkeys := make(map[string]bool)
+	pubkeys := make(map[string]bool, len(qTagValues))
 
 	// Fetch regular events by ID
 	if len(eventIDs) > 0 {
@@ -1959,11 +2385,7 @@ func fetchQuotedEvents(qTagValues []string) (map[string]*Event, map[string]*Prof
 
 	// Fetch profiles for quoted event authors
 	if len(pubkeys) > 0 {
-		pks := make([]string, 0, len(pubkeys))
-		for pk := range pubkeys {
-			pks = append(pks, pk)
-		}
-		quotedEventProfiles = fetchProfiles(ConfigGetProfileRelays(), pks)
+		quotedEventProfiles = fetchProfiles(config.GetProfileRelays(), util.MapKeys(pubkeys))
 	}
 
 	return quotedEvents, quotedEventProfiles
@@ -1998,7 +2420,13 @@ func buildQuotedEventItem(ev *Event, profile *ProfileInfo, relays []string, reso
 		item.HeaderImage = extractHeaderImage(ev.Tags)
 	}
 	if kindDef.ExtractImages {
-		item.ImagesHTML = extractImetaImages(ev.Tags)
+		item.ImagesHTML, item.ImageCount = extractImetaImages(ev.Tags)
+	}
+
+	// Extract content warning (NIP-36)
+	if util.HasTag(ev.Tags, "content-warning") {
+		item.HasContentWarning = true
+		item.ContentWarning = util.GetTagValue(ev.Tags, "content-warning")
 	}
 
 	return item
@@ -2018,19 +2446,19 @@ func stripQuotedNostrRef(content string, quotedRef string) string {
 
 		// Check if this reference matches our quoted event
 		if strings.HasPrefix(identifier, "nevent1") {
-			if ne, err := DecodeNEvent(identifier); err == nil {
+			if ne, err := nips.DecodeNEvent(identifier); err == nil {
 				if ne.EventID == qRef.EventID {
 					return ""
 				}
 			}
 		} else if strings.HasPrefix(identifier, "note1") {
-			if id, err := DecodeNote(identifier); err == nil {
+			if id, err := nips.DecodeNote(identifier); err == nil {
 				if id == qRef.EventID {
 					return ""
 				}
 			}
 		} else if strings.HasPrefix(identifier, "naddr1") {
-			if na, err := DecodeNAddr(identifier); err == nil {
+			if na, err := nips.DecodeNAddr(identifier); err == nil {
 				aTag := fmt.Sprintf("%d:%s:%s", na.Kind, na.Author, na.DTag)
 				// Compare full a-tag if d-tag present, otherwise compare kind:author prefix
 				if aTag == qRef.ATag {
@@ -2055,35 +2483,37 @@ func stripQuotedNostrRef(content string, quotedRef string) string {
 func nostrRefToLink(identifier string) string {
 	switch {
 	case strings.HasPrefix(identifier, "nevent1"):
-		if ne, err := DecodeNEvent(identifier); err == nil {
-			return fmt.Sprintf(`<a href="/html/thread/%s" class="nostr-ref nostr-ref-event">View quoted note →</a>`,
-				html.EscapeString(ne.EventID))
+		// Keep original nevent1 - thread handler accepts it directly
+		if _, err := nips.DecodeNEvent(identifier); err == nil {
+			return fmt.Sprintf(`<a href="/thread/%s" class="nostr-ref nostr-ref-event">View quoted note →</a>`,
+				html.EscapeString(identifier))
 		}
 	case strings.HasPrefix(identifier, "note1"):
-		if eventID, err := DecodeNote(identifier); err == nil {
-			return fmt.Sprintf(`<a href="/html/thread/%s" class="nostr-ref nostr-ref-event">View quoted note →</a>`,
-				html.EscapeString(eventID))
+		// Keep original note1 - thread handler accepts it directly
+		if _, err := nips.DecodeNote(identifier); err == nil {
+			return fmt.Sprintf(`<a href="/thread/%s" class="nostr-ref nostr-ref-event">View quoted note →</a>`,
+				html.EscapeString(identifier))
 		}
 	case strings.HasPrefix(identifier, "nprofile1"):
-		if np, err := DecodeNProfile(identifier); err == nil {
+		if np, err := nips.DecodeNProfile(identifier); err == nil {
 			username := getCachedUsername(np.Pubkey)
-			return fmt.Sprintf(`<a href="/html/profile/%s" class="nostr-ref nostr-ref-profile">%s</a>`,
+			return fmt.Sprintf(`<a href="/profile/%s" class="nostr-ref nostr-ref-profile">%s</a>`,
 				html.EscapeString(np.Pubkey), html.EscapeString(username))
 		}
 	case strings.HasPrefix(identifier, "npub1"):
 		if pubkey, err := decodeBech32Pubkey(identifier); err == nil {
 			username := getCachedUsername(pubkey)
-			return fmt.Sprintf(`<a href="/html/profile/%s" class="nostr-ref nostr-ref-profile">%s</a>`,
+			return fmt.Sprintf(`<a href="/profile/%s" class="nostr-ref nostr-ref-profile">%s</a>`,
 				html.EscapeString(pubkey), html.EscapeString(username))
 		}
 	case strings.HasPrefix(identifier, "naddr1"):
 		// naddr references replaceable events (often long-form articles)
-		if na, err := DecodeNAddr(identifier); err == nil {
+		if na, err := nips.DecodeNAddr(identifier); err == nil {
 			// Determine content type label from kind registry
 			kindDef := GetKindDefinition(int(na.Kind))
 			label := "View " + kindDef.Label() + " →"
 			// Link directly to thread with naddr - handler will decode and fetch
-			return fmt.Sprintf(`<a href="/html/thread/%s" class="nostr-ref nostr-ref-addr" title="kind:%d">%s</a>`,
+			return fmt.Sprintf(`<a href="/thread/%s" class="nostr-ref nostr-ref-addr" title="kind:%d">%s</a>`,
 				html.EscapeString(identifier), na.Kind, label)
 		}
 	}
@@ -2139,16 +2569,30 @@ func computeKindFilter(kinds []int) string {
 	return "all" // Unknown filter pattern, default to all
 }
 
-func renderHTML(resp TimelineResponse, relays []string, authors []string, kinds []int, limit int, session *BunkerSession, errorMsg, successMsg string, feedMode string, currentURL string, themeClass, themeLabel string, csrfToken string, hasUnreadNotifs bool, isFragment bool, isAppend bool, newestTimestamp int64, repostEvents map[string]*Event) (string, error) {
+func renderHTML(resp TimelineResponse, relays []string, authors []string, kinds []int, limit int, session *BunkerSession, errorMsg, successMsg string, feedMode string, currentURL string, themeClass, themeLabel string, csrfToken string, hasUnreadNotifs bool, isFragment bool, isAppend bool, newestTimestamp int64, repostEvents map[string]*Event, dvmMetadata *DVMMetadata) (string, error) {
 	// Pre-fetch all nostr: references in parallel for much faster rendering
-	contents := make([]string, len(resp.Items))
-	for i, item := range resp.Items {
-		contents[i] = item.Content
+	// Include embedded content from reposts so mentions inside reposted notes get resolved
+	contents := make([]string, 0, len(resp.Items)*2)
+	for _, item := range resp.Items {
+		contents = append(contents, item.Content)
+		// For reposts (kind 6, 16), also include embedded JSON content
+		kindDef := GetKindDefinition(item.Kind)
+		if kindDef.IsRepost && item.Content != "" {
+			if embeddedContent := util.ExtractEmbeddedEventContent(item.Content); embeddedContent != "" {
+				contents = append(contents, embeddedContent)
+			}
+		}
+	}
+	// Also include content from pre-fetched repost events (for reference-only reposts)
+	for _, evt := range repostEvents {
+		if evt != nil && evt.Content != "" {
+			contents = append(contents, evt.Content)
+		}
 	}
 	nostrRefs := extractNostrRefs(contents)
 	resolvedRefs := batchResolveNostrRefs(nostrRefs, relays)
 
-	// Pre-fetch link previews for all URLs
+	// Pre-fetch link previews for all URLs (contents already includes embedded repost content)
 	var allURLs []string
 	for _, content := range contents {
 		allURLs = append(allURLs, ExtractPreviewableURLs(content)...)
@@ -2171,15 +2615,34 @@ func renderHTML(resp TimelineResponse, relays []string, authors []string, kinds 
 	}
 	var liveParticipantProfiles map[string]*ProfileInfo
 	if len(liveParticipantPubkeys) > 0 {
-		pubkeys := make([]string, 0, len(liveParticipantPubkeys))
-		for pk := range liveParticipantPubkeys {
-			pubkeys = append(pubkeys, pk)
-		}
 		// Fetch from profile relays for better profile coverage
-		liveParticipantProfiles = fetchProfiles(ConfigGetProfileRelays(), pubkeys)
+		liveParticipantProfiles = fetchProfiles(config.GetProfileRelays(), util.MapKeys(liveParticipantPubkeys))
 	}
 
-	// Build profiles map for kind processing context (combines author and participant profiles)
+	// Pre-fetch profiles for reposted event authors
+	// These are different from the reposter - they're the original note authors
+	repostAuthorPubkeys := make(map[string]bool)
+	for _, item := range resp.Items {
+		kindDef := GetKindDefinition(item.Kind)
+		if kindDef.IsRepost && item.Content != "" {
+			// Extract pubkey from embedded JSON
+			if embeddedPubkey := util.ExtractEmbeddedEventPubkey(item.Content); embeddedPubkey != "" {
+				repostAuthorPubkeys[embeddedPubkey] = true
+			}
+		}
+	}
+	// Also collect pubkeys from pre-fetched repost events (for reference-only reposts)
+	for _, evt := range repostEvents {
+		if evt != nil {
+			repostAuthorPubkeys[evt.PubKey] = true
+		}
+	}
+	var repostAuthorProfiles map[string]*ProfileInfo
+	if len(repostAuthorPubkeys) > 0 {
+		repostAuthorProfiles = fetchProfiles(config.GetProfileRelays(), util.MapKeys(repostAuthorPubkeys))
+	}
+
+	// Build profiles map for kind processing context (combines author, participant, and repost author profiles)
 	allProfiles := make(map[string]*ProfileInfo)
 	for _, it := range resp.Items {
 		if it.AuthorProfile != nil {
@@ -2187,6 +2650,9 @@ func renderHTML(resp TimelineResponse, relays []string, authors []string, kinds 
 		}
 	}
 	for pk, profile := range liveParticipantProfiles {
+		allProfiles[pk] = profile
+	}
+	for pk, profile := range repostAuthorProfiles {
 		allProfiles[pk] = profile
 	}
 
@@ -2200,6 +2666,28 @@ func renderHTML(resp TimelineResponse, relays []string, authors []string, kinds 
 				if len(tag) >= 2 && tag[0] == "q" {
 					qTagValues = append(qTagValues, tag[1])
 					break // Only one q tag per event
+				}
+			}
+		}
+		// Also collect q tags from embedded repost content
+		if itemKindDef.IsRepost && item.Content != "" {
+			if embeddedTags := util.ExtractEmbeddedEventTags(item.Content); embeddedTags != nil {
+				for _, tag := range embeddedTags {
+					if len(tag) >= 2 && tag[0] == "q" {
+						qTagValues = append(qTagValues, tag[1])
+						break
+					}
+				}
+			}
+		}
+	}
+	// Also collect q tags from pre-fetched repost events (for reference-only reposts)
+	for _, evt := range repostEvents {
+		if evt != nil {
+			for _, tag := range evt.Tags {
+				if len(tag) >= 2 && tag[0] == "q" {
+					qTagValues = append(qTagValues, tag[1])
+					break
 				}
 			}
 		}
@@ -2232,6 +2720,7 @@ func renderHTML(resp TimelineResponse, relays []string, authors []string, kinds 
 			RelaysSeen:     item.RelaysSeen,
 			Links:          []string{},
 			AuthorProfile:  item.AuthorProfile,
+			ProfileMissing: item.AuthorProfile == nil,
 			Reactions:      item.Reactions,
 			ReplyCount:     item.ReplyCount,
 		}
@@ -2245,9 +2734,15 @@ func renderHTML(resp TimelineResponse, relays []string, authors []string, kinds 
 			items[i].IsMuted = session.IsPubkeyMuted(item.Pubkey)
 		}
 
+		// Extract content warning (NIP-36)
+		if util.HasTag(item.Tags, "content-warning") {
+			items[i].HasContentWarning = true
+			items[i].ContentWarning = util.GetTagValue(item.Tags, "content-warning")
+		}
+
 		// Extract kind-specific metadata using KindDefinition hints
 		if kindDef.ExtractImages {
-			items[i].ImagesHTML = extractImetaImages(item.Tags)
+			items[i].ImagesHTML, items[i].ImageCount = extractImetaImages(item.Tags)
 		}
 		if kindDef.ExtractTitle {
 			items[i].Title = extractTitle(item.Tags)
@@ -2261,17 +2756,15 @@ func renderHTML(resp TimelineResponse, relays []string, authors []string, kinds 
 		if kindDef.RenderMarkdown {
 			items[i].ContentHTML = renderMarkdown(item.Content)
 		}
+		// Extract d-tag for addressable events (kind 30xxx)
+		if kindDef.IsAddressable {
+			items[i].DTag = util.GetTagValue(item.Tags, "d")
+		}
 
 		// Parse embedded event for reposts (handles both embedded JSON and reference-only reposts)
 		if kindDef.IsRepost {
-			// Build profiles map from response items for reposted author lookup
-			profilesMap := make(map[string]*ProfileInfo)
-			for _, it := range resp.Items {
-				if it.AuthorProfile != nil {
-					profilesMap[it.Pubkey] = it.AuthorProfile
-				}
-			}
-			items[i].RepostedEvent = parseRepostedEvent(item.Content, item.Tags, relays, resolvedRefs, linkPreviews, profilesMap, repostEvents)
+			// Use allProfiles which includes repost author profiles fetched earlier
+			items[i].RepostedEvent = parseRepostedEvent(item.Content, item.Tags, relays, resolvedRefs, linkPreviews, allProfiles, repostEvents, quotedEvents, quotedEventProfiles)
 			// Check if logged-in user has bookmarked, reacted, reposted, or muted the reposted event's author
 			if items[i].RepostedEvent != nil && session != nil && session.Connected {
 				items[i].RepostedEvent.IsBookmarked = session.IsEventBookmarked(items[i].RepostedEvent.ID)
@@ -2310,9 +2803,27 @@ func renderHTML(resp TimelineResponse, relays []string, authors []string, kinds 
 		// Add thread link if reply
 		for _, tag := range item.Tags {
 			if len(tag) >= 2 && tag[0] == "e" {
-				items[i].Links = append(items[i].Links, fmt.Sprintf("/html/threads/%s", tag[1]))
+				items[i].Links = append(items[i].Links, fmt.Sprintf("/threads/%s", tag[1]))
 				break
 			}
+		}
+
+		// Fetch handlers for unknown kinds (NIP-89)
+		if items[i].RenderTemplate == "render-default" {
+			var follows []string
+			if session != nil {
+				session.mu.Lock()
+				follows = session.FollowingPubkeys
+				session.mu.Unlock()
+			}
+			ctx := HandlerURLContext{
+				EventID:    item.ID,
+				AuthorHex:  item.Pubkey,
+				Kind:       item.Kind,
+				DTag:       items[i].DTag,
+				RelayHints: relays,
+			}
+			items[i].Handlers = getHandlersForEvent(relays, ctx, follows)
 		}
 	}
 
@@ -2323,39 +2834,14 @@ func renderHTML(resp TimelineResponse, relays []string, authors []string, kinds 
 	if loggedIn {
 		userPubkeyHex = hex.EncodeToString(session.UserPubKey)
 	}
-	loginURL := "/html/login?return_url=" + currentURL
+	loginURL := util.BuildURL("/login", map[string]string{"return_url": currentURL})
 
 	for i := range items {
 		item := &items[i]
 
-		// For reposts (kind 6), actions target the reposted event
-		var targetID, targetPubkey string
-		var targetKind int
-		var targetReplyCount int
-		var targetIsBookmarked, targetIsReacted, targetIsReposted, targetIsZapped, targetIsMuted bool
-
+		// Actions always target the item itself, not embedded content
+		// This ensures Reply goes to the repost's thread, not the original's thread
 		itemKindDef := GetKindDefinition(item.Kind)
-		if itemKindDef.IsRepost && item.RepostedEvent != nil {
-			targetID = item.RepostedEvent.ID
-			targetPubkey = item.RepostedEvent.Pubkey
-			targetKind = item.RepostedEvent.Kind
-			targetReplyCount = item.RepostedEvent.ReplyCount
-			targetIsBookmarked = item.RepostedEvent.IsBookmarked
-			targetIsReacted = item.RepostedEvent.IsReacted
-			targetIsReposted = item.RepostedEvent.IsReposted
-			targetIsZapped = item.RepostedEvent.IsZapped
-			targetIsMuted = item.RepostedEvent.IsMuted
-		} else {
-			targetID = item.ID
-			targetPubkey = item.Pubkey
-			targetKind = item.Kind
-			targetReplyCount = item.ReplyCount
-			targetIsBookmarked = item.IsBookmarked
-			targetIsReacted = item.IsReacted
-			targetIsReposted = item.IsReposted
-			targetIsZapped = item.IsZapped
-			targetIsMuted = item.IsMuted
-		}
 
 		// Get reaction count from summary
 		var targetReactionCount int
@@ -2366,19 +2852,20 @@ func renderHTML(resp TimelineResponse, relays []string, authors []string, kinds 
 		}
 
 		ctx := ActionContext{
-			EventID:       targetID,
-			EventPubkey:   targetPubkey,
-			Kind:          targetKind,
-			IsBookmarked:  targetIsBookmarked,
-			IsReacted:     targetIsReacted,
-			IsReposted:    targetIsReposted,
-			IsZapped:      targetIsZapped,
-			IsMuted:       targetIsMuted,
-			ReplyCount:    targetReplyCount,
+			EventID:       item.ID,
+			EventPubkey:   item.Pubkey,
+			Kind:          item.Kind,
+			DTag:          item.DTag,
+			IsBookmarked:  item.IsBookmarked,
+			IsReacted:     item.IsReacted,
+			IsReposted:    item.IsReposted,
+			IsZapped:      item.IsZapped,
+			IsMuted:       item.IsMuted,
+			ReplyCount:    item.ReplyCount,
 			ReactionCount: targetReactionCount,
 			LoggedIn:      loggedIn,
 			HasWallet:     hasWallet,
-			IsAuthor:      loggedIn && targetPubkey == userPubkeyHex,
+			IsAuthor:      loggedIn && item.Pubkey == userPubkeyHex,
 			CSRFToken:     csrfToken,
 			ReturnURL:     currentURL,
 			LoginURL:      loginURL,
@@ -2399,6 +2886,7 @@ func renderHTML(resp TimelineResponse, relays []string, authors []string, kinds 
 				EventID:       item.RepostedEvent.ID,
 				EventPubkey:   item.RepostedEvent.Pubkey,
 				Kind:          item.RepostedEvent.Kind,
+				DTag:          item.RepostedEvent.DTag,
 				IsBookmarked:  item.RepostedEvent.IsBookmarked,
 				IsReacted:     item.RepostedEvent.IsReacted,
 				IsReposted:    item.RepostedEvent.IsReposted,
@@ -2448,10 +2936,11 @@ func renderHTML(resp TimelineResponse, relays []string, authors []string, kinds 
 		ThemeLabel:          themeLabel,
 		CSRFToken:           csrfToken,
 		NewestTimestamp:     newestTimestamp,
+		DVMMetadata:         dvmMetadata,
 	}
 
 	// Add session info if logged in
-	var userAvatarURL string
+	var userAvatarURL, userNpub string
 	if session != nil && session.Connected {
 		data.LoggedIn = true
 		pubkeyHex := hex.EncodeToString(session.UserPubKey)
@@ -2459,12 +2948,14 @@ func renderHTML(resp TimelineResponse, relays []string, authors []string, kinds 
 		data.UserDisplayName = getUserDisplayName(pubkeyHex)
 		data.HasUnreadNotifications = hasUnreadNotifs
 		userAvatarURL = getUserAvatarURL(pubkeyHex)
+		userNpub, _ = encodeBech32Pubkey(pubkeyHex)
 	}
 
 	// Build navigation (NATEOAS)
 	data.FeedModes = GetFeedModes(FeedModeContext{
 		LoggedIn:    data.LoggedIn,
 		ActiveFeed:  feedMode,
+		ActiveKinds: kindsStr,
 		CurrentPage: "timeline",
 	})
 	data.NavItems = GetNavItems(NavContext{
@@ -2483,25 +2974,27 @@ func renderHTML(resp TimelineResponse, relays []string, authors []string, kinds 
 		FeedMode:      feedMode,
 		KindFilter:    kindsStr,
 		UserAvatarURL: userAvatarURL,
+		UserNpub:      userNpub,
 	}
 	data.SettingsItems = GetSettingsItems(settingsCtx)
 	data.SettingsToggle = GetSettingsToggle(settingsCtx)
 
 	// Use cached template for better performance
-	var buf strings.Builder
+	buf := getBuffer()
+	defer putBuffer(buf)
 	if isAppend {
 		// HelmJS "Load More" request: render items + updated pagination for append
-		if err := cachedAppendFragment.ExecuteTemplate(&buf, tmplAppendFragment, data); err != nil {
+		if err := cachedAppendFragment.ExecuteTemplate(buf, tmplAppendFragment, data); err != nil {
 			return "", err
 		}
 	} else if isFragment {
 		// HelmJS request: render just the content fragment
-		if err := cachedTimelineFragment.ExecuteTemplate(&buf, tmplFragment, data); err != nil {
+		if err := cachedTimelineFragment.ExecuteTemplate(buf, tmplFragment, data); err != nil {
 			return "", err
 		}
 	} else {
 		// Full page request: render with base template
-		if err := cachedHTMLTemplate.ExecuteTemplate(&buf, tmplBase, data); err != nil {
+		if err := cachedHTMLTemplate.ExecuteTemplate(buf, tmplBase, data); err != nil {
 			return "", err
 		}
 	}
@@ -2667,6 +3160,8 @@ type HTMLThreadData struct {
 	Root                   *HTMLEventItem
 	ReplyGroups            []ReplyGroup // Two-level nested replies
 	TotalReplyCount        int          // Total number of replies across all groups
+	CachedAt               int64        // Cache timestamp for stale-while-revalidate polling
+	Identifier             string       // Original identifier (note1, nevent1, hex) for polling URLs
 	LoggedIn               bool
 	UserPubKey             string
 	UserDisplayName        string
@@ -2708,27 +3203,86 @@ func extractParentID(tags [][]string) string {
 	return parentID
 }
 
-func renderThreadHTML(resp ThreadResponse, relays []string, session *BunkerSession, currentURL string, themeClass, themeLabel, successMsg, csrfToken string, hasUnreadNotifs bool, isFragment bool, repostEvents map[string]*Event) (string, error) {
+func renderThreadHTML(resp ThreadResponse, relays []string, session *BunkerSession, currentURL string, identifier string, themeClass, themeLabel, successMsg, csrfToken string, hasUnreadNotifs bool, isFragment bool, repostEvents map[string]*Event) (string, error) {
 	// Pre-fetch all nostr: references in parallel for much faster rendering
-	contents := make([]string, 1+len(resp.Replies))
-	contents[0] = resp.Root.Content
-	for i, item := range resp.Replies {
-		contents[i+1] = item.Content
+	// Include embedded content from reposts so mentions inside reposted notes get resolved
+	contents := make([]string, 0, 1+len(resp.Replies)*2)
+	contents = append(contents, resp.Root.Content)
+	// If root is a repost, include embedded content
+	rootKindDef := GetKindDefinition(resp.Root.Kind)
+	if rootKindDef.IsRepost && resp.Root.Content != "" {
+		if embeddedContent := util.ExtractEmbeddedEventContent(resp.Root.Content); embeddedContent != "" {
+			contents = append(contents, embeddedContent)
+		}
+	}
+	for _, item := range resp.Replies {
+		contents = append(contents, item.Content)
+		// If reply is a repost, include embedded content
+		replyKindDef := GetKindDefinition(item.Kind)
+		if replyKindDef.IsRepost && item.Content != "" {
+			if embeddedContent := util.ExtractEmbeddedEventContent(item.Content); embeddedContent != "" {
+				contents = append(contents, embeddedContent)
+			}
+		}
+	}
+	// Also include content from pre-fetched repost events (for reference-only reposts)
+	for _, evt := range repostEvents {
+		if evt != nil && evt.Content != "" {
+			contents = append(contents, evt.Content)
+		}
 	}
 	nostrRefs := extractNostrRefs(contents)
 	resolvedRefs := batchResolveNostrRefs(nostrRefs, relays)
 
-	// Pre-fetch link previews for all URLs
+	// Pre-fetch link previews for all URLs (contents already includes embedded repost content)
 	var allURLs []string
 	for _, content := range contents {
 		allURLs = append(allURLs, ExtractPreviewableURLs(content)...)
 	}
 	linkPreviews := FetchLinkPreviews(allURLs)
 
+	// Pre-fetch profiles for reposted event authors
+	repostAuthorPubkeys := make(map[string]bool)
+	if rootKindDef.IsRepost && resp.Root.Content != "" {
+		if embeddedPubkey := util.ExtractEmbeddedEventPubkey(resp.Root.Content); embeddedPubkey != "" {
+			repostAuthorPubkeys[embeddedPubkey] = true
+		}
+	}
+	for _, item := range resp.Replies {
+		replyKindDef := GetKindDefinition(item.Kind)
+		if replyKindDef.IsRepost && item.Content != "" {
+			if embeddedPubkey := util.ExtractEmbeddedEventPubkey(item.Content); embeddedPubkey != "" {
+				repostAuthorPubkeys[embeddedPubkey] = true
+			}
+		}
+	}
+	for _, evt := range repostEvents {
+		if evt != nil {
+			repostAuthorPubkeys[evt.PubKey] = true
+		}
+	}
+	var repostAuthorProfiles map[string]*ProfileInfo
+	if len(repostAuthorPubkeys) > 0 {
+		repostAuthorProfiles = fetchProfiles(config.GetProfileRelays(), util.MapKeys(repostAuthorPubkeys))
+	}
+
+	// Build combined profiles map (includes thread participants and repost authors)
+	allProfiles := make(map[string]*ProfileInfo)
+	if resp.Root.AuthorProfile != nil {
+		allProfiles[resp.Root.Pubkey] = resp.Root.AuthorProfile
+	}
+	for _, item := range resp.Replies {
+		if item.AuthorProfile != nil {
+			allProfiles[item.Pubkey] = item.AuthorProfile
+		}
+	}
+	for pk, profile := range repostAuthorProfiles {
+		allProfiles[pk] = profile
+	}
+
 	// Collect q tags for quote post processing (kinds that support quote posts)
 	// q tags can be hex IDs, note1, nevent1, naddr1, or raw a-tag format (kind:pubkey:d-tag)
 	var qTagValues []string
-	rootKindDef := GetKindDefinition(resp.Root.Kind)
 	if rootKindDef.SupportsQuotePosts {
 		for _, tag := range resp.Root.Tags {
 			if len(tag) >= 2 && tag[0] == "q" {
@@ -2768,6 +3322,7 @@ func renderThreadHTML(resp ThreadResponse, relays []string, session *BunkerSessi
 		ContentHTML:    processContentToHTMLFull(resp.Root.Content, relays, resolvedRefs, linkPreviews),
 		RelaysSeen:     resp.Root.RelaysSeen,
 		AuthorProfile:  resp.Root.AuthorProfile,
+		ProfileMissing: resp.Root.AuthorProfile == nil,
 		ReplyCount:     resp.Root.ReplyCount,
 		ParentID:       extractParentID(resp.Root.Tags),
 	}
@@ -2781,6 +3336,12 @@ func renderThreadHTML(resp ThreadResponse, relays []string, session *BunkerSessi
 		root.IsMuted = session.IsPubkeyMuted(resp.Root.Pubkey)
 	}
 
+	// Extract content warning (NIP-36)
+	if util.HasTag(resp.Root.Tags, "content-warning") {
+		root.HasContentWarning = true
+		root.ContentWarning = util.GetTagValue(resp.Root.Tags, "content-warning")
+	}
+
 	// Extract kind-specific metadata using KindDefinition
 	if rootKindDef.ExtractTitle {
 		root.Title = extractTitle(resp.Root.Tags)
@@ -2792,6 +3353,10 @@ func renderThreadHTML(resp ThreadResponse, relays []string, session *BunkerSessi
 	}
 	if rootKindDef.RenderMarkdown {
 		root.ContentHTML = renderMarkdown(resp.Root.Content)
+	}
+	// Extract d-tag for addressable events (kind 30xxx)
+	if rootKindDef.IsAddressable {
+		root.DTag = util.GetTagValue(resp.Root.Tags, "d")
 	}
 
 	// Handle quote posts for root event (kinds that support q tags)
@@ -2814,17 +3379,8 @@ func renderThreadHTML(resp ThreadResponse, relays []string, session *BunkerSessi
 
 	// Handle reposts for root event (kind 6) - both embedded JSON and reference-only
 	if rootKindDef.IsRepost {
-		// Build profiles map from response items for reposted author lookup
-		profilesMap := make(map[string]*ProfileInfo)
-		if resp.Root.AuthorProfile != nil {
-			profilesMap[resp.Root.Pubkey] = resp.Root.AuthorProfile
-		}
-		for _, item := range resp.Replies {
-			if item.AuthorProfile != nil {
-				profilesMap[item.Pubkey] = item.AuthorProfile
-			}
-		}
-		root.RepostedEvent = parseRepostedEvent(resp.Root.Content, resp.Root.Tags, relays, resolvedRefs, linkPreviews, profilesMap, repostEvents)
+		// Use allProfiles which includes repost author profiles fetched earlier
+		root.RepostedEvent = parseRepostedEvent(resp.Root.Content, resp.Root.Tags, relays, resolvedRefs, linkPreviews, allProfiles, repostEvents, quotedEvents, quotedEventProfiles)
 		// Check if logged-in user has bookmarked, reacted, reposted, or muted the reposted event's author
 		if root.RepostedEvent != nil && session != nil && session.Connected {
 			root.RepostedEvent.IsBookmarked = session.IsEventBookmarked(root.RepostedEvent.ID)
@@ -2878,6 +3434,7 @@ func renderThreadHTML(resp ThreadResponse, relays []string, session *BunkerSessi
 			ContentHTML:    processContentToHTMLFull(item.Content, relays, resolvedRefs, linkPreviews),
 			RelaysSeen:     item.RelaysSeen,
 			AuthorProfile:  item.AuthorProfile,
+			ProfileMissing: item.AuthorProfile == nil,
 			ReplyCount:     item.ReplyCount,
 			ParentID:       parentID,
 		}
@@ -2910,6 +3467,12 @@ func renderThreadHTML(resp ThreadResponse, relays []string, session *BunkerSessi
 			replies[i].IsMuted = session.IsPubkeyMuted(item.Pubkey)
 		}
 
+		// Extract content warning (NIP-36)
+		if util.HasTag(item.Tags, "content-warning") {
+			replies[i].HasContentWarning = true
+			replies[i].ContentWarning = util.GetTagValue(item.Tags, "content-warning")
+		}
+
 		// Handle quote posts for replies (kinds that support q tags)
 		itemKindDef := GetKindDefinition(item.Kind)
 		if itemKindDef.SupportsQuotePosts {
@@ -2937,7 +3500,7 @@ func renderThreadHTML(resp ThreadResponse, relays []string, session *BunkerSessi
 	if loggedIn {
 		userPubkeyHex = hex.EncodeToString(session.UserPubKey)
 	}
-	loginURL := "/html/login?return_url=" + currentURL
+	loginURL := util.BuildURL("/login", map[string]string{"return_url": currentURL})
 
 	// Actions for root event (thread view doesn't show reply action since there's a reply form)
 	var rootReactionCount int
@@ -2948,6 +3511,7 @@ func renderThreadHTML(resp ThreadResponse, relays []string, session *BunkerSessi
 		EventID:       root.ID,
 		EventPubkey:   root.Pubkey,
 		Kind:          root.Kind,
+		DTag:          root.DTag,
 		IsBookmarked:  root.IsBookmarked,
 		IsReacted:     root.IsReacted,
 		IsReposted:    root.IsReposted,
@@ -2984,6 +3548,7 @@ func renderThreadHTML(resp ThreadResponse, relays []string, session *BunkerSessi
 			EventID:       reply.ID,
 			EventPubkey:   reply.Pubkey,
 			Kind:          reply.Kind,
+			DTag:          reply.DTag,
 			IsBookmarked:  reply.IsBookmarked,
 			IsReacted:     reply.IsReacted,
 			IsReposted:    reply.IsReposted,
@@ -3032,6 +3597,8 @@ func renderThreadHTML(resp ThreadResponse, relays []string, session *BunkerSessi
 		Root:            root,
 		ReplyGroups:     replyGroups,
 		TotalReplyCount: totalReplyCount,
+		CachedAt:        resp.Meta.GeneratedAt.Unix(),
+		Identifier:      identifier,
 		CurrentURL:      currentURL,
 		ThemeClass:      themeClass,
 		ThemeLabel:      themeLabel,
@@ -3062,28 +3629,32 @@ func renderThreadHTML(resp ThreadResponse, relays []string, session *BunkerSessi
 		ActivePage: "",
 		HasUnread:  hasUnreadNotifs,
 	})
-	var userAvatarURL string
+	var userAvatarURL, userNpub string
 	if session != nil && session.Connected {
-		userAvatarURL = getUserAvatarURL(hex.EncodeToString(session.UserPubKey))
+		pubkeyHex := hex.EncodeToString(session.UserPubKey)
+		userAvatarURL = getUserAvatarURL(pubkeyHex)
+		userNpub, _ = encodeBech32Pubkey(pubkeyHex)
 	}
 	settingsCtx := SettingsContext{
 		LoggedIn:      data.LoggedIn,
 		ThemeLabel:    themeLabel,
 		UserAvatarURL: userAvatarURL,
+		UserNpub:      userNpub,
 	}
 	data.SettingsItems = GetSettingsItems(settingsCtx)
 	data.SettingsToggle = GetSettingsToggle(settingsCtx)
 
 	// Use cached template for better performance
-	var buf strings.Builder
+	buf := getBuffer()
+	defer putBuffer(buf)
 	if isFragment {
 		// HelmJS request: render just the content fragment
-		if err := cachedThreadFragment.ExecuteTemplate(&buf, tmplFragment, data); err != nil {
+		if err := cachedThreadFragment.ExecuteTemplate(buf, tmplFragment, data); err != nil {
 			return "", err
 		}
 	} else {
 		// Full page request: render with base template
-		if err := cachedThreadTemplate.ExecuteTemplate(&buf, tmplBase, data); err != nil {
+		if err := cachedThreadTemplate.ExecuteTemplate(buf, tmplBase, data); err != nil {
 			return "", err
 		}
 	}
@@ -3164,6 +3735,7 @@ func renderProfileHTML(resp ProfileResponse, relays []string, limit int, themeCl
 			ContentHTML:    processContentToHTMLFull(item.Content, relays, resolvedRefs, linkPreviews),
 			RelaysSeen:     item.RelaysSeen,
 			AuthorProfile:  item.AuthorProfile,
+			ProfileMissing: item.AuthorProfile == nil,
 		}
 
 		// Check if logged-in user has bookmarked, reacted, reposted, or muted this event's author
@@ -3174,11 +3746,17 @@ func renderProfileHTML(resp ProfileResponse, relays []string, limit int, themeCl
 			items[i].IsZapped = session.IsEventZapped(item.ID)
 			items[i].IsMuted = session.IsPubkeyMuted(item.Pubkey)
 		}
+
+		// Extract content warning (NIP-36)
+		if util.HasTag(item.Tags, "content-warning") {
+			items[i].HasContentWarning = true
+			items[i].ContentWarning = util.GetTagValue(item.Tags, "content-warning")
+		}
 	}
 
 	// Populate actions for each item
 	hasWallet := loggedIn && session != nil && session.HasWallet()
-	loginURL := "/html/login?return_url=" + currentURL
+	loginURL := util.BuildURL("/login", map[string]string{"return_url": currentURL})
 	for i := range items {
 		item := &items[i]
 		var itemReactionCount int
@@ -3189,6 +3767,7 @@ func renderProfileHTML(resp ProfileResponse, relays []string, limit int, themeCl
 			EventID:       item.ID,
 			EventPubkey:   item.Pubkey,
 			Kind:          item.Kind,
+			DTag:          item.DTag,
 			IsBookmarked:  item.IsBookmarked,
 			IsReacted:     item.IsReacted,
 			IsReposted:    item.IsReposted,
@@ -3280,33 +3859,37 @@ func renderProfileHTML(resp ProfileResponse, relays []string, limit int, themeCl
 		ActivePage: "",
 		HasUnread:  hasUnreadNotifs,
 	})
-	var userAvatarURL string
+	var userAvatarURL, userNpub string
 	if session != nil && session.Connected {
-		userAvatarURL = getUserAvatarURL(hex.EncodeToString(session.UserPubKey))
+		pubkeyHex := hex.EncodeToString(session.UserPubKey)
+		userAvatarURL = getUserAvatarURL(pubkeyHex)
+		userNpub, _ = encodeBech32Pubkey(pubkeyHex)
 	}
 	settingsCtx := SettingsContext{
 		LoggedIn:      loggedIn,
 		ThemeLabel:    themeLabel,
 		UserAvatarURL: userAvatarURL,
+		UserNpub:      userNpub,
 	}
 	data.SettingsItems = GetSettingsItems(settingsCtx)
 	data.SettingsToggle = GetSettingsToggle(settingsCtx)
 
 	// Use cached template for better performance
-	var buf strings.Builder
+	buf := getBuffer()
+	defer putBuffer(buf)
 	if isAppend {
 		// HelmJS "Load More" request: render items + updated pagination
-		if err := cachedProfileAppend.ExecuteTemplate(&buf, tmplProfileAppend, data); err != nil {
+		if err := cachedProfileAppend.ExecuteTemplate(buf, tmplProfileAppend, data); err != nil {
 			return "", err
 		}
 	} else if isFragment {
 		// HelmJS request: render just the content fragment
-		if err := cachedProfileFragment.ExecuteTemplate(&buf, tmplFragment, data); err != nil {
+		if err := cachedProfileFragment.ExecuteTemplate(buf, tmplFragment, data); err != nil {
 			return "", err
 		}
 	} else {
 		// Full page request: render with base template
-		if err := cachedProfileTemplate.ExecuteTemplate(&buf, tmplBase, data); err != nil {
+		if err := cachedProfileTemplate.ExecuteTemplate(buf, tmplBase, data); err != nil {
 			return "", err
 		}
 	}
@@ -3489,30 +4072,33 @@ func renderNotificationsHTML(notifications []Notification, profiles map[string]*
 	})
 	// No kind filters submenu on notifications page
 	data.KindFilters = nil
+	userNpub, _ := encodeBech32Pubkey(userPubKey)
 	settingsCtx := SettingsContext{
 		LoggedIn:      true,
 		ThemeLabel:    themeLabel,
 		UserAvatarURL: getUserAvatarURL(userPubKey),
+		UserNpub:      userNpub,
 	}
 	data.SettingsItems = GetSettingsItems(settingsCtx)
 	data.SettingsToggle = GetSettingsToggle(settingsCtx)
 
-	var buf strings.Builder
+	buf := getBuffer()
+	defer putBuffer(buf)
 	if isAppend {
 		// HelmJS "Load More" request: render items + updated pagination
-		if err := cachedNotificationsAppend.ExecuteTemplate(&buf, tmplNotificationsAppend, data); err != nil {
+		if err := cachedNotificationsAppend.ExecuteTemplate(buf, tmplNotificationsAppend, data); err != nil {
 			return "", err
 		}
 	} else if isFragment {
 		// HelmJS request: render just the content fragment
-		if err := cachedNotificationsFragment.ExecuteTemplate(&buf, tmplFragment, data); err != nil {
+		if err := cachedNotificationsFragment.ExecuteTemplate(buf, tmplFragment, data); err != nil {
 			return "", err
 		}
 		// Add OOB update to hide the notification badge since user is viewing notifications
 		buf.WriteString(`<span class="notification-badge notification-badge-hidden" id="notification-badge" h-oob="outer"></span>`)
 	} else {
 		// Full page request: render with base template
-		if err := cachedNotificationsTemplate.ExecuteTemplate(&buf, tmplBase, data); err != nil {
+		if err := cachedNotificationsTemplate.ExecuteTemplate(buf, tmplBase, data); err != nil {
 			return "", err
 		}
 	}
@@ -3555,13 +4141,13 @@ type HTMLMutesData struct {
 
 func renderMutesHTML(mutedUsers []HTMLMutedUser, themeClass, themeLabel, userDisplayName, userPubKey, csrfToken string, isFragment bool) (string, error) {
 	data := HTMLMutesData{
-		Title:           I18n("nav.mutes"),
+		Title:           config.I18n("nav.mutes"),
 		ThemeClass:      themeClass,
 		ThemeLabel:      themeLabel,
 		UserDisplayName: userDisplayName,
 		UserPubKey:      userPubKey,
 		Items:           mutedUsers,
-		CurrentURL:      "/html/mutes",
+		CurrentURL:      "/mutes",
 		CSRFToken:       csrfToken,
 		LoggedIn:        true,
 	}
@@ -3577,21 +4163,24 @@ func renderMutesHTML(mutedUsers []HTMLMutedUser, themeClass, themeLabel, userDis
 		LoggedIn:   true,
 		ActivePage: "mutes",
 	})
+	userNpub, _ := encodeBech32Pubkey(userPubKey)
 	settingsCtx := SettingsContext{
 		LoggedIn:      true,
 		ThemeLabel:    themeLabel,
 		UserAvatarURL: getUserAvatarURL(userPubKey),
+		UserNpub:      userNpub,
 	}
 	data.SettingsItems = GetSettingsItems(settingsCtx)
 	data.SettingsToggle = GetSettingsToggle(settingsCtx)
 
-	var buf strings.Builder
+	buf := getBuffer()
+	defer putBuffer(buf)
 	if isFragment {
-		if err := cachedMutesFragment.ExecuteTemplate(&buf, tmplFragment, data); err != nil {
+		if err := cachedMutesFragment.ExecuteTemplate(buf, tmplFragment, data); err != nil {
 			return "", err
 		}
 	} else {
-		if err := cachedMutesTemplate.ExecuteTemplate(&buf, tmplBase, data); err != nil {
+		if err := cachedMutesTemplate.ExecuteTemplate(buf, tmplBase, data); err != nil {
 			return "", err
 		}
 	}
@@ -3629,13 +4218,14 @@ type HTMLWalletData struct {
 }
 
 func renderWalletHTML(data HTMLWalletData, isFragment bool) (string, error) {
-	var buf strings.Builder
+	buf := getBuffer()
+	defer putBuffer(buf)
 	if isFragment {
-		if err := cachedWalletFragment.ExecuteTemplate(&buf, tmplFragment, data); err != nil {
+		if err := cachedWalletFragment.ExecuteTemplate(buf, tmplFragment, data); err != nil {
 			return "", err
 		}
 	} else {
-		if err := cachedWalletTemplate.ExecuteTemplate(&buf, tmplBase, data); err != nil {
+		if err := cachedWalletTemplate.ExecuteTemplate(buf, tmplBase, data); err != nil {
 			return "", err
 		}
 	}
@@ -3644,32 +4234,7 @@ func renderWalletHTML(data HTMLWalletData, isFragment bool) (string, error) {
 }
 
 func formatTimeAgo(timestamp int64) string {
-	now := time.Now().Unix()
-	diff := now - timestamp
-
-	if diff < 60 {
-		return "just now"
-	} else if diff < 3600 {
-		mins := diff / 60
-		if mins == 1 {
-			return "1 min ago"
-		}
-		return fmt.Sprintf("%d mins ago", mins)
-	} else if diff < 86400 {
-		hours := diff / 3600
-		if hours == 1 {
-			return "1 hour ago"
-		}
-		return fmt.Sprintf("%d hours ago", hours)
-	} else if diff < 604800 {
-		days := diff / 86400
-		if days == 1 {
-			return "1 day ago"
-		}
-		return fmt.Sprintf("%d days ago", days)
-	} else {
-		return time.Unix(timestamp, 0).Format("Jan 2")
-	}
+	return formatRelativeTime(timestamp)
 }
 
 // HTMLSearchData is the data passed to the search template
@@ -3702,7 +4267,7 @@ type HTMLSearchData struct {
 }
 
 
-func renderSearchHTML(events []Event, profiles map[string]*ProfileInfo, query, themeClass, themeLabel string, loggedIn bool, userPubKey, userDisplayName, csrfToken string, hasUnreadNotifs bool, pagination *HTMLPagination, isFragment bool, isAppend bool, isLiveSearch bool, relays []string, quotedEvents map[string]*Event) (string, error) {
+func renderSearchHTML(events []Event, profiles map[string]*ProfileInfo, query, themeClass, themeLabel string, loggedIn bool, userPubKey, userDisplayName, csrfToken string, hasUnreadNotifs bool, pagination *HTMLPagination, isFragment bool, isAppend bool, isLiveSearch bool, relays []string, quotedEvents map[string]*Event, linkPreviews map[string]*LinkPreview) (string, error) {
 	// Convert events to HTMLEventItem
 	items := make([]HTMLEventItem, 0, len(events))
 	for _, evt := range events {
@@ -3725,12 +4290,12 @@ func renderSearchHTML(events []Event, profiles map[string]*ProfileInfo, query, t
 		}
 
 		// Process content - strip quoted reference if we have a quoted event
-		contentHTML := processContentToHTML(evt.Content)
+		contentHTML := processContentToHTMLFull(evt.Content, relays, nil, linkPreviews)
 		if qTagValue != "" && quotedEvents != nil {
 			// quotedEvents is keyed by original q tag value
 			if _, hasQuoted := quotedEvents[qTagValue]; hasQuoted {
 				strippedContent := stripQuotedNostrRef(evt.Content, qTagValue)
-				contentHTML = processContentToHTML(strippedContent)
+				contentHTML = processContentToHTMLFull(strippedContent, relays, nil, linkPreviews)
 			}
 		}
 
@@ -3745,6 +4310,7 @@ func renderSearchHTML(events []Event, profiles map[string]*ProfileInfo, query, t
 			CreatedAt:      evt.CreatedAt,
 			ContentHTML:    contentHTML,
 			AuthorProfile:  profiles[evt.PubKey],
+			ProfileMissing: profiles[evt.PubKey] == nil,
 			Tags:           evt.Tags,
 		}
 
@@ -3754,6 +4320,12 @@ func renderSearchHTML(events []Event, profiles map[string]*ProfileInfo, query, t
 			if qev, ok := quotedEvents[qTagValue]; ok {
 				item.QuotedEvent = buildQuotedEventItem(qev, profiles[qev.PubKey], relays, nil, nil)
 			}
+		}
+
+		// Extract content warning (NIP-36)
+		if util.HasTag(evt.Tags, "content-warning") {
+			item.HasContentWarning = true
+			item.ContentWarning = util.GetTagValue(evt.Tags, "content-warning")
 		}
 
 		items = append(items, item)
@@ -3790,37 +4362,40 @@ func renderSearchHTML(events []Event, profiles map[string]*ProfileInfo, query, t
 		ActivePage: "search",
 		HasUnread:  hasUnreadNotifs,
 	})
-	var userAvatarURL string
+	var userAvatarURL, userNpub string
 	if loggedIn {
 		userAvatarURL = getUserAvatarURL(userPubKey)
+		userNpub, _ = encodeBech32Pubkey(userPubKey)
 	}
 	settingsCtx := SettingsContext{
 		LoggedIn:      loggedIn,
 		ThemeLabel:    themeLabel,
 		UserAvatarURL: userAvatarURL,
+		UserNpub:      userNpub,
 	}
 	data.SettingsItems = GetSettingsItems(settingsCtx)
 	data.SettingsToggle = GetSettingsToggle(settingsCtx)
 
-	var buf strings.Builder
+	buf := getBuffer()
+	defer putBuffer(buf)
 	if isAppend {
 		// HelmJS "Load More" request: render items + updated pagination
-		if err := cachedSearchAppend.ExecuteTemplate(&buf, tmplSearchAppend, data); err != nil {
+		if err := cachedSearchAppend.ExecuteTemplate(buf, tmplSearchAppend, data); err != nil {
 			return "", err
 		}
 	} else if isLiveSearch {
 		// HelmJS live search: render just the search-results content
-		if err := cachedSearchTemplate.ExecuteTemplate(&buf, tmplSearchResults, data); err != nil {
+		if err := cachedSearchTemplate.ExecuteTemplate(buf, tmplSearchResults, data); err != nil {
 			return "", err
 		}
 	} else if isFragment {
 		// HelmJS navigation to search page: render full fragment with form
-		if err := cachedSearchFragment.ExecuteTemplate(&buf, tmplFragment, data); err != nil {
+		if err := cachedSearchFragment.ExecuteTemplate(buf, tmplFragment, data); err != nil {
 			return "", err
 		}
 	} else {
 		// Full page request: render with base template
-		if err := cachedSearchTemplate.ExecuteTemplate(&buf, tmplBase, data); err != nil {
+		if err := cachedSearchTemplate.ExecuteTemplate(buf, tmplBase, data); err != nil {
 			return "", err
 		}
 	}

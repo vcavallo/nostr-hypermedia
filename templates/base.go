@@ -26,7 +26,8 @@ var baseTemplate = `{{define "base"}}{{$site := siteConfig}}<!DOCTYPE html>
   {{range $site.Links.Preconnect}}<link rel="preconnect" href="{{.}}">
   {{end}}<link rel="stylesheet" href="{{$site.Links.Stylesheet}}">
   {{range $site.Scripts}}<script src="{{.Src}}"{{if .Defer}} defer{{end}}{{if .Async}} async{{end}}></script>
-  {{end}}
+  {{end}}{{range .KindFilters}}{{if and (not .IsDropdown) (not .Active)}}<link rel="prefetch" href="{{.Href}}">
+  {{end}}{{end}}
 </head>
 <body id="top">
   <a href="#main-content" class="skip-link">{{i18n "a11y.skip_to_main"}}</a>
@@ -34,21 +35,39 @@ var baseTemplate = `{{define "base"}}{{$site := siteConfig}}<!DOCTYPE html>
     {{template "header" .}}
     <div id="page-content">
       {{if .KindFilters}}<div class="kind-filter" id="kind-filter">
-        {{range .KindFilters}}
-        <a href="{{.Href}}" h-get h-target="#page-content" h-swap="inner" h-replace-url h-scroll="top" h-indicator="#nav-loading" class="{{if .Active}}active{{end}}">{{.Title}}</a>
-        {{end}}
+        {{range .KindFilters}}{{if .IsDropdown}}<details class="kind-filter-dropdown{{if .Active}} active{{end}}">
+          <summary>{{.Title}}</summary>
+          <div class="kind-filter-dropdown-menu">
+            {{range .Children}}<a href="{{.Href}}" h-get h-target="#page-content" h-swap="inner" h-replace-url h-scroll="top" h-indicator="#nav-loading" h-prefetch class="{{if .Active}}active{{end}}">{{.Title}}</a>{{end}}
+          </div>
+        </details>{{else}}<a href="{{.Href}}" h-get h-target="#page-content" h-swap="inner" h-replace-url h-scroll="top" h-indicator="#nav-loading" h-prefetch class="{{if .Active}}active{{end}}">{{.Title}}</a>{{end}}{{end}}
       </div>{{end}}
       {{if and .LoggedIn .ShowPostForm}}
       <div class="post-form-container">
         <div id="post-error" class="form-error" role="alert" aria-live="polite"></div>
-        <form method="POST" action="/html/post" class="post-form" id="post-form" h-post h-target="#post-form" h-swap="outer" h-indicator="#post-spinner" h-error-target="#post-error">
+        <form method="POST" action="/post" class="post-form" id="post-form" h-post h-target="#post-form" h-swap="outer" h-indicator="#post-spinner" h-error-target="#post-error">
           <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
+          <input type="hidden" id="mentions-data-post" name="mentions" value="{}">
           <label for="post-content" class="sr-only">Write a new note</label>
           <textarea id="post-content" name="content" placeholder="What's on your mind?"></textarea>
+          <a href="{{buildURL "/mentions" "target" "post"}}" h-get h-target="#mentions-dropdown-post" h-swap="inner" h-trigger="input debounce:300 from:#post-content" h-include="#post-content" hidden aria-hidden="true" aria-label="Mention autocomplete trigger"></a>
+          <div id="mentions-dropdown-post" class="mentions-dropdown"></div>
           <div id="gif-attachment-post"></div>
           <div class="post-actions">
             <button type="submit" class="btn-primary">{{i18n "btn.post"}} <span id="post-spinner" class="h-indicator"><span class="h-spinner"></span></span></button>
-            {{if .ShowGifButton}}<a href="/html/gifs?target=post" h-get h-target="#gif-panel-post" h-swap="inner" class="btn-primary post-gif" title="Add GIF">Add GIF</a>{{end}}
+            {{if .ShowGifButton}}<a href="{{buildURL "/gifs" "target" "post"}}" h-get h-target="#gif-panel-post" h-swap="inner" class="btn-primary post-gif" title="Add GIF">Add GIF</a>{{end}}
+            <details class="cw-dropdown">
+              <summary class="cw-toggle" title="{{i18n "label.content_warning"}}">⚠️</summary>
+              <div class="cw-options">
+                <select name="content_warning" class="cw-select" aria-label="{{i18n "label.content_warning"}}">
+                  <option value="">{{i18n "option.no_warning"}}</option>
+                  <option value="nsfw">NSFW</option>
+                  <option value="spoiler">{{i18n "option.spoiler"}}</option>
+                  <option value="sensitive">{{i18n "option.sensitive"}}</option>
+                </select>
+                <input type="text" name="content_warning_custom" class="cw-custom" placeholder="{{i18n "placeholder.custom_warning"}}">
+              </div>
+            </details>
           </div>
         </form>
         <div id="gif-panel-post"></div>
@@ -68,7 +87,7 @@ var baseTemplate = `{{define "base"}}{{$site := siteConfig}}<!DOCTYPE html>
 var headerTemplate = `{{define "header"}}
 <header class="sticky-section">
   <nav>
-    <span id="feed-tabs">{{range .FeedModes}}{{if eq .IconOnly "always"}}<a href="{{.Href}}" h-get h-target="#page-content" h-swap="inner" h-push-url h-scroll="top" h-indicator="#nav-loading" class="nav-icon{{if .Active}} active{{end}}" title="{{.Title}}"{{if .Active}} aria-current="page"{{end}}>{{.Icon}}</a>{{else if eq .IconOnly "mobile"}}<a href="{{.Href}}" h-get h-target="#page-content" h-swap="inner" h-push-url h-scroll="top" h-indicator="#nav-loading" class="nav-tab{{if .Active}} active{{end}}"{{if .Active}} aria-current="page"{{end}}><span class="icon-mobile-only" title="{{.Title}}">{{.Icon}}</span><span class="icon-desktop-only">{{if .Icon}}{{.Icon}} {{end}}{{.Title}}</span></a>{{else if eq .IconOnly "desktop"}}<a href="{{.Href}}" h-get h-target="#page-content" h-swap="inner" h-push-url h-scroll="top" h-indicator="#nav-loading" class="nav-tab{{if .Active}} active{{end}}"{{if .Active}} aria-current="page"{{end}}><span class="icon-desktop-only" title="{{.Title}}">{{.Icon}}</span><span class="icon-mobile-only">{{if .Icon}}{{.Icon}} {{end}}{{.Title}}</span></a>{{else}}<a href="{{.Href}}" h-get h-target="#page-content" h-swap="inner" h-push-url h-scroll="top" h-indicator="#nav-loading" class="nav-tab{{if .Active}} active{{end}}"{{if .Active}} aria-current="page"{{end}}>{{if .Icon}}{{.Icon}} {{end}}{{.Title}}</a>{{end}}{{end}}</span>
+    <span id="feed-tabs">{{range .FeedModes}}{{if .IsDropdown}}<details class="feed-dropdown{{if .Active}} active{{end}}"><summary class="nav-tab{{if .Active}} active{{end}}">{{if .Icon}}{{.Icon}} {{end}}{{.Title}}</summary><div class="feed-dropdown-menu">{{range .Children}}<a href="{{.Href}}" h-get h-target="#page-content" h-swap="inner" h-push-url h-scroll="top" h-indicator="#nav-loading" class="feed-dropdown-item{{if .Active}} active{{end}}"{{if .Active}} aria-current="page"{{end}}>{{.Title}}</a>{{end}}</div></details>{{else if eq .IconOnly "always"}}<a href="{{.Href}}" h-get h-target="#page-content" h-swap="inner" h-push-url h-scroll="top" h-indicator="#nav-loading" class="nav-icon{{if .Active}} active{{end}}" title="{{.Title}}"{{if .Active}} aria-current="page"{{end}}>{{.Icon}}</a>{{else if eq .IconOnly "mobile"}}<a href="{{.Href}}" h-get h-target="#page-content" h-swap="inner" h-push-url h-scroll="top" h-indicator="#nav-loading" class="nav-tab{{if .Active}} active{{end}}"{{if .Active}} aria-current="page"{{end}}><span class="icon-mobile-only" title="{{.Title}}">{{.Icon}}</span><span class="icon-desktop-only">{{if .Icon}}{{.Icon}} {{end}}{{.Title}}</span></a>{{else if eq .IconOnly "desktop"}}<a href="{{.Href}}" h-get h-target="#page-content" h-swap="inner" h-push-url h-scroll="top" h-indicator="#nav-loading" class="nav-tab{{if .Active}} active{{end}}"{{if .Active}} aria-current="page"{{end}}><span class="icon-desktop-only" title="{{.Title}}">{{.Icon}}</span><span class="icon-mobile-only">{{if .Icon}}{{.Icon}} {{end}}{{.Title}}</span></a>{{else}}<a href="{{.Href}}" h-get h-target="#page-content" h-swap="inner" h-push-url h-scroll="top" h-indicator="#nav-loading" class="nav-tab{{if .Active}} active{{end}}"{{if .Active}} aria-current="page"{{end}}>{{if .Icon}}{{.Icon}} {{end}}{{.Title}}</a>{{end}}{{end}}</span>
     <span id="nav-loading" class="h-indicator"><span class="h-spinner"></span></span>
     <div class="ml-auto flex-center gap-sm">
       {{range .NavItems}}
@@ -100,10 +119,11 @@ var headerTemplate = `{{define "header"}}
           {{end}}
         </div>
       </details>{{end}}
-      <span id="login-btn">{{if not .LoggedIn}}<a href="/html/login" class="btn-primary">{{i18n "btn.login"}}</a>{{end}}</span>
+      <span id="login-btn">{{if not .LoggedIn}}<a href="/login" class="btn-primary">{{i18n "btn.login"}}</a>{{end}}</span>
     </div>
   </nav>
-  {{if .LoggedIn}}<span h-sse="/stream/notifications?format=html" hidden><template h-sse-on="notification" h-target="#notification-badge" h-swap="outer"></template></span>{{end}}
+  {{if .LoggedIn}}<span h-sse="/stream/notifications?format=html" hidden><template h-sse-on="notification" h-target="#notification-badge" h-swap="outer"></template></span>
+  <span h-sse="/stream/corrections" hidden><template h-sse-on="correction" h-swap="none"></template></span>{{end}}
   <span id="config-sse" h-sse="/stream/config" hidden><template h-sse-on="reload" h-target="#config-sse" h-swap="inner"></template></span>
   <a id="config-reload" href="{{.CurrentURL}}{{if contains .CurrentURL "?"}}&amp;{{else}}?{{end}}refresh=1" h-get h-target="body" h-swap="morph" h-select="body" h-trigger="h:sse-message from:#config-sse" hidden aria-hidden="true" aria-label="Reload page configuration"></a>
 </header>

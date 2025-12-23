@@ -1,4 +1,4 @@
-module nostr-hypermedia
+module nostr-server
 
 go 1.25.1
 
@@ -21,5 +21,6 @@ require (
 	github.com/microcosm-cc/bluemonday v1.0.27 // indirect
 	github.com/redis/go-redis/v9 v9.17.2 // indirect
 	golang.org/x/net v0.48.0 // indirect
+	golang.org/x/sync v0.19.0 // indirect
 	golang.org/x/sys v0.39.0 // indirect
 )

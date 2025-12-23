@@ -25,6 +25,9 @@
     ]
   },
   "scripts": [
-    {"src": "/static/helm.js", "defer": true}
+    {
+      "src": "/static/helm.js",
+      "defer": true
+    }
   ]
 }

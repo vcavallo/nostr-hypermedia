@@ -1,0 +1,76 @@
+/* Calendar RSVP styles (kind 31925) */
+.rsvp-card {
+  background: var(--bg-secondary);
+  border-radius: 8px;
+  padding: 12px 16px;
+  margin: 8px 0;
+  border-left: 4px solid var(--text-muted);
+}
+.rsvp-card.rsvp-accepted {
+  border-left-color: var(--success, #22c55e);
+}
+.rsvp-card.rsvp-declined {
+  border-left-color: var(--error, #ef4444);
+}
+.rsvp-card.rsvp-tentative {
+  border-left-color: var(--warning, #eab308);
+}
+.rsvp-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+.rsvp-icon {
+  font-size: 18px;
+  width: 24px;
+  height: 24px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  background: var(--bg-primary);
+}
+.rsvp-accepted .rsvp-icon {
+  color: var(--success, #22c55e);
+}
+.rsvp-declined .rsvp-icon {
+  color: var(--error, #ef4444);
+}
+.rsvp-tentative .rsvp-icon {
+  color: var(--warning, #eab308);
+}
+.rsvp-status-text {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+.rsvp-event {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 14px;
+  margin-bottom: 8px;
+}
+.rsvp-event-icon {
+  font-size: 14px;
+}
+.rsvp-event-link {
+  color: var(--accent);
+  text-decoration: none;
+}
+.rsvp-event-link:hover {
+  text-decoration: underline;
+}
+.rsvp-freebusy {
+  font-size: 12px;
+  color: var(--text-muted);
+  margin-bottom: 8px;
+}
+.rsvp-note {
+  font-size: 14px;
+  color: var(--text-secondary);
+  line-height: 1.5;
+  padding-top: 8px;
+  border-top: 1px solid var(--border-color);
+}

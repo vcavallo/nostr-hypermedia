@@ -13,6 +13,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"nostr-server/internal/util"
 )
 
 // OG tag parsing regexes
@@ -30,6 +32,12 @@ var (
 	// Fallback to meta description
 	metaDescRegex    = regexp.MustCompile(`(?i)<meta[^>]*name=["']description["'][^>]*content=["']([^"']+)["']`)
 	metaDescRegexAlt = regexp.MustCompile(`(?i)<meta[^>]*content=["']([^"']+)["'][^>]*name=["']description["']`)
+	// Next.js RSC streaming format (OG tags delivered as JSON in script chunks)
+	// Format: "property":"og:title","content":"Title Here"
+	ogTitleRSC    = regexp.MustCompile(`"property"\s*:\s*"og:title"\s*,\s*"content"\s*:\s*"([^"]+)"`)
+	ogDescRSC     = regexp.MustCompile(`"property"\s*:\s*"og:description"\s*,\s*"content"\s*:\s*"([^"]+)"`)
+	ogImageRSC    = regexp.MustCompile(`"property"\s*:\s*"og:image"\s*,\s*"content"\s*:\s*"([^"]+)"`)
+	ogSiteNameRSC = regexp.MustCompile(`"property"\s*:\s*"og:site_name"\s*,\s*"content"\s*:\s*"([^"]+)"`)
 )
 
 // ssrfSafeDialer creates connections only to public IPs, preventing DNS rebinding attacks
@@ -47,14 +55,9 @@ func ssrfSafeDialContext(ctx context.Context, network, addr string) (net.Conn, e
 		return nil, fmt.Errorf("invalid address: %w", err)
 	}
 
-	// Block localhost variations before DNS lookup
-	if host == "localhost" || host == "127.0.0.1" || host == "::1" {
-		return nil, errors.New("connection to localhost blocked")
-	}
-
-	// Block obvious internal names
-	if strings.HasSuffix(host, ".local") || strings.HasSuffix(host, ".internal") {
-		return nil, errors.New("connection to internal host blocked")
+	// Block localhost and internal hosts before DNS lookup
+	if util.IsPrivateHost(host) {
+		return nil, errors.New("connection to private/internal host blocked")
 	}
 
 	// Resolve DNS
@@ -116,8 +119,8 @@ func isURLSafeForSSRF(rawURL string) bool {
 		return false
 	}
 
-	// Block localhost variations
-	if host == "localhost" || host == "127.0.0.1" || host == "::1" {
+	// Block localhost and internal hosts
+	if util.IsPrivateHost(host) {
 		return false
 	}
 
@@ -126,7 +129,7 @@ func isURLSafeForSSRF(rawURL string) bool {
 	if err != nil {
 		// If we can't resolve, allow it (might be valid external host)
 		// but block obvious internal names
-		if strings.HasSuffix(host, ".local") || strings.HasSuffix(host, ".internal") {
+		if util.IsInternalHost(host) {
 			return false
 		}
 		return true
@@ -182,8 +185,119 @@ func isPublicIP(ip net.IP) bool {
 	return true
 }
 
-// FetchLinkPreview fetches OG metadata from a URL
+// FetchLinkPreview fetches OG metadata from a URL (uses default 5s timeout)
 func FetchLinkPreview(targetURL string) *LinkPreview {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	return FetchLinkPreviewWithContext(ctx, targetURL)
+}
+
+// extractMeta tries multiple regex patterns to extract a meta tag value
+func extractMeta(html string, patterns ...*regexp.Regexp) string {
+	for _, pattern := range patterns {
+		if match := pattern.FindStringSubmatch(html); len(match) > 1 {
+			return decodeHTMLEntities(strings.TrimSpace(match[1]))
+		}
+	}
+	return ""
+}
+
+// htmlEntityReplacer is created once at startup to avoid allocation per call
+var htmlEntityReplacer = strings.NewReplacer(
+	"&amp;", "&",
+	"&lt;", "<",
+	"&gt;", ">",
+	"&quot;", "\"",
+	"&#39;", "'",
+	"&apos;", "'",
+	"&#x27;", "'",
+	"&nbsp;", " ",
+)
+
+// decodeHTMLEntities decodes common HTML entities
+func decodeHTMLEntities(s string) string {
+	return htmlEntityReplacer.Replace(s)
+}
+
+// FetchLinkPreviews fetches multiple link previews in parallel with a global timeout.
+// Returns available previews within timeout; slow URLs are skipped to avoid blocking.
+func FetchLinkPreviews(urls []string) map[string]*LinkPreview {
+	if len(urls) == 0 {
+		return nil
+	}
+
+	// Check cache first
+	cached, missing := linkPreviewCache.GetMultiple(urls)
+	if len(missing) == 0 {
+		return cached
+	}
+
+	// Global timeout for all fetches - don't let slow servers block the page
+	const fetchTimeout = 5 * time.Second
+	ctx, cancel := context.WithTimeout(context.Background(), fetchTimeout)
+	defer cancel()
+
+	// Fetch missing previews in parallel
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	results := make(map[string]*LinkPreview, len(urls))
+
+	// Copy cached results
+	for url, preview := range cached {
+		results[url] = preview
+	}
+
+	// Limit concurrent fetches - balance between speed and not overwhelming targets
+	semaphore := make(chan struct{}, 15)
+
+	for _, url := range missing {
+		wg.Add(1)
+		go func(u string) {
+			defer wg.Done()
+
+			// Acquire semaphore with context
+			select {
+			case semaphore <- struct{}{}:
+				defer func() { <-semaphore }()
+			case <-ctx.Done():
+				return // Timeout reached, skip this URL
+			}
+
+			// Check if we still have time
+			if ctx.Err() != nil {
+				return
+			}
+
+			preview := FetchLinkPreviewWithContext(ctx, u)
+			if preview != nil {
+				linkPreviewCache.Set(u, preview)
+				mu.Lock()
+				results[u] = preview
+				mu.Unlock()
+			}
+		}(url)
+	}
+
+	// Wait for either all goroutines to finish or timeout
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// All fetches completed
+	case <-ctx.Done():
+		// Timeout - return what we have
+		slog.Debug("link preview fetch timeout", "completed", len(results)-len(cached), "total", len(missing))
+	}
+
+	return results
+}
+
+// FetchLinkPreviewWithContext fetches OG metadata from a URL with context support
+func FetchLinkPreviewWithContext(ctx context.Context, targetURL string) *LinkPreview {
 	preview := &LinkPreview{
 		URL:       targetURL,
 		FetchedAt: time.Now(),
@@ -196,7 +310,7 @@ func FetchLinkPreview(targetURL string) *LinkPreview {
 		return preview
 	}
 
-	req, err := http.NewRequest("GET", targetURL, nil)
+	req, err := http.NewRequestWithContext(ctx, "GET", targetURL, nil)
 	if err != nil {
 		preview.Failed = true
 		return preview
@@ -208,6 +322,10 @@ func FetchLinkPreview(targetURL string) *LinkPreview {
 
 	resp, err := previewHTTPClient.Do(req)
 	if err != nil {
+		if ctx.Err() != nil {
+			// Context cancelled/timeout - don't log as error
+			return nil
+		}
 		slog.Debug("link preview fetch failed", "url", targetURL, "error", err)
 		preview.Failed = true
 		return preview
@@ -229,18 +347,33 @@ func FetchLinkPreview(targetURL string) *LinkPreview {
 
 	html := string(body)
 
-	// Extract OG tags
+	// Extract OG tags (standard HTML meta tags)
 	preview.Title = extractMeta(html, ogTitleRegex, ogTitleRegexAlt)
 	preview.Description = extractMeta(html, ogDescRegex, ogDescRegexAlt)
 	preview.Image = extractMeta(html, ogImageRegex, ogImageRegexAlt)
 	preview.SiteName = extractMeta(html, ogSiteNameRegex, ogSiteNameRegexAlt)
 
-	// Fallbacks
+	// Fallback to Next.js RSC streaming format (JSON in script chunks)
+	if preview.Title == "" {
+		preview.Title = extractMeta(html, ogTitleRSC)
+	}
+	if preview.Description == "" {
+		preview.Description = extractMeta(html, ogDescRSC)
+	}
+	if preview.Image == "" {
+		preview.Image = extractMeta(html, ogImageRSC)
+	}
+	if preview.SiteName == "" {
+		preview.SiteName = extractMeta(html, ogSiteNameRSC)
+	}
+
+	// Fallback to regular title tag
 	if preview.Title == "" {
 		if match := titleTagRegex.FindStringSubmatch(html); len(match) > 1 {
 			preview.Title = strings.TrimSpace(match[1])
 		}
 	}
+	// Fallback to meta description
 	if preview.Description == "" {
 		preview.Description = extractMeta(html, metaDescRegex, metaDescRegexAlt)
 	}
@@ -253,83 +386,17 @@ func FetchLinkPreview(targetURL string) *LinkPreview {
 	return preview
 }
 
-// extractMeta tries multiple regex patterns to extract a meta tag value
-func extractMeta(html string, patterns ...*regexp.Regexp) string {
-	for _, pattern := range patterns {
-		if match := pattern.FindStringSubmatch(html); len(match) > 1 {
-			return decodeHTMLEntities(strings.TrimSpace(match[1]))
-		}
-	}
-	return ""
-}
-
-// decodeHTMLEntities decodes common HTML entities
-func decodeHTMLEntities(s string) string {
-	replacer := strings.NewReplacer(
-		"&amp;", "&",
-		"&lt;", "<",
-		"&gt;", ">",
-		"&quot;", "\"",
-		"&#39;", "'",
-		"&apos;", "'",
-		"&#x27;", "'",
-		"&nbsp;", " ",
-	)
-	return replacer.Replace(s)
-}
-
-// FetchLinkPreviews fetches multiple link previews in parallel
-func FetchLinkPreviews(urls []string) map[string]*LinkPreview {
-	if len(urls) == 0 {
-		return nil
-	}
-
-	// Check cache first
-	cached, missing := linkPreviewCache.GetMultiple(urls)
-	if len(missing) == 0 {
-		return cached
-	}
-
-	// Fetch missing previews in parallel
-	var wg sync.WaitGroup
-	var mu sync.Mutex
-	results := make(map[string]*LinkPreview)
-
-	// Copy cached results
-	for url, preview := range cached {
-		results[url] = preview
-	}
-
-	// Limit concurrent fetches
-	semaphore := make(chan struct{}, 5)
-
-	for _, url := range missing {
-		wg.Add(1)
-		go func(u string) {
-			defer wg.Done()
-			semaphore <- struct{}{}
-			defer func() { <-semaphore }()
-
-			preview := FetchLinkPreview(u)
-			linkPreviewCache.Set(u, preview)
-
-			mu.Lock()
-			results[u] = preview
-			mu.Unlock()
-		}(url)
-	}
-
-	wg.Wait()
-	return results
-}
-
 // ExtractPreviewableURLs extracts URLs that should get link previews
 // (excludes images, videos, YouTube, and nostr references)
 func ExtractPreviewableURLs(content string) []string {
-	var urls []string
-	seen := make(map[string]bool)
-
 	matches := urlRegex.FindAllString(content, -1)
+	if len(matches) == 0 {
+		return nil
+	}
+
+	urls := make([]string, 0, len(matches))
+	seen := make(map[string]bool, len(matches))
+
 	for _, rawURL := range matches {
 		// Clean trailing punctuation (e.g., from markdown links or prose)
 		url := cleanURLTrailing(rawURL)
@@ -360,6 +427,8 @@ func ExtractPreviewableURLs(content string) []string {
 		if audioExtRegex.MatchString(url) {
 			continue
 		}
+		// Note: We fetch link previews for all Wavlake URLs as fallback
+		// Tracks will use NOM audio player if available, otherwise link preview
 
 		urls = append(urls, url)
 	}

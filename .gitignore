@@ -1,6 +1,9 @@
 # Build output
 nostr-server
+nostr-hypermedia
 release/
+release.tar.gz
+static/style.css
 
 # Development secrets
 .dev-keypair
@@ -32,6 +35,8 @@ coverage.out
 /cmd/markup-check/markup-check
 /cmd/nateoas-check/nateoas-check
 /cmd/security-check/security-check
+reports/
+reports/*
 
 # Temporary files
 *.tmp

@@ -1,0 +1,78 @@
+/* Handler recommendation styles (kind 31989, NIP-89) */
+/* Compact inline format: [avatar] Name recommended AppName for Kind X · time ago */
+
+.recommendation-compact {
+  padding: 16px;
+  border-bottom: 1px solid var(--border-color);
+}
+.recommendation-line {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  font-size: 14px;
+  line-height: 1.4;
+}
+.recommendation-author {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text-primary);
+  text-decoration: none;
+}
+.recommendation-author:hover .recommendation-author-name {
+  text-decoration: underline;
+}
+.recommendation-author-avatar {
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  object-fit: cover;
+}
+.recommendation-author-name {
+  font-weight: 600;
+}
+.recommendation-verb {
+  color: var(--text-secondary);
+}
+.recommendation-handler-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--accent);
+  text-decoration: none;
+  font-weight: 600;
+}
+.recommendation-handler-link:hover {
+  text-decoration: underline;
+}
+.recommendation-handler-icon {
+  width: 18px;
+  height: 18px;
+  border-radius: 4px;
+  object-fit: contain;
+}
+.recommendation-handler-unknown {
+  color: var(--text-muted);
+  font-style: italic;
+}
+.recommendation-for-label {
+  color: var(--text-secondary);
+}
+.recommendation-kind-badge {
+  background: var(--bg-tertiary);
+  color: var(--text-secondary);
+  padding: 2px 6px;
+  border-radius: 4px;
+  font-size: 12px;
+  font-family: monospace;
+}
+.recommendation-time {
+  color: var(--text-muted);
+}
+.recommendation-reason {
+  margin: 8px 0 0 26px;
+  font-size: 14px;
+  color: var(--text-secondary);
+  line-height: 1.5;
+}

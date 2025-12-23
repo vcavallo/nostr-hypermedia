@@ -1,0 +1,71 @@
+/* Label styles (kind 1985) */
+.label-card {
+  background: var(--bg-secondary);
+  border-radius: 8px;
+  padding: 12px 16px;
+  margin: 8px 0;
+}
+.label-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+.label-icon {
+  font-size: 16px;
+}
+.label-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+.label-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+.label-tag {
+  display: inline-flex;
+  align-items: center;
+  padding: 4px 10px;
+  background: var(--accent-bg);
+  border-radius: 14px;
+  font-size: 13px;
+}
+.label-namespace {
+  color: var(--text-muted);
+  margin-right: 2px;
+}
+.label-value {
+  color: var(--accent);
+  font-weight: 500;
+}
+.label-targets {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 10px;
+  font-size: 13px;
+}
+.label-targets-title {
+  color: var(--text-muted);
+}
+.label-target-link {
+  color: var(--accent);
+  text-decoration: none;
+  padding: 2px 8px;
+  background: var(--bg-primary);
+  border-radius: 4px;
+}
+.label-target-link:hover {
+  text-decoration: underline;
+}
+.label-description {
+  font-size: 14px;
+  color: var(--text-secondary);
+  line-height: 1.5;
+  padding-top: 10px;
+  border-top: 1px solid var(--border-color);
+}

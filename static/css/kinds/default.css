@@ -1,0 +1,92 @@
+/* Unknown/default kind styles (NIP-89 handler discovery) */
+.unknown-kind-info {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px;
+  background: var(--bg-secondary);
+  border-radius: 8px;
+  margin: 12px 0;
+}
+.unknown-kind-badge {
+  background: var(--bg-tertiary);
+  color: var(--text-secondary);
+  padding: 4px 8px;
+  border-radius: 4px;
+  font-size: 12px;
+  font-weight: 600;
+  font-family: monospace;
+}
+.unknown-kind-message {
+  color: var(--text-secondary);
+  font-size: 14px;
+}
+
+/* Handler links (Open in App) */
+.handler-links {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 12px 0;
+}
+.handler-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 12px;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  color: var(--text-primary);
+  text-decoration: none;
+  font-size: 14px;
+  transition: background 0.15s, border-color 0.15s;
+}
+.handler-link:hover {
+  background: var(--bg-tertiary);
+  border-color: var(--accent);
+}
+.handler-link.handler-recommended {
+  border-color: var(--accent);
+  background: var(--accent-bg, rgba(var(--accent-rgb, 99, 102, 241), 0.1));
+}
+.handler-recommended-badge {
+  font-size: 11px;
+  color: var(--accent);
+  margin-left: 4px;
+  opacity: 0.9;
+}
+.handler-icon {
+  width: 20px;
+  height: 20px;
+  border-radius: 4px;
+  object-fit: contain;
+}
+
+/* Raw content viewer */
+.unknown-kind-content {
+  margin: 12px 0;
+}
+.unknown-kind-content summary {
+  cursor: pointer;
+  color: var(--text-secondary);
+  font-size: 13px;
+  padding: 8px 0;
+}
+.unknown-kind-content summary:hover {
+  color: var(--text-primary);
+}
+.raw-content {
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  padding: 12px;
+  margin-top: 8px;
+  font-size: 12px;
+  font-family: monospace;
+  white-space: pre-wrap;
+  word-break: break-all;
+  overflow-x: auto;
+  max-height: 300px;
+  color: var(--text-secondary);
+}

@@ -1,0 +1,60 @@
+/* Video (kind 30) styles */
+.video-note {
+  margin: 12px 0;
+}
+.video-title {
+  font-size: 17px;
+  font-weight: 600;
+  color: var(--text-primary);
+  margin: 0 0 12px 0;
+  line-height: 1.3;
+}
+.video-player-container {
+  width: 100%;
+  background: #000;
+  border-radius: 8px;
+  overflow: hidden;
+}
+.video-player {
+  width: 100%;
+  display: block;
+}
+.video-thumbnail {
+  width: 100%;
+  display: block;
+}
+.video-placeholder {
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--bg-secondary);
+  color: var(--text-muted);
+  font-size: 16px;
+}
+.video-duration {
+  margin-top: 8px;
+  font-size: 13px;
+  color: var(--text-muted);
+}
+.video-description {
+  margin-top: 12px;
+  font-size: 14px;
+  color: var(--text-content);
+  line-height: 1.6;
+}
+.video-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 12px;
+}
+.video-hashtag {
+  color: var(--accent);
+  font-size: 13px;
+  text-decoration: none;
+}
+.video-hashtag:hover {
+  text-decoration: underline;
+}

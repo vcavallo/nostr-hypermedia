@@ -14,6 +14,8 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"nostr-server/internal/config"
+	"nostr-server/internal/nips"
 )
 
 // ServerKeypair holds the persistent server keypair for NIP-46
@@ -81,7 +83,7 @@ func loadOrCreateKeypair() (*ServerKeypair, error) {
 		if data, err := os.ReadFile(devKeypairFile); err == nil {
 			privKey, decodeErr := hex.DecodeString(string(data))
 			if decodeErr == nil && len(privKey) == 32 {
-				pubKey, pkErr := GetPublicKey(privKey)
+				pubKey, pkErr := nips.GetPublicKey(privKey)
 				if pkErr == nil {
 					slog.Info("NIP-46: loaded persistent dev keypair", "pubkey", hex.EncodeToString(pubKey))
 					return &ServerKeypair{PrivKey: privKey, PubKey: pubKey}, nil
@@ -91,11 +93,11 @@ func loadOrCreateKeypair() (*ServerKeypair, error) {
 	}
 
 	// Generate new keypair
-	privKey, err := GeneratePrivateKey()
+	privKey, err := nips.GeneratePrivateKey()
 	if err != nil {
 		return nil, fmt.Errorf("failed to generate keypair: %v", err)
 	}
-	pubKey, err := GetPublicKey(privKey)
+	pubKey, err := nips.GetPublicKey(privKey)
 	if err != nil {
 		return nil, fmt.Errorf("failed to derive pubkey: %v", err)
 	}
@@ -276,14 +278,14 @@ func handlePotentialConnectResponse(event Event, kp *ServerKeypair) {
 	}
 
 	// Compute conversation key
-	convKey, err := GetConversationKey(kp.PrivKey, remoteSignerPubKey)
+	convKey, err := nips.GetConversationKey(kp.PrivKey, remoteSignerPubKey)
 	if err != nil {
 		slog.Error("NIP-46: failed to compute conversation key", "error", err)
 		return
 	}
 
 	// Try to decrypt
-	decrypted, err := Nip44Decrypt(event.Content, convKey)
+	decrypted, err := nips.Nip44Decrypt(event.Content, convKey)
 	if err != nil {
 		// Not for us or wrong key
 		return
@@ -350,7 +352,7 @@ func fetchUserPubKey(pending *PendingConnection, remoteSignerPubKeyHex string, s
 	}
 
 	requestJSON, _ := json.Marshal(request)
-	encryptedContent, err := Nip44Encrypt(string(requestJSON), pending.ConversationKey)
+	encryptedContent, err := nips.Nip44Encrypt(string(requestJSON), pending.ConversationKey)
 	if err != nil {
 		slog.Error("NIP-46: failed to encrypt get_public_key request", "error", err)
 		return
@@ -395,7 +397,7 @@ func fetchUserPubKey(pending *PendingConnection, remoteSignerPubKeyHex string, s
 
 		// Fetch user's profile in background (for avatar in settings toggle)
 		go func(pubkeyHex string) {
-			fetchProfilesWithOptions(ConfigGetProfileRelays(), []string{pubkeyHex}, false)
+			fetchProfilesWithOptions(config.GetProfileRelays(), []string{pubkeyHex}, false)
 		}(userPubKey)
 
 		return
@@ -455,7 +457,7 @@ func sendAndWaitForResponse(ctx context.Context, relayURL string, event *Event, 
 			continue
 		}
 
-		decrypted, err := Nip44Decrypt(respEvent.Content, convKey)
+		decrypted, err := nips.Nip44Decrypt(respEvent.Content, convKey)
 		if err != nil {
 			continue
 		}
@@ -484,10 +486,12 @@ func sendAndWaitForResponse(ctx context.Context, relayURL string, event *Event, 
 func CheckConnection(secret string) *BunkerSession {
 	pending := pendingConnections.Get(secret)
 	if pending == nil {
+		slog.Debug("NIP-46: CheckConnection - pending connection not found", "secret", secret[:8]+"...")
 		return nil
 	}
 
-	if !pending.Connected || pending.UserPubKey == nil {
+	if !pending.Connected || len(pending.UserPubKey) == 0 {
+		slog.Debug("NIP-46: CheckConnection - not ready", "connected", pending.Connected, "has_pubkey", len(pending.UserPubKey) > 0)
 		return nil
 	}
 
@@ -523,7 +527,7 @@ func CheckConnection(secret string) *BunkerSession {
 
 // defaultNostrConnectRelays returns the default relays for nostrconnect from config
 func defaultNostrConnectRelays() []string {
-	return ConfigGetNostrConnectRelays()
+	return config.GetNostrConnectRelays()
 }
 
 // TryReconnectToSigner attempts to reconnect to an existing approved signer
@@ -540,7 +544,7 @@ func TryReconnectToSigner(signerPubKeyHex string, relays []string) (*BunkerSessi
 	}
 
 	// Compute conversation key
-	convKey, err := GetConversationKey(kp.PrivKey, signerPubKey)
+	convKey, err := nips.GetConversationKey(kp.PrivKey, signerPubKey)
 	if err != nil {
 		return nil, fmt.Errorf("failed to compute conversation key: %v", err)
 	}
@@ -562,7 +566,7 @@ func TryReconnectToSigner(signerPubKeyHex string, relays []string) (*BunkerSessi
 	}
 
 	requestJSON, _ := json.Marshal(request)
-	encryptedContent, err := Nip44Encrypt(string(requestJSON), convKey)
+	encryptedContent, err := nips.Nip44Encrypt(string(requestJSON), convKey)
 	if err != nil {
 		return nil, fmt.Errorf("failed to encrypt request: %v", err)
 	}
@@ -605,7 +609,7 @@ func TryReconnectToSigner(signerPubKeyHex string, relays []string) (*BunkerSessi
 
 		// Fetch user's profile in background (for avatar in settings toggle)
 		go func(pubkeyHex string) {
-			fetchProfilesWithOptions(ConfigGetProfileRelays(), []string{pubkeyHex}, false)
+			fetchProfilesWithOptions(config.GetProfileRelays(), []string{pubkeyHex}, false)
 		}(userPubKey)
 
 		return session, nil

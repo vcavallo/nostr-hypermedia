@@ -113,13 +113,16 @@ func main() {
 		Summary:     make(map[string]CategorySummary),
 	}
 
-	// Find all template files
+	// Find all template files (including subdirectories like templates/kinds/)
 	templatesDir := filepath.Join(projectPath, "templates")
 	templateFiles, err := filepath.Glob(filepath.Join(templatesDir, "*.go"))
 	if err != nil {
 		fmt.Printf("Error finding templates: %v\n", err)
 		os.Exit(1)
 	}
+	// Also include templates/kinds/*.go
+	kindTemplates, _ := filepath.Glob(filepath.Join(templatesDir, "kinds", "*.go"))
+	templateFiles = append(templateFiles, kindTemplates...)
 
 	if len(templateFiles) == 0 {
 		fmt.Printf("No template files found in %s\n", templatesDir)
@@ -1520,7 +1523,7 @@ func runBestPracticesChecks(analysis *TemplateAnalysis, original string, cleaned
 
 	// Check 8: Links have semantic rel attributes (author, next, prev, etc.)
 	// Check for profile links having rel="author"
-	profileLinkPattern := regexp.MustCompile(`<a[^>]*href="/html/profile[^"]*"[^>]*>`)
+	profileLinkPattern := regexp.MustCompile(`<a[^>]*href="/profile[^"]*"[^>]*>`)
 	profileLinks := profileLinkPattern.FindAllString(original, -1)
 	profileLinksWithAuthor := 0
 	for _, link := range profileLinks {
@@ -1988,9 +1991,12 @@ func runDeadCodeAnalysis(report *Report, projectPath string) {
 	// Collect all templates referenced
 	usedTemplates := make(map[string]bool)
 
-	// Read all template files
+	// Read all template files (including subdirectories like templates/kinds/)
 	templatesDir := filepath.Join(projectPath, "templates")
 	templateFiles, _ := filepath.Glob(filepath.Join(templatesDir, "*.go"))
+	// Also include templates/kinds/*.go
+	kindTemplates, _ := filepath.Glob(filepath.Join(templatesDir, "kinds", "*.go"))
+	templateFiles = append(templateFiles, kindTemplates...)
 
 	var allContent strings.Builder
 	for _, file := range templateFiles {
@@ -2061,7 +2067,7 @@ func runDeadCodeAnalysis(report *Report, projectPath string) {
 		for _, pm := range prefixMatches {
 			prefix := pm[1]
 			// Mark common dynamic suffixes as used
-			commonSuffixes := []string{"active", "inactive", "sold", "pending", "live", "ended", "scheduled", "playing", "paused", "loading", "error", "success", "incoming", "outgoing"}
+			commonSuffixes := []string{"active", "inactive", "sold", "pending", "live", "ended", "scheduled", "playing", "paused", "loading", "error", "success", "incoming", "outgoing", "accepted", "declined", "tentative"}
 			for _, suffix := range commonSuffixes {
 				usedClasses[prefix+suffix] = true
 			}
@@ -2111,27 +2117,36 @@ func runDeadCodeAnalysis(report *Report, projectPath string) {
 		usedTemplates[match[1]] = true
 	}
 
-	// Also check for templates referenced in Go code (html.go typically)
-	htmlGoPath := filepath.Join(projectPath, "html.go")
-	if htmlGoContent, err := os.ReadFile(htmlGoPath); err == nil {
-		goContent := string(htmlGoContent)
-		// Look for ExecuteTemplate calls
-		execPattern := regexp.MustCompile(`ExecuteTemplate\([^,]+,\s*"([^"]+)"`)
-		execMatches := execPattern.FindAllStringSubmatch(goContent, -1)
-		for _, match := range execMatches {
-			usedTemplates[match[1]] = true
-		}
-		// Look for template.New("name") calls (fragment templates)
-		newPattern := regexp.MustCompile(`template\.New\("([^"]+)"\)`)
-		newMatches := newPattern.FindAllStringSubmatch(goContent, -1)
-		for _, match := range newMatches {
-			usedTemplates[match[1]] = true
-		}
-		// Look for tmplXxx = "name" constant definitions
-		constPattern := regexp.MustCompile(`tmpl\w+\s*=\s*"([^"]+)"`)
-		constMatches := constPattern.FindAllStringSubmatch(goContent, -1)
-		for _, match := range constMatches {
-			usedTemplates[match[1]] = true
+	// Also check for templates referenced in Go code (multiple files use templates)
+	templateGoFiles := []string{"html.go", "html_handlers.go", "html_auth.go", "flash.go", "sse.go"}
+	for _, goFile := range templateGoFiles {
+		goPath := filepath.Join(projectPath, goFile)
+		if goContent, err := os.ReadFile(goPath); err == nil {
+			goStr := string(goContent)
+			// Look for ExecuteTemplate calls
+			execPattern := regexp.MustCompile(`ExecuteTemplate\([^,]+,\s*"([^"]+)"`)
+			execMatches := execPattern.FindAllStringSubmatch(goStr, -1)
+			for _, match := range execMatches {
+				usedTemplates[match[1]] = true
+			}
+			// Look for template.New("name") calls (fragment templates)
+			newPattern := regexp.MustCompile(`template\.New\("([^"]+)"\)`)
+			newMatches := newPattern.FindAllStringSubmatch(goStr, -1)
+			for _, match := range newMatches {
+				usedTemplates[match[1]] = true
+			}
+			// Look for tmplXxx = "name" constant definitions
+			constPattern := regexp.MustCompile(`tmpl\w+\s*=\s*"([^"]+)"`)
+			constMatches := constPattern.FindAllStringSubmatch(goStr, -1)
+			for _, match := range constMatches {
+				usedTemplates[match[1]] = true
+			}
+			// Look for mustCompileTemplate("name", ...) calls
+			compilePattern := regexp.MustCompile(`mustCompileTemplate\("([^"]+)"`)
+			compileMatches := compilePattern.FindAllStringSubmatch(goStr, -1)
+			for _, match := range compileMatches {
+				usedTemplates[match[1]] = true
+			}
 		}
 	}
 

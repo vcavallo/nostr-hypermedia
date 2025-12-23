@@ -5,15 +5,53 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-	"fmt"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	"nostr-server/internal/cache"
+	"nostr-server/internal/types"
+	"nostr-server/internal/util"
 )
+
+// NIP05CacheStore defines the interface for NIP-05 caching
+type NIP05CacheStore interface {
+	Get(identifier string) (*NIP05Result, bool)
+	Set(identifier string, result *NIP05Result)
+}
+
+// RelayHealthStore defines the interface for relay health tracking
+type RelayHealthStore interface {
+	shouldSkip(relayURL string) bool
+	recordFailure(relayURL string)
+	recordSuccess(relayURL string)
+	recordResponseTime(relayURL string, duration time.Duration)
+	getAverageResponseTime(relayURL string) time.Duration
+	getRelayScore(relayURL string) int
+	SortRelaysByScore(relays []string) []string
+	GetExpectedResponseTime(relays []string, minRelays int) time.Duration
+	GetRelayHealthStats() (healthy int, unhealthy int, avgResponseMs int64)
+	GetRelayHealthDetails() []RelayHealthDetail
+}
+
+// WavlakeCacheStore defines the interface for caching Wavlake track metadata
+type WavlakeCacheStore interface {
+	Get(trackID string) (*WavlakeTrack, bool)
+	Set(trackID string, track *WavlakeTrack, ttl time.Duration)
+}
+
+// LNURLCacheStore defines the interface for caching LNURL pay info
+type LNURLCacheStore interface {
+	Get(pubkey string) (*LNURLPayInfo, bool)
+	Set(pubkey string, info *LNURLPayInfo)
+	SetNotFound(pubkey string)
+}
 
 // Global cache instances - these maintain backward compatibility with existing code
 var (
@@ -33,6 +71,14 @@ var (
 	threadCacheStore       ThreadCacheStore
 	notificationReadStore  NotificationReadStore
 	notificationCacheStore NotificationCacheStore
+	dvmCacheStore          DVMCacheStore
+	dvmMetaCacheStore      DVMMetaCacheStore
+
+	// NIP-05 and relay health caches
+	nip05CacheStore    NIP05CacheStore
+	relayHealthStore   RelayHealthStore
+	wavlakeCache       WavlakeCacheStore
+	lnurlCacheStore    LNURLCacheStore
 
 	// Cache backend (memory or redis)
 	cacheBackend CacheBackend
@@ -69,6 +115,13 @@ func InitCaches() error {
 		threadCacheStore = NewRedisThreadCacheStore(redisClient, "nostr:")
 		notificationReadStore = NewRedisNotificationReadStore(redisClient, "nostr:", cacheConfig.NotificationReadTTL)
 		notificationCacheStore = NewRedisNotificationCacheStore(redisClient, "nostr:")
+		dvmCacheStore = NewRedisDVMCacheStore(redisClient, "nostr:")
+		dvmMetaCacheStore = NewRedisDVMMetaCacheStore(redisClient, "nostr:")
+		eventCache = NewRedisEventCache(redisClient, "nostr:")
+		nip05CacheStore = NewRedisNIP05Cache(redisClient, "nostr:", 24*time.Hour)
+		relayHealthStore = NewRedisRelayHealth(redisClient, "nostr:")
+		wavlakeCache = NewMemoryWavlakeCache() // Memory-only for now, Redis not needed
+		lnurlCacheStore = NewRedisLNURLCache(redisClient, "nostr:", 5*time.Minute)
 
 		slog.Info("Redis cache initialized")
 	} else {
@@ -90,7 +143,7 @@ func InitCaches() error {
 func initMemoryCaches() error {
 	slog.Info("initializing in-memory cache")
 
-	cacheBackend = NewMemoryCache(10000, 2*time.Minute)
+	cacheBackend = cache.NewMemoryCache(10000, 2*time.Minute)
 	cacheBackendType = "memory"
 	sessionStore = NewMemorySessionStore(cacheConfig.SessionTTL)
 	pendingConnStore = NewMemoryPendingConnStore(cacheConfig.PendingConnTTL)
@@ -99,6 +152,13 @@ func initMemoryCaches() error {
 	threadCacheStore = NewMemoryThreadCacheStore()
 	notificationReadStore = NewMemoryNotificationReadStore(cacheConfig.NotificationReadTTL)
 	notificationCacheStore = NewMemoryNotificationCacheStore()
+	dvmCacheStore = NewMemoryDVMCacheStore()
+	dvmMetaCacheStore = NewMemoryDVMMetaCacheStore()
+	eventCache = NewMemoryEventCacheWithMemory(500, 50*1024*1024)
+	nip05CacheStore = NewMemoryNIP05Cache(24 * time.Hour)
+	relayHealthStore = NewMemoryRelayHealth()
+	wavlakeCache = NewMemoryWavlakeCache()
+	lnurlCacheStore = NewMemoryLNURLCache(5 * time.Minute)
 
 	return nil
 }
@@ -182,7 +242,8 @@ func (c *ProfileCacheWrapper) SetNotFound(pubkeys []string) {
 // GetMultiple retrieves multiple profiles, returning found ones and list of missing pubkeys
 // Pubkeys with cached "not found" status are NOT included in missing (they're known to not exist)
 func (c *ProfileCacheWrapper) GetMultiple(pubkeys []string) (found map[string]*ProfileInfo, missing []string) {
-	found = make(map[string]*ProfileInfo)
+	found = make(map[string]*ProfileInfo, len(pubkeys))
+	missing = make([]string, 0, len(pubkeys)) // Pre-allocate for worst case
 	ctx := context.Background()
 
 	keys := make([]string, len(pubkeys))
@@ -192,9 +253,11 @@ func (c *ProfileCacheWrapper) GetMultiple(pubkeys []string) (found map[string]*P
 
 	results, err := c.backend.GetMultiple(ctx, keys)
 	if err != nil {
+		slog.Debug("profile cache GetMultiple error", "error", err, "keys", len(keys))
 		return found, pubkeys
 	}
 
+	var notFoundCount int
 	for i, pubkey := range pubkeys {
 		data, ok := results[keys[i]]
 		if !ok {
@@ -204,14 +267,26 @@ func (c *ProfileCacheWrapper) GetMultiple(pubkeys []string) (found map[string]*P
 
 		var cached CachedProfile
 		if err := json.Unmarshal(data, &cached); err != nil {
+			slog.Debug("profile cache unmarshal error", "pubkey", shortID(pubkey), "error", err)
 			missing = append(missing, pubkey)
 			continue
 		}
 
 		// If it's a "not found" entry, don't add to found but also don't add to missing
-		if !cached.NotFound && cached.Profile != nil {
+		if cached.NotFound {
+			notFoundCount++
+		} else if cached.Profile != nil {
 			found[pubkey] = cached.Profile
+		} else {
+			// Edge case: NotFound=false but Profile=nil - this shouldn't happen
+			// Add to missing to trigger a re-fetch
+			slog.Warn("profile cache: invalid entry (NotFound=false, Profile=nil)", "pubkey", shortID(pubkey))
+			missing = append(missing, pubkey)
 		}
+	}
+
+	if notFoundCount > 0 {
+		slog.Debug("profile cache: entries marked not-found", "count", notFoundCount)
 	}
 
 	return found, missing
@@ -303,6 +378,88 @@ func (c *RelayListCacheWrapper) Set(pubkey string, relayList *RelayList) {
 	c.backend.Set(ctx, "relaylist:"+pubkey, data, ttl)
 }
 
+// GetMultiple retrieves multiple relay lists, returning found ones and list of missing pubkeys
+// Pubkeys with cached "not found" status are NOT included in missing (they're known to not exist)
+func (c *RelayListCacheWrapper) GetMultiple(pubkeys []string) (found map[string]*RelayList, missing []string) {
+	found = make(map[string]*RelayList, len(pubkeys))
+	missing = make([]string, 0, len(pubkeys)) // Pre-allocate for worst case
+	ctx := context.Background()
+
+	keys := make([]string, len(pubkeys))
+	for i, pk := range pubkeys {
+		keys[i] = "relaylist:" + pk
+	}
+
+	results, err := c.backend.GetMultiple(ctx, keys)
+	if err != nil {
+		return found, pubkeys
+	}
+
+	for i, pubkey := range pubkeys {
+		data, ok := results[keys[i]]
+		if !ok {
+			missing = append(missing, pubkey)
+			continue
+		}
+
+		var cached CachedRelayList
+		if err := json.Unmarshal(data, &cached); err != nil {
+			missing = append(missing, pubkey)
+			continue
+		}
+
+		// If it's a "not found" entry, don't add to found but also don't add to missing
+		if !cached.NotFound && cached.RelayList != nil {
+			found[pubkey] = cached.RelayList
+		}
+	}
+
+	return found, missing
+}
+
+// SetMultiple stores multiple relay lists at once (nil lists are stored as "not found")
+func (c *RelayListCacheWrapper) SetMultiple(relayLists map[string]*RelayList) {
+	ctx := context.Background()
+	now := time.Now().Unix()
+
+	for pubkey, relayList := range relayLists {
+		cached := CachedRelayList{
+			RelayList: relayList,
+			FetchedAt: now,
+			NotFound:  relayList == nil,
+		}
+		data, err := json.Marshal(cached)
+		if err != nil {
+			continue
+		}
+
+		ttl := c.config.RelayListTTL
+		if relayList == nil {
+			ttl = c.config.RelayListNotFoundTTL
+		}
+		c.backend.Set(ctx, "relaylist:"+pubkey, data, ttl)
+	}
+}
+
+// SetNotFound marks multiple pubkeys as having no relay list
+func (c *RelayListCacheWrapper) SetNotFound(pubkeys []string) {
+	ctx := context.Background()
+	now := time.Now().Unix()
+
+	for _, pubkey := range pubkeys {
+		cached := CachedRelayList{
+			RelayList: nil,
+			FetchedAt: now,
+			NotFound:  true,
+		}
+		data, err := json.Marshal(cached)
+		if err != nil {
+			continue
+		}
+		c.backend.Set(ctx, "relaylist:"+pubkey, data, c.config.RelayListNotFoundTTL)
+	}
+}
+
 // AvatarCacheWrapper provides typed access to avatar cache
 type AvatarCacheWrapper struct {
 	backend CacheBackend
@@ -390,11 +547,12 @@ func (c *LinkPreviewCacheWrapper) Set(url string, preview *LinkPreview) {
 
 // GetMultiple retrieves multiple previews, returning found ones and missing URLs
 func (c *LinkPreviewCacheWrapper) GetMultiple(urls []string) (found map[string]*LinkPreview, missing []string) {
-	found = make(map[string]*LinkPreview)
+	found = make(map[string]*LinkPreview, len(urls))
+	missing = make([]string, 0, len(urls)) // Pre-allocate for worst case
 	ctx := context.Background()
 
 	keys := make([]string, len(urls))
-	urlByKey := make(map[string]string)
+	urlByKey := make(map[string]string, len(urls))
 	for i, url := range urls {
 		hash := sha256.Sum256([]byte(url))
 		key := "linkpreview:" + hex.EncodeToString(hash[:8])
@@ -429,31 +587,56 @@ func (c *LinkPreviewCacheWrapper) GetMultiple(urls []string) (found map[string]*
 	return found, missing
 }
 
-// EventCache provides in-memory caching for relay queries
-// This stays in-memory only due to short TTL and instance-specific queries
-type EventCache struct {
-	mu      sync.RWMutex
-	entries map[string]*EventCacheEntry
-	maxSize int
-	stopCh  chan struct{}
+// EventCacheStore defines the interface for event caching
+type EventCacheStore interface {
+	Get(relays []string, filter Filter) ([]Event, bool, bool) // events, eose, found
+	Set(relays []string, filter Filter, events []Event, eose bool)
+	Close()
 }
 
-// EventCacheEntry holds cached events with expiration
+// EventCacheEntry holds cached events with expiration (used by memory cache)
 type EventCacheEntry struct {
 	Events    []Event
 	EOSE      bool
 	ExpiresAt time.Time
+	estSize   int64 // Estimated size in bytes
 }
 
-// Global event cache - max 500 cached queries (stays in-memory)
-var eventCache = NewEventCache(500)
+// CachedEventResult is the JSON structure for Redis storage
+type CachedEventResult struct {
+	Events   []Event `json:"events"`
+	EOSE     bool    `json:"eose"`
+	CachedAt int64   `json:"cached_at"`
+}
 
-// NewEventCache creates a new cache with the given max size
-func NewEventCache(maxSize int) *EventCache {
-	cache := &EventCache{
-		entries: make(map[string]*EventCacheEntry),
-		maxSize: maxSize,
-		stopCh:  make(chan struct{}),
+// Estimated bytes per event (conservative estimate)
+const estimatedBytesPerEvent = 1536 // 1.5KB
+
+// Global event cache - initialized in InitCaches()
+var eventCache EventCacheStore
+
+// MemoryEventCache provides in-memory caching for relay queries
+type MemoryEventCache struct {
+	mu          sync.RWMutex
+	entries     map[string]*EventCacheEntry
+	maxSize     int           // Maximum number of entries
+	maxMemory   int64         // Maximum estimated memory in bytes
+	currentMem  int64         // Current estimated memory usage
+	stopCh      chan struct{}
+}
+
+// NewMemoryEventCache creates a new cache with the given max size (no memory limit)
+func NewMemoryEventCache(maxSize int) *MemoryEventCache {
+	return NewMemoryEventCacheWithMemory(maxSize, 0)
+}
+
+// NewMemoryEventCacheWithMemory creates a cache with both count and memory limits
+func NewMemoryEventCacheWithMemory(maxSize int, maxMemory int64) *MemoryEventCache {
+	cache := &MemoryEventCache{
+		entries:   make(map[string]*EventCacheEntry),
+		maxSize:   maxSize,
+		maxMemory: maxMemory,
+		stopCh:    make(chan struct{}),
 	}
 	// Start background cleanup
 	go cache.cleanupLoop()
@@ -461,21 +644,15 @@ func NewEventCache(maxSize int) *EventCache {
 }
 
 // Close stops the cleanup goroutine
-func (c *EventCache) Close() {
+func (c *MemoryEventCache) Close() {
 	close(c.stopCh)
 }
 
 // buildCacheKey creates a deterministic key from query parameters
 func buildEventCacheKey(relays []string, filter Filter) string {
-	// Sort relays for consistent keys
-	sortedRelays := make([]string, len(relays))
-	copy(sortedRelays, relays)
-	sort.Strings(sortedRelays)
-
-	// Sort authors for consistent keys
-	sortedAuthors := make([]string, len(filter.Authors))
-	copy(sortedAuthors, filter.Authors)
-	sort.Strings(sortedAuthors)
+	// Sort relays and authors for consistent keys
+	sortedRelays := util.SortedCopy(relays)
+	sortedAuthors := util.SortedCopy(filter.Authors)
 
 	// Sort kinds for consistent keys
 	sortedKinds := make([]int, len(filter.Kinds))
@@ -491,13 +668,15 @@ func buildEventCacheKey(relays []string, filter Filter) string {
 	sb.WriteString("|kinds:")
 	for i, k := range sortedKinds {
 		if i > 0 {
-			sb.WriteString(",")
+			sb.WriteByte(',')
 		}
-		sb.WriteString(fmt.Sprintf("%d", k))
+		sb.WriteString(strconv.Itoa(k))
 	}
-	sb.WriteString(fmt.Sprintf("|limit:%d", filter.Limit))
+	sb.WriteString("|limit:")
+	sb.WriteString(strconv.Itoa(filter.Limit))
 	if filter.Until != nil {
-		sb.WriteString(fmt.Sprintf("|until:%d", *filter.Until))
+		sb.WriteString("|until:")
+		sb.WriteString(strconv.FormatInt(*filter.Until, 10))
 	}
 
 	// Hash the key to keep it short
@@ -520,7 +699,7 @@ func getEventTTL(filter Filter) time.Duration {
 }
 
 // Get retrieves cached events if available and not expired
-func (c *EventCache) Get(relays []string, filter Filter) ([]Event, bool, bool) {
+func (c *MemoryEventCache) Get(relays []string, filter Filter) ([]Event, bool, bool) {
 	key := buildEventCacheKey(relays, filter)
 
 	c.mu.RLock()
@@ -538,7 +717,7 @@ func (c *EventCache) Get(relays []string, filter Filter) ([]Event, bool, bool) {
 }
 
 // Set stores events in the cache
-func (c *EventCache) Set(relays []string, filter Filter, events []Event, eose bool) {
+func (c *MemoryEventCache) Set(relays []string, filter Filter, events []Event, eose bool) {
 	key := buildEventCacheKey(relays, filter)
 	ttl := getEventTTL(filter)
 
@@ -546,23 +725,39 @@ func (c *EventCache) Set(relays []string, filter Filter, events []Event, eose bo
 	eventsCopy := make([]Event, len(events))
 	copy(eventsCopy, events)
 
+	// Estimate size of this entry
+	entrySize := int64(len(events)) * estimatedBytesPerEvent
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	// Simple eviction if at max size: remove oldest entries
+	// Remove existing entry if present (reclaim its memory)
+	if existing, ok := c.entries[key]; ok {
+		c.currentMem -= existing.estSize
+		delete(c.entries, key)
+	}
+
+	// Evict if at max count
 	if len(c.entries) >= c.maxSize {
 		c.evictOldest()
+	}
+
+	// Evict if at max memory (and memory limit is set)
+	if c.maxMemory > 0 && c.currentMem+entrySize > c.maxMemory {
+		c.evictForMemory(entrySize)
 	}
 
 	c.entries[key] = &EventCacheEntry{
 		Events:    eventsCopy,
 		EOSE:      eose,
 		ExpiresAt: time.Now().Add(ttl),
+		estSize:   entrySize,
 	}
+	c.currentMem += entrySize
 }
 
 // evictOldest removes the oldest 10% of entries (must hold write lock)
-func (c *EventCache) evictOldest() {
+func (c *MemoryEventCache) evictOldest() {
 	toRemove := c.maxSize / 10
 	if toRemove < 1 {
 		toRemove = 1
@@ -571,11 +766,12 @@ func (c *EventCache) evictOldest() {
 	type keyExpiry struct {
 		key     string
 		expires time.Time
+		size    int64
 	}
 
 	entries := make([]keyExpiry, 0, len(c.entries))
 	for k, v := range c.entries {
-		entries = append(entries, keyExpiry{k, v.ExpiresAt})
+		entries = append(entries, keyExpiry{k, v.ExpiresAt, v.estSize})
 	}
 
 	// Sort by expiration time (oldest first)
@@ -585,12 +781,38 @@ func (c *EventCache) evictOldest() {
 
 	// Remove oldest entries
 	for i := 0; i < toRemove && i < len(entries); i++ {
+		c.currentMem -= entries[i].size
+		delete(c.entries, entries[i].key)
+	}
+}
+
+// evictForMemory removes entries until we have room for neededBytes (must hold write lock)
+func (c *MemoryEventCache) evictForMemory(neededBytes int64) {
+	type keyExpiry struct {
+		key     string
+		expires time.Time
+		size    int64
+	}
+
+	entries := make([]keyExpiry, 0, len(c.entries))
+	for k, v := range c.entries {
+		entries = append(entries, keyExpiry{k, v.ExpiresAt, v.estSize})
+	}
+
+	// Sort by expiration time (oldest first)
+	sort.Slice(entries, func(i, j int) bool {
+		return entries[i].expires.Before(entries[j].expires)
+	})
+
+	// Remove entries until we have enough room
+	for i := 0; i < len(entries) && c.currentMem+neededBytes > c.maxMemory; i++ {
+		c.currentMem -= entries[i].size
 		delete(c.entries, entries[i].key)
 	}
 }
 
 // cleanupLoop periodically removes expired entries
-func (c *EventCache) cleanupLoop() {
+func (c *MemoryEventCache) cleanupLoop() {
 	ticker := time.NewTicker(1 * time.Minute)
 	defer ticker.Stop()
 	for {
@@ -604,13 +826,14 @@ func (c *EventCache) cleanupLoop() {
 }
 
 // cleanup removes all expired entries
-func (c *EventCache) cleanup() {
+func (c *MemoryEventCache) cleanup() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	now := time.Now()
 	for key, entry := range c.entries {
 		if now.After(entry.ExpiresAt) {
+			c.currentMem -= entry.estSize
 			delete(c.entries, key)
 		}
 	}
@@ -632,20 +855,27 @@ var avatarHTTPClient = &http.Client{
 }
 
 // validateAvatarURL checks if an avatar URL is reachable via HEAD request
-func validateAvatarURL(url string) bool {
-	if url == "" {
+func validateAvatarURL(avatarURL string) bool {
+	if avatarURL == "" {
 		return false
 	}
 
 	// Only validate http/https URLs
-	if !strings.HasPrefix(url, "http://") && !strings.HasPrefix(url, "https://") {
+	if !strings.HasPrefix(avatarURL, "http://") && !strings.HasPrefix(avatarURL, "https://") {
 		return false
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
+	// Parse URL and check for SSRF
+	parsed, err := url.Parse(avatarURL)
+	if err != nil {
+		return false
+	}
+	if util.IsPrivateHost(parsed.Hostname()) {
+		return false
+	}
 
-	req, err := http.NewRequestWithContext(ctx, "HEAD", url, nil)
+	// Client timeout handles request lifecycle; no need for context timeout
+	req, err := http.NewRequest("HEAD", avatarURL, nil)
 	if err != nil {
 		return false
 	}
@@ -688,16 +918,8 @@ func GetValidatedAvatarURL(url string) string {
 	return DefaultAvatarURL
 }
 
-// LinkPreview holds Open Graph metadata for a URL
-type LinkPreview struct {
-	URL         string
-	Title       string
-	Description string
-	Image       string
-	SiteName    string
-	FetchedAt   time.Time
-	Failed      bool // true if we tried but couldn't get OG tags
-}
+// Type alias for internal/types
+type LinkPreview = types.LinkPreview
 
 // --- Wallet Info Cache ---
 // Caches wallet balance and transaction data to avoid repeated NWC requests
@@ -753,10 +975,35 @@ func DeleteCachedWalletInfo(userPubkeyHex string) {
 // --- Wallet Info Prefetch ---
 // Tracks in-flight wallet info fetches so multiple requests can share the same fetch
 
+type walletPrefetchEntry struct {
+	ch        chan *CachedWalletInfo
+	startedAt time.Time
+}
+
 var (
-	walletInfoPrefetch   = make(map[string]chan *CachedWalletInfo)
+	walletInfoPrefetch   = make(map[string]*walletPrefetchEntry)
 	walletInfoPrefetchMu sync.Mutex
 )
+
+func init() {
+	// Cleanup stale prefetch entries every 2 minutes
+	go func() {
+		ticker := time.NewTicker(2 * time.Minute)
+		defer ticker.Stop()
+		for range ticker.C {
+			walletInfoPrefetchMu.Lock()
+			now := time.Now()
+			for key, entry := range walletInfoPrefetch {
+				// Remove entries older than 2 minutes (should complete much faster)
+				if now.Sub(entry.startedAt) > 2*time.Minute {
+					delete(walletInfoPrefetch, key)
+					close(entry.ch)
+				}
+			}
+			walletInfoPrefetchMu.Unlock()
+		}
+	}()
+}
 
 // StartWalletInfoPrefetch starts a background fetch of wallet info if not already in progress.
 // Returns a channel that will receive the result (or nil if fetch already started by another caller).
@@ -771,7 +1018,10 @@ func StartWalletInfoPrefetch(userPubkeyHex string) chan *CachedWalletInfo {
 
 	// Create result channel (buffered to avoid blocking)
 	resultCh := make(chan *CachedWalletInfo, 1)
-	walletInfoPrefetch[userPubkeyHex] = resultCh
+	walletInfoPrefetch[userPubkeyHex] = &walletPrefetchEntry{
+		ch:        resultCh,
+		startedAt: time.Now(),
+	}
 
 	return resultCh
 }
@@ -779,17 +1029,17 @@ func StartWalletInfoPrefetch(userPubkeyHex string) chan *CachedWalletInfo {
 // CompleteWalletInfoPrefetch marks a prefetch as complete and notifies waiters
 func CompleteWalletInfoPrefetch(userPubkeyHex string, result *CachedWalletInfo) {
 	walletInfoPrefetchMu.Lock()
-	ch, exists := walletInfoPrefetch[userPubkeyHex]
+	entry, exists := walletInfoPrefetch[userPubkeyHex]
 	delete(walletInfoPrefetch, userPubkeyHex)
 	walletInfoPrefetchMu.Unlock()
 
-	if exists && ch != nil {
+	if exists && entry != nil && entry.ch != nil {
 		// Send result to waiting channel (non-blocking)
 		select {
-		case ch <- result:
+		case entry.ch <- result:
 		default:
 		}
-		close(ch)
+		close(entry.ch)
 	}
 }
 
@@ -797,18 +1047,27 @@ func CompleteWalletInfoPrefetch(userPubkeyHex string, result *CachedWalletInfo) 
 // Returns (result, found) - found is false if no prefetch in progress
 func WaitForWalletInfoPrefetch(userPubkeyHex string, timeout time.Duration) (*CachedWalletInfo, bool) {
 	walletInfoPrefetchMu.Lock()
-	ch, exists := walletInfoPrefetch[userPubkeyHex]
+	entry, exists := walletInfoPrefetch[userPubkeyHex]
 	walletInfoPrefetchMu.Unlock()
 
-	if !exists || ch == nil {
+	if !exists || entry == nil || entry.ch == nil {
 		return nil, false
 	}
 
 	// Wait for result with timeout
 	select {
-	case result := <-ch:
+	case result := <-entry.ch:
 		return result, true
 	case <-time.After(timeout):
 		return nil, false
 	}
+}
+
+// getCachedProfile returns a cached profile or nil if not found/not cached.
+// This is a convenience wrapper around profileCache.Get().
+func getCachedProfile(pubkey string) *ProfileInfo {
+	if profile, _, inCache := profileCache.Get(pubkey); inCache && profile != nil {
+		return profile
+	}
+	return nil
 }

@@ -240,9 +240,11 @@ func analyzeProject() Report {
 		{"Search results", "labels", "a11y.search_results"},
 	}
 
-	// Scan templates
+	// Scan templates (including subdirectories like templates/kinds/)
 	templatesPath := filepath.Join(projectPath, "templates")
 	templateFiles, _ := filepath.Glob(filepath.Join(templatesPath, "*.go"))
+	kindTemplates, _ := filepath.Glob(filepath.Join(templatesPath, "kinds", "*.go"))
+	templateFiles = append(templateFiles, kindTemplates...)
 
 	// Combine all template content for analysis
 	var allTemplateContent strings.Builder
@@ -667,9 +669,11 @@ func runFeatureChecks(report *Report) {
 		},
 	}
 
-	// Read all relevant files
+	// Read all relevant files (including subdirectories like templates/kinds/)
 	templatesPath := filepath.Join(projectPath, "templates")
 	templateFiles, _ := filepath.Glob(filepath.Join(templatesPath, "*.go"))
+	kindTemplates, _ := filepath.Glob(filepath.Join(templatesPath, "kinds", "*.go"))
+	templateFiles = append(templateFiles, kindTemplates...)
 	var allTemplateContent strings.Builder
 	for _, file := range templateFiles {
 		if content, err := os.ReadFile(file); err == nil {

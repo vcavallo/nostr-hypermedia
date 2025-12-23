@@ -1,0 +1,132 @@
+/* Marketplace stall styles (kind 30017) */
+.stall-card {
+  background: var(--bg-secondary);
+  border-radius: 8px;
+  padding: 16px;
+  margin: 12px 0;
+}
+.stall-header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 8px;
+}
+.stall-icon {
+  font-size: 24px;
+}
+.stall-name {
+  font-size: 18px;
+  font-weight: 600;
+  color: var(--text-primary);
+  margin: 0;
+}
+.stall-description {
+  font-size: 14px;
+  color: var(--text-secondary);
+  margin-bottom: 12px;
+  line-height: 1.5;
+}
+.stall-meta {
+  display: flex;
+  gap: 16px;
+  flex-wrap: wrap;
+  font-size: 13px;
+  color: var(--text-muted);
+}
+.stall-shipping summary {
+  cursor: pointer;
+  color: var(--accent);
+}
+.stall-shipping-list {
+  margin: 8px 0 0 0;
+  padding-left: 20px;
+  font-size: 12px;
+}
+
+/* Marketplace product styles (kind 30018) */
+.product-card {
+  display: flex;
+  gap: 16px;
+  margin: 12px 0;
+}
+.product-images {
+  flex-shrink: 0;
+  width: 150px;
+}
+.product-image-main {
+  width: 100%;
+  border-radius: 8px;
+  object-fit: cover;
+  aspect-ratio: 1;
+}
+.product-image-thumbs {
+  display: flex;
+  gap: 4px;
+  margin-top: 4px;
+}
+.product-image-thumb {
+  width: 32px;
+  height: 32px;
+  border-radius: 4px;
+  object-fit: cover;
+}
+.product-info {
+  flex: 1;
+  min-width: 0;
+}
+.product-name {
+  font-size: 18px;
+  font-weight: 600;
+  color: var(--text-primary);
+  margin: 0 0 8px 0;
+}
+.product-price {
+  font-size: 20px;
+  font-weight: 700;
+  color: var(--accent);
+  margin-bottom: 8px;
+}
+.product-price-currency {
+  font-size: 14px;
+  font-weight: 400;
+  color: var(--text-secondary);
+  margin-left: 4px;
+}
+.product-description {
+  font-size: 14px;
+  color: var(--text-secondary);
+  margin-bottom: 8px;
+  line-height: 1.5;
+}
+.product-quantity {
+  font-size: 13px;
+  color: var(--success);
+  margin-bottom: 8px;
+}
+.product-specs {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 4px 12px;
+  font-size: 13px;
+  margin-bottom: 8px;
+}
+.product-specs dt {
+  color: var(--text-muted);
+}
+.product-specs dd {
+  color: var(--text-secondary);
+  margin: 0;
+}
+.product-categories {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.product-category {
+  font-size: 12px;
+  color: var(--accent);
+  text-decoration: none;
+}
+.product-category:hover {
+  text-decoration: underline;
+}

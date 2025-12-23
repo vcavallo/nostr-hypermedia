@@ -2,6 +2,7 @@ package main
 
 import (
 	"compress/gzip"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -9,11 +10,15 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
+
+	"nostr-server/internal/config"
+	"nostr-server/internal/util"
 )
 
 const maxBodySize = 32 * 1024 // 32KB max for POST requests
@@ -23,6 +28,7 @@ var precomputedCSP = "default-src 'self'; " +
 	"img-src * data:; " +
 	"media-src *; " +
 	"frame-src https://www.youtube.com https://www.youtube-nocookie.com; " +
+	"frame-ancestors 'self'; " +
 	"style-src 'self' 'unsafe-inline'; " +
 	"script-src 'self'"
 
@@ -192,7 +198,7 @@ func securityHeaders(next http.HandlerFunc) http.HandlerFunc {
 					"method", r.Method,
 					"path", r.URL.Path,
 				)
-				http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+				util.RespondInternalError(w, "Internal Server Error")
 			}
 		}()
 
@@ -226,6 +232,15 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Initialize request batchers (after caches)
+	InitBatchers()
+
+	// Initialize subscription aggregator (keeps cache warm)
+	InitAggregator()
+
+	// Initialize i18n strings
+	config.InitI18n()
+
 	initTemplates()
 	initAuthTemplates()
 	initGiphy()
@@ -238,9 +253,9 @@ func main() {
 	// Static files (serves pre-compressed .gz when available)
 	http.HandleFunc("/static/", staticFileHandler)
 
-	// JSON API
-	http.HandleFunc("/timeline", timelineHandler)
-	http.HandleFunc("/thread/", threadHandler)
+	// JSON API (legacy - use HTML endpoints for hypermedia)
+	http.HandleFunc("/api/timeline", timelineHandler)
+	http.HandleFunc("/api/thread/", threadHandler)
 
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/" {
@@ -256,49 +271,65 @@ func main() {
 	})
 
 	// HTML pages
-	http.HandleFunc("/html/timeline", gzipMiddleware(securityHeaders(htmlTimelineHandler)))
-	http.HandleFunc("/html/thread/", gzipMiddleware(securityHeaders(htmlThreadHandler)))
-	http.HandleFunc("/html/profile/edit", gzipMiddleware(securityHeaders(limitBody(htmlProfileEditHandler, maxBodySize))))
-	http.HandleFunc("/html/profile/", gzipMiddleware(securityHeaders(htmlProfileHandler)))
-	http.HandleFunc("/html/login", gzipMiddleware(securityHeaders(limitBody(htmlLoginHandler, maxBodySize))))
-	http.HandleFunc("/html/logout", securityHeaders(htmlLogoutHandler))
-	http.HandleFunc("/html/post", securityHeaders(limitBody(htmlPostNoteHandler, maxBodySize)))
-	http.HandleFunc("/html/reply", securityHeaders(limitBody(htmlReplyHandler, maxBodySize)))
-	http.HandleFunc("/html/react", securityHeaders(limitBody(htmlReactHandler, maxBodySize)))
-	http.HandleFunc("/html/zap", securityHeaders(limitBody(htmlZapHandler, maxBodySize)))
-	http.HandleFunc("/html/bookmark", securityHeaders(limitBody(htmlBookmarkHandler, maxBodySize)))
-	http.HandleFunc("/html/mute", securityHeaders(limitBody(htmlMuteHandler, maxBodySize)))
-	http.HandleFunc("/html/repost", securityHeaders(limitBody(htmlRepostHandler, maxBodySize)))
-	http.HandleFunc("/html/follow", securityHeaders(limitBody(htmlFollowHandler, maxBodySize)))
-	http.HandleFunc("/html/quote/", gzipMiddleware(securityHeaders(htmlQuoteHandler)))
-	http.HandleFunc("/html/check-connection", securityHeaders(htmlCheckConnectionHandler))
-	http.HandleFunc("/html/reconnect", securityHeaders(htmlReconnectHandler))
-	http.HandleFunc("/html/theme", securityHeaders(htmlThemeHandler))
-	http.HandleFunc("/html/notifications", gzipMiddleware(securityHeaders(htmlNotificationsHandler)))
-	http.HandleFunc("/html/mutes", gzipMiddleware(securityHeaders(htmlMutesHandler)))
-	http.HandleFunc("/html/wallet", gzipMiddleware(securityHeaders(htmlWalletHandler)))
-	http.HandleFunc("/html/wallet/connect", securityHeaders(limitBody(htmlWalletConnectHandler, maxBodySize)))
-	http.HandleFunc("/html/wallet/disconnect", securityHeaders(limitBody(htmlWalletDisconnectHandler, maxBodySize)))
-	http.HandleFunc("/html/wallet/info", securityHeaders(htmlWalletInfoHandler))
-	http.HandleFunc("/html/search", gzipMiddleware(securityHeaders(htmlSearchHandler)))
-	http.HandleFunc("/html/timeline/check-new", securityHeaders(htmlCheckNewNotesHandler))
+	http.HandleFunc("/timeline", gzipMiddleware(securityHeaders(htmlTimelineHandler)))
+	http.HandleFunc("/thread/", gzipMiddleware(securityHeaders(htmlThreadHandler)))
+	http.HandleFunc("/profile/edit", gzipMiddleware(securityHeaders(limitBody(htmlProfileEditHandler, maxBodySize))))
+	http.HandleFunc("/profile/", gzipMiddleware(securityHeaders(htmlProfileHandler)))
+	http.HandleFunc("/fragment/author/", gzipMiddleware(securityHeaders(htmlAuthorFragmentHandler)))
+	http.HandleFunc("/login", gzipMiddleware(securityHeaders(limitBody(htmlLoginHandler, maxBodySize))))
+	http.HandleFunc("/logout", securityHeaders(htmlLogoutHandler))
+	http.HandleFunc("/post", securityHeaders(limitBody(htmlPostNoteHandler, maxBodySize)))
+	http.HandleFunc("/reply", securityHeaders(limitBody(htmlReplyHandler, maxBodySize)))
+	http.HandleFunc("/react", securityHeaders(limitBody(htmlReactHandler, maxBodySize)))
+	http.HandleFunc("/zap", securityHeaders(limitBody(htmlZapHandler, maxBodySize)))
+	http.HandleFunc("/bookmark", securityHeaders(limitBody(htmlBookmarkHandler, maxBodySize)))
+	http.HandleFunc("/mute", securityHeaders(limitBody(htmlMuteHandler, maxBodySize)))
+	http.HandleFunc("/repost", securityHeaders(limitBody(htmlRepostHandler, maxBodySize)))
+	http.HandleFunc("/follow", securityHeaders(limitBody(htmlFollowHandler, maxBodySize)))
+	http.HandleFunc("/quote/", gzipMiddleware(securityHeaders(htmlQuoteHandler)))
+	http.HandleFunc("/report/", gzipMiddleware(securityHeaders(limitBody(htmlReportHandler, maxBodySize))))
+	http.HandleFunc("/check-connection", securityHeaders(htmlCheckConnectionHandler))
+	http.HandleFunc("/reconnect", securityHeaders(htmlReconnectHandler))
+	http.HandleFunc("/theme", securityHeaders(htmlThemeHandler))
+	http.HandleFunc("/notifications", gzipMiddleware(securityHeaders(htmlNotificationsHandler)))
+	http.HandleFunc("/mutes", gzipMiddleware(securityHeaders(htmlMutesHandler)))
+	http.HandleFunc("/wallet", gzipMiddleware(securityHeaders(htmlWalletHandler)))
+	http.HandleFunc("/wallet/connect", securityHeaders(limitBody(htmlWalletConnectHandler, maxBodySize)))
+	http.HandleFunc("/wallet/disconnect", securityHeaders(limitBody(htmlWalletDisconnectHandler, maxBodySize)))
+	http.HandleFunc("/wallet/info", securityHeaders(htmlWalletInfoHandler))
+	http.HandleFunc("/search", gzipMiddleware(securityHeaders(htmlSearchHandler)))
+	http.HandleFunc("/timeline/check-new", securityHeaders(htmlCheckNewNotesHandler))
 	http.HandleFunc("/health", healthHandler)
 	http.HandleFunc("/health/live", healthLiveHandler)
 	http.HandleFunc("/health/ready", healthReadyHandler)
 	http.HandleFunc("/metrics", metricsHandler)
 
+	// Debug/profiling endpoints (DEV_MODE only)
+	if os.Getenv("DEV_MODE") == "1" {
+		http.HandleFunc("/debug/memstats", memStatsHandler)
+		slog.Info("debug endpoints enabled", "endpoints", "/debug/memstats")
+	}
+
 	// GIF picker endpoints
-	http.HandleFunc("/html/gifs", gzipMiddleware(securityHeaders(htmlGifsHandler)))
-	http.HandleFunc("/html/gifs/search", gzipMiddleware(securityHeaders(htmlGifsSearchHandler)))
-	http.HandleFunc("/html/gifs/select", securityHeaders(htmlGifsSelectHandler))
-	http.HandleFunc("/html/gifs/clear", securityHeaders(htmlGifsClearHandler))
-	http.HandleFunc("/html/gifs/close", securityHeaders(htmlGifsCloseHandler))
-	http.HandleFunc("/html/compose", gzipMiddleware(securityHeaders(htmlComposeHandler)))
+	http.HandleFunc("/gifs", gzipMiddleware(securityHeaders(htmlGifsHandler)))
+	http.HandleFunc("/gifs/search", gzipMiddleware(securityHeaders(htmlGifsSearchHandler)))
+	http.HandleFunc("/gifs/select", securityHeaders(htmlGifsSelectHandler))
+	http.HandleFunc("/gifs/clear", securityHeaders(htmlGifsClearHandler))
+	http.HandleFunc("/gifs/close", securityHeaders(htmlGifsCloseHandler))
+	http.HandleFunc("/compose", gzipMiddleware(securityHeaders(htmlComposeHandler)))
+
+	// Mention autocomplete endpoints
+	http.HandleFunc("/mentions", gzipMiddleware(securityHeaders(htmlMentionsHandler)))
+	http.HandleFunc("/mentions/select", securityHeaders(htmlMentionSelectHandler))
+
+	// Legacy /html/* redirects for backwards compatibility
+	http.HandleFunc("/html/", legacyHTMLRedirectHandler)
 
 	// SSE
 	http.HandleFunc("/stream/timeline", streamTimelineHandler)
 	http.HandleFunc("/stream/notifications", securityHeaders(streamNotificationsHandler))
 	http.HandleFunc("/stream/config", securityHeaders(streamConfigHandler))
+	http.HandleFunc("/stream/corrections", securityHeaders(streamCorrectionsHandler))
 
 	StartConnectionListener(defaultNostrConnectRelays()) // NIP-46 listener
 	go WarmupConnections()                               // Warm up relays
@@ -318,17 +349,20 @@ func main() {
 			if err := ReloadFeedsConfig(); err != nil {
 				slog.Error("failed to reload feeds config", "error", err)
 			}
-			if err := ReloadRelaysConfig(); err != nil {
+			if err := config.ReloadRelaysConfig(); err != nil {
 				slog.Error("failed to reload relays config", "error", err)
 			}
 			if err := ReloadNavigationConfig(); err != nil {
 				slog.Error("failed to reload navigation config", "error", err)
 			}
-			if err := ReloadI18nConfig(); err != nil {
+			if err := config.ReloadI18nConfig(); err != nil {
 				slog.Error("failed to reload i18n config", "error", err)
 			}
-			if err := ReloadSiteConfig(); err != nil {
+			if err := config.ReloadSiteConfig(); err != nil {
 				slog.Error("failed to reload site config", "error", err)
+			}
+			if err := config.ReloadClientConfig(); err != nil {
+				slog.Error("failed to reload client config", "error", err)
 			}
 			// Notify connected clients to refresh
 			BroadcastConfigReload()
@@ -346,7 +380,36 @@ func main() {
 		IdleTimeout:       120 * time.Second,
 		MaxHeaderBytes:    1 << 20, // 1MB
 	}
-	if err := server.ListenAndServe(); err != nil {
+
+	// Graceful shutdown handling
+	go func() {
+		sigterm := make(chan os.Signal, 1)
+		signal.Notify(sigterm, syscall.SIGTERM, syscall.SIGINT)
+		<-sigterm
+		slog.Info("shutdown signal received, cleaning up...")
+
+		// Create context with timeout for shutdown
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+
+		// Shutdown HTTP server gracefully
+		if err := server.Shutdown(ctx); err != nil {
+			slog.Error("server shutdown error", "error", err)
+		}
+
+		// Stop subscription aggregator
+		StopAggregator()
+
+		// Close relay pool connections
+		relayPool.Close()
+
+		// Close event cache cleanup goroutine
+		eventCache.Close()
+
+		slog.Info("cleanup complete")
+	}()
+
+	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		slog.Error("server failed", "error", err)
 		os.Exit(1)
 	}
@@ -355,7 +418,7 @@ func main() {
 func healthHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 
-	healthy, unhealthy, avgMs := relayHealth.GetRelayHealthStats()
+	healthy, unhealthy, avgMs := relayHealthStore.GetRelayHealthStats()
 	activeConns, maxConns := relayPool.GetConnectionStats()
 	cacheHits := cacheHitsTotal.Load()
 	cacheMisses := cacheMissesTotal.Load()
@@ -388,6 +451,14 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 			"misses":   cacheMisses,
 			"hit_rate": fmt.Sprintf("%.1f%%", cacheHitRate),
 		},
+		"aggregator": func() map[string]interface{} {
+			count, lastEvent, running := GetAggregatorStats()
+			return map[string]interface{}{
+				"running":         running,
+				"event_count":     count,
+				"last_event_time": lastEvent,
+			}
+		}(),
 		"http": map[string]interface{}{
 			"requests_total": httpRequestsTotal.Load(),
 			"errors_total":   httpErrorsTotal.Load(),
@@ -399,7 +470,7 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 
 	// Add verbose relay details if requested
 	if r.URL.Query().Get("verbose") == "1" {
-		response["relay_details"] = relayHealth.GetRelayHealthDetails()
+		response["relay_details"] = relayHealthStore.GetRelayHealthDetails()
 	}
 
 	// Determine status
@@ -432,7 +503,7 @@ func healthLiveHandler(w http.ResponseWriter, r *http.Request) {
 func healthReadyHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 
-	healthy, unhealthy, _ := relayHealth.GetRelayHealthStats()
+	healthy, unhealthy, _ := relayHealthStore.GetRelayHealthStats()
 
 	response := map[string]interface{}{
 		"status": "ready",
@@ -448,6 +519,28 @@ func healthReadyHandler(w http.ResponseWriter, r *http.Request) {
 	if err := json.NewEncoder(w).Encode(response); err != nil {
 		slog.Error("failed to encode readiness response", "error", err)
 	}
+}
+
+// memStatsHandler returns memory statistics for profiling
+func memStatsHandler(w http.ResponseWriter, r *http.Request) {
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+
+	w.Header().Set("Content-Type", "application/json")
+	response := map[string]interface{}{
+		"alloc_mb":        float64(m.Alloc) / 1024 / 1024,
+		"total_alloc_mb":  float64(m.TotalAlloc) / 1024 / 1024,
+		"sys_mb":          float64(m.Sys) / 1024 / 1024,
+		"heap_alloc_mb":   float64(m.HeapAlloc) / 1024 / 1024,
+		"heap_sys_mb":     float64(m.HeapSys) / 1024 / 1024,
+		"heap_inuse_mb":   float64(m.HeapInuse) / 1024 / 1024,
+		"heap_objects":    m.HeapObjects,
+		"stack_inuse_mb":  float64(m.StackInuse) / 1024 / 1024,
+		"goroutines":      runtime.NumGoroutine(),
+		"gc_cycles":       m.NumGC,
+		"gc_pause_total_ms": float64(m.PauseTotalNs) / 1000000,
+	}
+	json.NewEncoder(w).Encode(response)
 }
 
 // staticFileHandler serves static files (serves .gz versions when available)
@@ -489,4 +582,18 @@ func setContentType(w http.ResponseWriter, originalPath string) {
 	case strings.HasSuffix(originalPath, ".svg"):
 		w.Header().Set("Content-Type", "image/svg+xml")
 	}
+}
+
+// legacyHTMLRedirectHandler redirects old /html/* URLs to new clean URLs
+func legacyHTMLRedirectHandler(w http.ResponseWriter, r *http.Request) {
+	// Strip /html prefix and redirect
+	newPath := strings.TrimPrefix(r.URL.Path, "/html")
+	if newPath == "" {
+		newPath = "/"
+	}
+	// Preserve query string
+	if r.URL.RawQuery != "" {
+		newPath += "?" + r.URL.RawQuery
+	}
+	http.Redirect(w, r, newPath, http.StatusMovedPermanently)
 }

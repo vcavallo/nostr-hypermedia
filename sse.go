@@ -9,6 +9,9 @@ import (
 	"net/http"
 	"sync"
 	"time"
+
+	"nostr-server/internal/config"
+	"nostr-server/internal/util"
 )
 
 // SSE event types
@@ -23,18 +26,81 @@ const (
 // ConfigReloadBroadcaster manages SSE clients waiting for config reload events
 type ConfigReloadBroadcaster struct {
 	mu      sync.RWMutex
-	clients map[chan struct{}]struct{}
+	clients map[chan struct{}]*clientInfo
 }
 
+// clientInfo tracks metadata about SSE clients for cleanup
+type clientInfo struct {
+	addedAt  time.Time
+	closeOnce sync.Once
+}
+
+// Maximum age for SSE client channels before cleanup
+const maxSSEClientAge = 15 * time.Minute
+
 var configBroadcaster = &ConfigReloadBroadcaster{
-	clients: make(map[chan struct{}]struct{}),
+	clients: make(map[chan struct{}]*clientInfo),
+}
+
+func init() {
+	// Start periodic cleanup of orphaned SSE clients
+	go configBroadcaster.cleanupLoop()
+}
+
+// cleanupLoop periodically removes orphaned client channels
+func (b *ConfigReloadBroadcaster) cleanupLoop() {
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		b.cleanup()
+	}
+}
+
+// cleanup removes channels that are too old (likely orphaned)
+func (b *ConfigReloadBroadcaster) cleanup() {
+	now := time.Now()
+	type toRemoveItem struct {
+		ch   chan struct{}
+		info *clientInfo
+	}
+	var toRemove []toRemoveItem
+
+	b.mu.RLock()
+	for ch, info := range b.clients {
+		if now.Sub(info.addedAt) > maxSSEClientAge {
+			toRemove = append(toRemove, toRemoveItem{ch, info})
+		}
+	}
+	b.mu.RUnlock()
+
+	if len(toRemove) == 0 {
+		return
+	}
+
+	b.mu.Lock()
+	for _, item := range toRemove {
+		// Double-check it still exists under write lock
+		if _, exists := b.clients[item.ch]; exists {
+			delete(b.clients, item.ch)
+			// Close channel exactly once using sync.Once
+			item.info.closeOnce.Do(func() {
+				close(item.ch)
+			})
+		}
+	}
+	b.mu.Unlock()
+
+	if len(toRemove) > 0 {
+		slog.Debug("SSE config: cleaned up orphaned clients", "count", len(toRemove))
+	}
 }
 
 // Subscribe adds a client channel to receive reload notifications
 func (b *ConfigReloadBroadcaster) Subscribe() chan struct{} {
 	ch := make(chan struct{}, 1)
 	b.mu.Lock()
-	b.clients[ch] = struct{}{}
+	b.clients[ch] = &clientInfo{addedAt: time.Now()}
 	b.mu.Unlock()
 	return ch
 }
@@ -43,14 +109,15 @@ func (b *ConfigReloadBroadcaster) Subscribe() chan struct{} {
 // Channel is closed after removal to unblock any pending receives
 func (b *ConfigReloadBroadcaster) Unsubscribe(ch chan struct{}) {
 	b.mu.Lock()
-	_, exists := b.clients[ch]
+	info, exists := b.clients[ch]
 	delete(b.clients, ch)
 	b.mu.Unlock()
 
-	// Close channel outside lock to unblock pending receives
-	// Only close if it was in the map (prevents double-close)
-	if exists {
-		close(ch)
+	// Close channel exactly once using sync.Once
+	if exists && info != nil {
+		info.closeOnce.Do(func() {
+			close(ch)
+		})
 	}
 }
 
@@ -99,7 +166,7 @@ func streamTimelineHandler(w http.ResponseWriter, r *http.Request) {
 	// Check if client supports SSE
 	flusher, ok := w.(http.Flusher)
 	if !ok {
-		http.Error(w, "SSE not supported", http.StatusInternalServerError)
+		util.RespondInternalError(w, "SSE not supported")
 		return
 	}
 
@@ -107,7 +174,7 @@ func streamTimelineHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
-	w.Header().Set("Access-Control-Allow-Origin", "*")
+	// Note: No CORS header - SSE is same-origin only for security
 
 	// Track SSE connection
 	IncrementSSEConnections()
@@ -117,7 +184,7 @@ func streamTimelineHandler(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	relays := parseStringList(q.Get("relays"))
 	if len(relays) == 0 {
-		relays = ConfigGetDefaultRelays()
+		relays = config.GetDefaultRelays()
 	}
 	authors := parseStringList(q.Get("authors"))
 	kinds := parseIntList(q.Get("kinds"))
@@ -156,12 +223,31 @@ func streamTimelineHandler(w http.ResponseWriter, r *http.Request) {
 		}(relay)
 	}
 
-	// Close channels when all relay goroutines complete
+	// Close channels when all relay goroutines complete or context is cancelled
+	closerDone := make(chan struct{})
 	go func() {
-		wg.Wait()
+		defer close(closerDone)
+		// Wait for relay goroutines to finish
+		done := make(chan struct{})
+		go func() {
+			wg.Wait()
+			close(done)
+		}()
+		// Exit when either all relays finish or context is cancelled
+		select {
+		case <-done:
+		case <-ctx.Done():
+			// Context cancelled - relay goroutines will exit soon
+			// Wait briefly for clean shutdown, then exit
+			select {
+			case <-done:
+			case <-time.After(100 * time.Millisecond):
+			}
+		}
 		close(eventChan)
 		close(eoseChan)
 	}()
+	defer func() { <-closerDone }() // Ensure closer goroutine exits before we return
 
 	// Send initial connection event
 	sendSSEEvent(w, flusher, "connected", map[string]interface{}{
@@ -216,9 +302,7 @@ func streamTimelineHandler(w http.ResponseWriter, r *http.Request) {
 			}
 
 			// Try to get cached profile (don't block SSE for profile fetch)
-			if profile, _, ok := profileCache.Get(evt.PubKey); ok && profile != nil {
-				item.AuthorProfile = profile
-			}
+			item.AuthorProfile = getCachedProfile(evt.PubKey)
 
 			// Send event to client
 			sendSSEEvent(w, flusher, SSEEventNote, item)
@@ -321,21 +405,21 @@ func streamNotificationsHandler(w http.ResponseWriter, r *http.Request) {
 	// Check format parameter (required)
 	format := r.URL.Query().Get("format")
 	if format != "html" && format != "json" {
-		http.Error(w, "Missing or invalid format parameter. Use ?format=html or ?format=json", http.StatusBadRequest)
+		util.RespondBadRequest(w, "Missing or invalid format parameter. Use ?format=html or ?format=json")
 		return
 	}
 
 	// Must be logged in
 	session := getSessionFromRequest(r)
 	if session == nil || !session.Connected {
-		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		util.RespondUnauthorized(w, "Unauthorized")
 		return
 	}
 
 	// Check if client supports SSE
 	flusher, ok := w.(http.Flusher)
 	if !ok {
-		http.Error(w, "SSE not supported", http.StatusInternalServerError)
+		util.RespondInternalError(w, "SSE not supported")
 		return
 	}
 
@@ -353,7 +437,7 @@ func streamNotificationsHandler(w http.ResponseWriter, r *http.Request) {
 	userPubkeyHex := hex.EncodeToString(session.UserPubKey)
 
 	// Get user's relays
-	relays := ConfigGetDefaultRelays()
+	relays := config.GetDefaultRelays()
 	if session.UserRelayList != nil && len(session.UserRelayList.Read) > 0 {
 		relays = session.UserRelayList.Read
 	}
@@ -386,12 +470,27 @@ func streamNotificationsHandler(w http.ResponseWriter, r *http.Request) {
 		}(relay)
 	}
 
-	// Close channels when all relay goroutines complete
+	// Close channels when all relay goroutines complete or context is cancelled
+	closerDone := make(chan struct{})
 	go func() {
-		wg.Wait()
+		defer close(closerDone)
+		done := make(chan struct{})
+		go func() {
+			wg.Wait()
+			close(done)
+		}()
+		select {
+		case <-done:
+		case <-ctx.Done():
+			select {
+			case <-done:
+			case <-time.After(100 * time.Millisecond):
+			}
+		}
 		close(eventChan)
 		close(eoseChan)
 	}()
+	defer func() { <-closerDone }()
 
 	// Ping ticker to keep connection alive
 	pingTicker := time.NewTicker(30 * time.Second)
@@ -467,6 +566,150 @@ type NotificationEvent struct {
 	Content   string `json:"content"`
 }
 
+// Correction represents a failed action that needs UI rollback
+type Correction struct {
+	Target string // CSS selector for the element to update
+	HTML   string // Replacement HTML content
+	Action string // Action type: "react", "bookmark", "mute", "repost"
+}
+
+// CorrectionsBroadcaster manages per-session SSE clients for action corrections
+type CorrectionsBroadcaster struct {
+	mu      sync.RWMutex
+	clients map[string]map[chan Correction]*correctionClientInfo // sessionID -> channels
+}
+
+type correctionClientInfo struct {
+	addedAt   time.Time
+	closeOnce sync.Once
+}
+
+const maxCorrectionClientAge = 15 * time.Minute
+
+var correctionsBroadcaster = &CorrectionsBroadcaster{
+	clients: make(map[string]map[chan Correction]*correctionClientInfo),
+}
+
+func init() {
+	go correctionsBroadcaster.cleanupLoop()
+}
+
+func (b *CorrectionsBroadcaster) cleanupLoop() {
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		b.cleanup()
+	}
+}
+
+func (b *CorrectionsBroadcaster) cleanup() {
+	now := time.Now()
+	type toRemoveItem struct {
+		sessionID string
+		ch        chan Correction
+		info      *correctionClientInfo
+	}
+	var toRemove []toRemoveItem
+
+	b.mu.RLock()
+	for sessionID, clients := range b.clients {
+		for ch, info := range clients {
+			if now.Sub(info.addedAt) > maxCorrectionClientAge {
+				toRemove = append(toRemove, toRemoveItem{sessionID, ch, info})
+			}
+		}
+	}
+	b.mu.RUnlock()
+
+	if len(toRemove) == 0 {
+		return
+	}
+
+	b.mu.Lock()
+	for _, item := range toRemove {
+		if clients, exists := b.clients[item.sessionID]; exists {
+			if _, chExists := clients[item.ch]; chExists {
+				delete(clients, item.ch)
+				item.info.closeOnce.Do(func() {
+					close(item.ch)
+				})
+				if len(clients) == 0 {
+					delete(b.clients, item.sessionID)
+				}
+			}
+		}
+	}
+	b.mu.Unlock()
+
+	if len(toRemove) > 0 {
+		slog.Debug("SSE corrections: cleaned up orphaned clients", "count", len(toRemove))
+	}
+}
+
+// Subscribe adds a client channel for a session to receive corrections
+func (b *CorrectionsBroadcaster) Subscribe(sessionID string) chan Correction {
+	ch := make(chan Correction, 10)
+	b.mu.Lock()
+	if b.clients[sessionID] == nil {
+		b.clients[sessionID] = make(map[chan Correction]*correctionClientInfo)
+	}
+	b.clients[sessionID][ch] = &correctionClientInfo{addedAt: time.Now()}
+	b.mu.Unlock()
+	return ch
+}
+
+// Unsubscribe removes a client channel for a session
+func (b *CorrectionsBroadcaster) Unsubscribe(sessionID string, ch chan Correction) {
+	b.mu.Lock()
+	if clients, exists := b.clients[sessionID]; exists {
+		if info, chExists := clients[ch]; chExists {
+			delete(clients, ch)
+			info.closeOnce.Do(func() {
+				close(ch)
+			})
+			if len(clients) == 0 {
+				delete(b.clients, sessionID)
+			}
+		}
+	}
+	b.mu.Unlock()
+}
+
+// SendCorrection sends a correction to all clients for a session
+func (b *CorrectionsBroadcaster) SendCorrection(sessionID string, correction Correction) {
+	b.mu.RLock()
+	clients, exists := b.clients[sessionID]
+	if !exists {
+		b.mu.RUnlock()
+		return
+	}
+	// Copy channels to avoid holding lock during send
+	channels := make([]chan Correction, 0, len(clients))
+	for ch := range clients {
+		channels = append(channels, ch)
+	}
+	b.mu.RUnlock()
+
+	for _, ch := range channels {
+		select {
+		case ch <- correction:
+		default:
+			// Channel full, skip
+		}
+	}
+	slog.Debug("SSE corrections: sent correction", "session", sessionID[:8], "action", correction.Action)
+}
+
+// SendCorrectionToSession is a convenience function for sending corrections
+func SendCorrectionToSession(sessionID string, target, html, action string) {
+	correctionsBroadcaster.SendCorrection(sessionID, Correction{
+		Target: target,
+		HTML:   html,
+		Action: action,
+	})
+}
+
 // streamConfigHandler handles SSE connections for config reload notifications
 // GET /stream/config
 // Sends a "reload" event when server config is reloaded (via SIGHUP or Nostr)
@@ -474,7 +717,7 @@ func streamConfigHandler(w http.ResponseWriter, r *http.Request) {
 	// Check if client supports SSE
 	flusher, ok := w.(http.Flusher)
 	if !ok {
-		http.Error(w, "SSE not supported", http.StatusInternalServerError)
+		util.RespondInternalError(w, "SSE not supported")
 		return
 	}
 
@@ -513,6 +756,67 @@ func streamConfigHandler(w http.ResponseWriter, r *http.Request) {
 
 		case <-pingTicker.C:
 			// Send ping to keep connection alive
+			sendSSEHTML(w, flusher, SSEEventPing, "")
+		}
+	}
+}
+
+// streamCorrectionsHandler handles SSE connections for action correction notifications
+// GET /stream/corrections
+// Sends correction events when async action publishes fail
+func streamCorrectionsHandler(w http.ResponseWriter, r *http.Request) {
+	// Must be logged in
+	session := getSessionFromRequest(r)
+	if session == nil || !session.Connected {
+		util.RespondUnauthorized(w, "Unauthorized")
+		return
+	}
+
+	// Check if client supports SSE
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		util.RespondInternalError(w, "SSE not supported")
+		return
+	}
+
+	// Set SSE headers
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+
+	// Track SSE connection
+	IncrementSSEConnections()
+	defer DecrementSSEConnections()
+
+	ctx := r.Context()
+
+	// Subscribe to corrections for this session
+	correctionChan := correctionsBroadcaster.Subscribe(session.ID)
+	defer correctionsBroadcaster.Unsubscribe(session.ID, correctionChan)
+
+	// Ping ticker to keep connection alive
+	pingTicker := time.NewTicker(30 * time.Second)
+	defer pingTicker.Stop()
+
+	slog.Debug("SSE corrections: client connected", "session", session.ID[:8])
+
+	// Event loop
+	for {
+		select {
+		case <-ctx.Done():
+			slog.Debug("SSE corrections: client disconnected", "session", session.ID[:8])
+			return
+
+		case correction, ok := <-correctionChan:
+			if !ok {
+				return
+			}
+			// Send correction as HTML that HelmJS can swap
+			// Format: target selector in event name, HTML in data
+			// HelmJS will use h-target from the SSE template
+			sendSSEHTML(w, flusher, "correction", correction.HTML)
+
+		case <-pingTicker.C:
 			sendSSEHTML(w, flusher, SSEEventPing, "")
 		}
 	}

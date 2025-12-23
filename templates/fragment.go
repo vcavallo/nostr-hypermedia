@@ -18,21 +18,39 @@ func GetFragmentTemplate() string {
 // Also includes OOB update for main nav to sync active states.
 var fragmentTemplate = `{{define "fragment"}}{{$site := siteConfig}}<title>{{.Title}} - {{$site.Site.Name}}</title>
 {{if .KindFilters}}<div class="kind-filter" id="kind-filter">
-  {{range .KindFilters}}
-  <a href="{{.Href}}" h-get h-target="#page-content" h-swap="inner" h-replace-url h-scroll="top" h-indicator="#nav-loading" class="{{if .Active}}active{{end}}">{{.Title}}</a>
-  {{end}}
+  {{range .KindFilters}}{{if .IsDropdown}}<details class="kind-filter-dropdown{{if .Active}} active{{end}}">
+    <summary>{{.Title}}</summary>
+    <div class="kind-filter-dropdown-menu">
+      {{range .Children}}<a href="{{.Href}}" h-get h-target="#page-content" h-swap="inner" h-replace-url h-scroll="top" h-indicator="#nav-loading" h-prefetch class="{{if .Active}}active{{end}}">{{.Title}}</a>{{end}}
+    </div>
+  </details>{{else}}<a href="{{.Href}}" h-get h-target="#page-content" h-swap="inner" h-replace-url h-scroll="top" h-indicator="#nav-loading" h-prefetch class="{{if .Active}}active{{end}}">{{.Title}}</a>{{end}}{{end}}
 </div>{{end}}
 {{if and .LoggedIn .ShowPostForm}}
 <div class="post-form-container">
   <div id="post-error" class="form-error" role="alert" aria-live="polite"></div>
-  <form method="POST" action="/html/post" class="post-form" id="post-form" h-post h-target="#post-form" h-swap="outer" h-indicator="#post-spinner" h-error-target="#post-error">
+  <form method="POST" action="/post" class="post-form" id="post-form" h-post h-target="#post-form" h-swap="outer" h-indicator="#post-spinner" h-error-target="#post-error">
     <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
+    <input type="hidden" id="mentions-data-post" name="mentions" value="{}">
     <label for="post-content" class="sr-only">Write a new note</label>
     <textarea id="post-content" name="content" placeholder="What's on your mind?"></textarea>
+    <a href="{{buildURL "/mentions" "target" "post"}}" h-get h-target="#mentions-dropdown-post" h-swap="inner" h-trigger="input debounce:300 from:#post-content" h-include="#post-content" hidden aria-hidden="true" aria-label="Mention autocomplete trigger"></a>
+    <div id="mentions-dropdown-post" class="mentions-dropdown"></div>
     <div id="gif-attachment-post"></div>
     <div class="post-actions">
       <button type="submit" class="btn-primary">{{i18n "btn.post"}} <span id="post-spinner" class="h-indicator"><span class="h-spinner"></span></span></button>
-      {{if .ShowGifButton}}<a href="/html/gifs?target=post" h-get h-target="#gif-panel-post" h-swap="inner" class="btn-primary post-gif" title="Add GIF">Add GIF</a>{{end}}
+      {{if .ShowGifButton}}<a href="{{buildURL "/gifs" "target" "post"}}" h-get h-target="#gif-panel-post" h-swap="inner" class="btn-primary post-gif" title="Add GIF">Add GIF</a>{{end}}
+      <details class="cw-dropdown">
+        <summary class="cw-toggle" title="{{i18n "label.content_warning"}}">⚠️</summary>
+        <div class="cw-options">
+          <select name="content_warning" class="cw-select" aria-label="{{i18n "label.content_warning"}}">
+            <option value="">{{i18n "option.no_warning"}}</option>
+            <option value="nsfw">NSFW</option>
+            <option value="spoiler">{{i18n "option.spoiler"}}</option>
+            <option value="sensitive">{{i18n "option.sensitive"}}</option>
+          </select>
+          <input type="text" name="content_warning_custom" class="cw-custom" placeholder="{{i18n "placeholder.custom_warning"}}">
+        </div>
+      </details>
     </div>
   </form>
   <div id="gif-panel-post"></div>
@@ -45,8 +63,9 @@ var fragmentTemplate = `{{define "fragment"}}{{$site := siteConfig}}<title>{{.Ti
 {{template "nav-oob" .}}{{end}}
 
 {{define "nav-oob"}}
-<span id="feed-tabs" h-oob="morph">{{range .FeedModes}}{{if eq .IconOnly "always"}}<a href="{{.Href}}" h-get h-target="#page-content" h-swap="inner" h-push-url h-scroll="top" h-indicator="#nav-loading" class="nav-icon{{if .Active}} active{{end}}" title="{{.Title}}"{{if .Active}} aria-current="page"{{end}}>{{.Icon}}</a>{{else if eq .IconOnly "mobile"}}<a href="{{.Href}}" h-get h-target="#page-content" h-swap="inner" h-push-url h-scroll="top" h-indicator="#nav-loading" class="nav-tab{{if .Active}} active{{end}}"{{if .Active}} aria-current="page"{{end}}><span class="icon-mobile-only" title="{{.Title}}">{{.Icon}}</span><span class="icon-desktop-only">{{if .Icon}}{{.Icon}} {{end}}{{.Title}}</span></a>{{else if eq .IconOnly "desktop"}}<a href="{{.Href}}" h-get h-target="#page-content" h-swap="inner" h-push-url h-scroll="top" h-indicator="#nav-loading" class="nav-tab{{if .Active}} active{{end}}"{{if .Active}} aria-current="page"{{end}}><span class="icon-desktop-only" title="{{.Title}}">{{.Icon}}</span><span class="icon-mobile-only">{{if .Icon}}{{.Icon}} {{end}}{{.Title}}</span></a>{{else}}<a href="{{.Href}}" h-get h-target="#page-content" h-swap="inner" h-push-url h-scroll="top" h-indicator="#nav-loading" class="nav-tab{{if .Active}} active{{end}}"{{if .Active}} aria-current="page"{{end}}>{{if .Icon}}{{.Icon}} {{end}}{{.Title}}</a>{{end}}{{end}}</span>
-<span id="login-btn" h-oob="morph">{{if not .LoggedIn}}<a href="/html/login" class="btn-primary">{{i18n "btn.login"}}</a>{{end}}</span>
+<span id="feed-tabs" h-oob="morph">{{range .FeedModes}}{{if .IsDropdown}}<details class="feed-dropdown{{if .Active}} active{{end}}"><summary class="nav-tab{{if .Active}} active{{end}}">{{if .Icon}}{{.Icon}} {{end}}{{.Title}}</summary><div class="feed-dropdown-menu">{{range .Children}}<a href="{{.Href}}" h-get h-target="#page-content" h-swap="inner" h-push-url h-scroll="top" h-indicator="#nav-loading" class="feed-dropdown-item{{if .Active}} active{{end}}"{{if .Active}} aria-current="page"{{end}}>{{.Title}}</a>{{end}}</div></details>{{else if eq .IconOnly "always"}}<a href="{{.Href}}" h-get h-target="#page-content" h-swap="inner" h-push-url h-scroll="top" h-indicator="#nav-loading" class="nav-icon{{if .Active}} active{{end}}" title="{{.Title}}"{{if .Active}} aria-current="page"{{end}}>{{.Icon}}</a>{{else if eq .IconOnly "mobile"}}<a href="{{.Href}}" h-get h-target="#page-content" h-swap="inner" h-push-url h-scroll="top" h-indicator="#nav-loading" class="nav-tab{{if .Active}} active{{end}}"{{if .Active}} aria-current="page"{{end}}><span class="icon-mobile-only" title="{{.Title}}">{{.Icon}}</span><span class="icon-desktop-only">{{if .Icon}}{{.Icon}} {{end}}{{.Title}}</span></a>{{else if eq .IconOnly "desktop"}}<a href="{{.Href}}" h-get h-target="#page-content" h-swap="inner" h-push-url h-scroll="top" h-indicator="#nav-loading" class="nav-tab{{if .Active}} active{{end}}"{{if .Active}} aria-current="page"{{end}}><span class="icon-desktop-only" title="{{.Title}}">{{.Icon}}</span><span class="icon-mobile-only">{{if .Icon}}{{.Icon}} {{end}}{{.Title}}</span></a>{{else}}<a href="{{.Href}}" h-get h-target="#page-content" h-swap="inner" h-push-url h-scroll="top" h-indicator="#nav-loading" class="nav-tab{{if .Active}} active{{end}}"{{if .Active}} aria-current="page"{{end}}>{{if .Icon}}{{.Icon}} {{end}}{{.Title}}</a>{{end}}{{end}}</span>
+<span id="login-btn" h-oob="morph">{{if not .LoggedIn}}<a href="/login" class="btn-primary">{{i18n "btn.login"}}</a>{{end}}</span>
+{{if .LoggedIn}}<span class="notification-badge{{if not .HasUnreadNotifications}} notification-badge-hidden{{end}}" id="notification-badge" role="status"{{if .HasUnreadNotifications}} aria-label="New notifications"{{end}} h-oob="outer"></span>{{end}}
 <a id="config-reload" href="{{.CurrentURL}}{{if contains .CurrentURL "?"}}&amp;{{else}}?{{end}}refresh=1" h-get h-target="body" h-swap="morph" h-select="body" h-trigger="h:sse-message from:#config-sse" hidden aria-hidden="true" aria-label="Reload page configuration" h-oob="morph"></a>
 {{end}}`
 
@@ -67,16 +86,38 @@ func GetFollowButtonTemplate() string {
 
 // followButtonTemplate renders just the follow button form for HelmJS action responses.
 var followButtonTemplate = `{{define "follow-button"}}
-<form method="POST" action="/html/follow" class="inline-form" h-post h-target="#follow-btn-{{.Pubkey}}" h-swap="inner"{{if .IsFollowing}} h-confirm="Unfollow this user?"{{end}}>
+<form method="POST" action="/follow" class="inline-form" h-post h-target="#follow-btn-{{.Pubkey}}" h-swap="inner" h-indicator="#follow-spinner-{{.Pubkey}}"{{if .IsFollowing}} h-confirm="Unfollow this user?"{{end}}>
   <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
   <input type="hidden" name="pubkey" value="{{.Pubkey}}">
   <input type="hidden" name="return_url" value="{{.ReturnURL}}">
   {{if .IsFollowing}}
   <input type="hidden" name="action" value="unfollow">
-  <button type="submit" class="follow-btn unfollow">{{i18n "btn.unfollow"}}</button>
+  <button type="submit" class="follow-btn unfollow">{{i18n "btn.unfollow"}} <span id="follow-spinner-{{.Pubkey}}" class="h-indicator"><span class="h-spinner"></span></span></button>
   {{else}}
   <input type="hidden" name="action" value="follow">
-  <button type="submit" class="follow-btn follow">{{i18n "btn.follow"}}</button>
+  <button type="submit" class="follow-btn follow">{{i18n "btn.follow"}} <span id="follow-spinner-{{.Pubkey}}" class="h-indicator"><span class="h-spinner"></span></span></button>
+  {{end}}
+</form>
+{{end}}`
+
+// GetMuteButtonTemplate returns a template for rendering just the mute button.
+// Used for HelmJS partial updates after mute/unmute actions.
+func GetMuteButtonTemplate() string {
+	return muteButtonTemplate
+}
+
+// muteButtonTemplate renders just the mute button form for HelmJS action responses.
+var muteButtonTemplate = `{{define "mute-button"}}
+<form method="POST" action="/mute" class="inline-form" h-post h-target="#mute-btn-{{.Pubkey}}" h-swap="inner" h-indicator="#mute-spinner-{{.Pubkey}}"{{if .IsMuted}} h-confirm="Unmute this user?"{{else}} h-confirm="Mute this user? Their content will be hidden from your timeline."{{end}}>
+  <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
+  <input type="hidden" name="pubkey" value="{{.Pubkey}}">
+  <input type="hidden" name="return_url" value="{{.ReturnURL}}">
+  {{if .IsMuted}}
+  <input type="hidden" name="action" value="unmute">
+  <button type="submit" class="mute-btn unmute">{{i18n "action.unmute"}} <span id="mute-spinner-{{.Pubkey}}" class="h-indicator"><span class="h-spinner"></span></span></button>
+  {{else}}
+  <input type="hidden" name="action" value="mute">
+  <button type="submit" class="mute-btn mute">{{i18n "action.mute"}} <span id="mute-spinner-{{.Pubkey}}" class="h-indicator"><span class="h-spinner"></span></span></button>
   {{end}}
 </form>
 {{end}}`
@@ -108,7 +149,7 @@ var notificationsAppendTemplate = `{{define "notifications-append"}}
   <header class="notification-header">
     <span class="notification-icon">{{.TypeIcon}}</span>
     <div class="notification-meta">
-      <a href="/html/profile/{{.AuthorNpub}}" class="notification-author" rel="author">{{displayName .AuthorProfile .AuthorNpubShort}}</a>
+      <a href="/profile/{{.AuthorNpub}}" class="notification-author" rel="author">{{displayName .AuthorProfile .AuthorNpubShort}}</a>
       <span class="notification-action">{{.TypeLabel}}</span>
       <time class="notification-time" datetime="{{isoTime .Event.CreatedAt}}">{{.TimeAgo}}</time>
     </div>
@@ -120,9 +161,9 @@ var notificationsAppendTemplate = `{{define "notifications-append"}}
   <div class="notification-target-content">{{.TargetContentHTML}}</div>
   {{end}}
   {{if .TargetEventID}}
-  <a href="/html/thread/{{.TargetEventID}}" class="notification-link" rel="related">{{i18n "nav.view_note"}} →</a>
+  <a href="/thread/{{noteLink .TargetEventID}}" h-get h-target="#page-content" h-swap="inner" h-push-url h-prefetch class="notification-link" rel="related">{{i18n "nav.view_note"}} →</a>
   {{else if .Event}}
-  <a href="/html/thread/{{.Event.ID}}" class="notification-link" rel="related">{{i18n "nav.view_note"}} →</a>
+  <a href="/thread/{{eventLink .Event.ID .Event.Kind .Event.Pubkey .Event.DTag}}" h-get h-target="#page-content" h-swap="inner" h-push-url h-prefetch class="notification-link" rel="related">{{i18n "nav.view_note"}} →</a>
   {{end}}
 </li>
 {{end}}
@@ -141,7 +182,7 @@ var searchAppendTemplate = `{{define "search-append"}}
   {{template "author-header" .}}
   <div class="note-content">{{.ContentHTML}}</div>
   <div class="note-footer">
-    <a href="/html/thread/{{.ID}}" class="text-link" rel="related">{{i18n "nav.view_thread"}}</a>
+    <a href="/thread/{{eventLink .ID .Kind .Pubkey .DTag}}" h-get h-target="#page-content" h-swap="inner" h-push-url h-prefetch class="text-link" rel="related">{{i18n "nav.view_thread"}}</a>
     {{if or (gt .ReplyCount 0) (gt .ReactionCount 0)}}
     <span class="note-stats">
       {{if gt .ReplyCount 0}}<span class="stat-badge">💬 {{.ReplyCount}}</span>{{end}}
@@ -171,18 +212,35 @@ func GetReplyResponseTemplate() string {
 
 // replyResponseTemplate returns the cleared reply form plus the new reply as OOB prepend.
 var replyResponseTemplate = `{{define "reply-response"}}
-<form method="POST" action="/html/reply" class="reply-form" id="reply-form" h-post h-target="#reply-form" h-swap="outer" h-indicator="#reply-spinner" h-error-target="#reply-error">
+<form method="POST" action="/reply" class="reply-form" id="reply-form" h-post h-target="#reply-form" h-swap="outer" h-indicator="#reply-spinner" h-error-target="#reply-error">
   <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
   <input type="hidden" name="reply_to" value="{{.ReplyTo}}">
   <input type="hidden" name="reply_to_pubkey" value="{{.ReplyToPubkey}}">
+  <input type="hidden" name="reply_to_kind" value="{{.ReplyToKind}}">
+  {{if .ReplyToDTag}}<input type="hidden" name="reply_to_dtag" value="{{.ReplyToDTag}}">{{end}}
   <input type="hidden" name="reply_count" value="{{.ReplyCount}}">
+  <input type="hidden" id="mentions-data-reply" name="mentions" value="{}">
   <label for="reply-content" class="sr-only">Write a reply</label>
   <textarea id="reply-content" name="content" placeholder="Write a reply..."></textarea>
+  <a href="{{buildURL "/mentions" "target" "reply"}}" h-get h-target="#mentions-dropdown-reply" h-swap="inner" h-trigger="input debounce:300 from:#reply-content" h-include="#reply-content" hidden aria-hidden="true" aria-label="Mention autocomplete trigger"></a>
+  <div id="mentions-dropdown-reply" class="mentions-dropdown"></div>
   <div id="gif-attachment-reply"></div>
   <div class="reply-actions-minimal">
     <button type="submit" class="btn-primary">{{i18n "btn.reply"}} <span id="reply-spinner" class="h-indicator"><span class="h-spinner"></span></span></button>
-    {{if .ShowGifButton}}<a href="/html/gifs?target=reply" h-get h-target="#gif-panel-reply" h-swap="inner" class="btn-primary" title="Add GIF">Add GIF</a>{{end}}
-    <a href="/html/profile/{{.UserNpub}}" class="reply-avatar-link" title="{{.UserDisplayName}}" rel="author">
+    {{if .ShowGifButton}}<a href="{{buildURL "/gifs" "target" "reply"}}" h-get h-target="#gif-panel-reply" h-swap="inner" class="btn-primary" title="Add GIF">Add GIF</a>{{end}}
+    <details class="cw-dropdown">
+      <summary class="cw-toggle" title="{{i18n "label.content_warning"}}">⚠️</summary>
+      <div class="cw-options">
+        <select name="content_warning" class="cw-select" aria-label="{{i18n "label.content_warning"}}">
+          <option value="">{{i18n "option.no_warning"}}</option>
+          <option value="nsfw">NSFW</option>
+          <option value="spoiler">{{i18n "option.spoiler"}}</option>
+          <option value="sensitive">{{i18n "option.sensitive"}}</option>
+        </select>
+        <input type="text" name="content_warning_custom" class="cw-custom" placeholder="{{i18n "placeholder.custom_warning"}}">
+      </div>
+    </details>
+    <a href="/profile/{{.UserNpub}}" class="reply-avatar-link" title="{{.UserDisplayName}}" rel="author">
       <img src="{{if .UserAvatarURL}}{{.UserAvatarURL}}{{else}}/static/avatar.jpg{{end}}" alt="Your avatar" class="reply-avatar" loading="lazy">
     </a>
   </div>
@@ -202,14 +260,29 @@ var replyResponseTemplate = `{{define "reply-response"}}
 // postResponseTemplate returns the cleared post form plus the new note as OOB prepend.
 // The new note has h-oob="prepend" targeting #notes-list so it appears at the top.
 var postResponseTemplate = `{{define "post-response"}}
-<form method="POST" action="/html/post" class="post-form" id="post-form" h-post h-target="#post-form" h-swap="outer" h-indicator="#post-spinner" h-error-target="#post-error">
+<form method="POST" action="/post" class="post-form" id="post-form" h-post h-target="#post-form" h-swap="outer" h-indicator="#post-spinner" h-error-target="#post-error">
   <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
+  <input type="hidden" id="mentions-data-post" name="mentions" value="{}">
   <label for="post-content" class="sr-only">Write a new note</label>
   <textarea id="post-content" name="content" placeholder="What's on your mind?"></textarea>
+  <a href="{{buildURL "/mentions" "target" "post"}}" h-get h-target="#mentions-dropdown-post" h-swap="inner" h-trigger="input debounce:300 from:#post-content" h-include="#post-content" hidden aria-hidden="true" aria-label="Mention autocomplete trigger"></a>
+  <div id="mentions-dropdown-post" class="mentions-dropdown"></div>
   <div id="gif-attachment-post"></div>
   <div class="post-actions">
     <button type="submit" class="btn-primary">{{i18n "btn.post"}} <span id="post-spinner" class="h-indicator"><span class="h-spinner"></span></span></button>
-    {{if .ShowGifButton}}<a href="/html/gifs?target=post" h-get h-target="#gif-panel-post" h-swap="inner" class="btn-primary post-gif" title="Add GIF">Add GIF</a>{{end}}
+    {{if .ShowGifButton}}<a href="{{buildURL "/gifs" "target" "post"}}" h-get h-target="#gif-panel-post" h-swap="inner" class="btn-primary post-gif" title="Add GIF">Add GIF</a>{{end}}
+    <details class="cw-dropdown">
+      <summary class="cw-toggle" title="{{i18n "label.content_warning"}}">⚠️</summary>
+      <div class="cw-options">
+        <select name="content_warning" class="cw-select" aria-label="{{i18n "label.content_warning"}}">
+          <option value="">{{i18n "option.no_warning"}}</option>
+          <option value="nsfw">NSFW</option>
+          <option value="spoiler">{{i18n "option.spoiler"}}</option>
+          <option value="sensitive">{{i18n "option.sensitive"}}</option>
+        </select>
+        <input type="text" name="content_warning_custom" class="cw-custom" placeholder="{{i18n "placeholder.custom_warning"}}">
+      </div>
+    </details>
   </div>
 </form>
 <div id="gif-panel-post" h-oob="inner"></div>
@@ -222,11 +295,11 @@ var profileAppendTemplate = `{{define "profile-append"}}
 {{range .Items}}
 <article class="note" aria-label="Note by {{displayName $.Profile $.NpubShort}}">
   <div class="note-author">
-    <a href="/html/profile/{{$.Npub}}" class="text-muted" rel="author">
+    <a href="/profile/{{$.Npub}}" class="text-muted" rel="author">
     <img class="author-avatar" src="{{if and $.Profile $.Profile.Picture}}{{avatarURL $.Profile.Picture}}{{else}}/static/avatar.jpg{{end}}" alt="{{displayName $.Profile "User"}}'s avatar" loading="lazy">
     </a>
     <div class="author-info">
-      <a href="/html/profile/{{$.Npub}}" class="text-muted" rel="author">
+      <a href="/profile/{{$.Npub}}" class="text-muted" rel="author">
       <span class="author-name">{{displayName $.Profile $.NpubShort}}</span>
       </a>
       <time class="author-time" datetime="{{isoTime .CreatedAt}}">{{formatTime .CreatedAt}}</time>
@@ -253,10 +326,8 @@ func GetNewNotesIndicatorTemplate() string {
 //   - RefreshURL: URL to navigate to when clicked
 //   - Count: number of new posts (0 = empty indicator)
 //   - Label: display label (e.g., "5 new notes")
-var newNotesIndicatorTemplate = `{{define "new-notes-indicator"}}<div id="new-notes-indicator" h-poll="/html/timeline/check-new?since={{.Since}}&amp;kinds={{.Kinds}}&amp;filter={{.Filter}}&amp;url={{urlquery .RefreshURL}} 30s" h-target="#new-notes-indicator" h-swap="outer" h-poll-pause-hidden>{{if gt .Count 0}}
-	<a href="{{.RefreshURL}}" class="new-notes-btn" h-get h-target="#page-content" h-swap="inner" h-push-url h-scroll="top" h-indicator=".new-notes-spinner">
-		{{.Label}} <span class="new-notes-spinner h-indicator"><span class="h-spinner"></span></span>
-	</a>{{end}}
+var newNotesIndicatorTemplate = `{{define "new-notes-indicator"}}<div id="new-notes-indicator" h-poll="{{buildURL "/timeline/check-new" "kinds" .Kinds "filter" .Filter "since" .Since "url" .RefreshURL}} 30s" h-target="#new-notes-indicator" h-swap="outer" h-poll-pause-hidden>{{if gt .Count 0}}
+	<a href="{{.RefreshURL}}" class="new-notes-btn">{{.Label}}</a>{{end}}
 </div>{{end}}`
 
 // GetLinkPreviewTemplate returns the link preview card template.
@@ -272,6 +343,21 @@ func GetLinkPreviewTemplate() string {
 //   - Title: link title
 //   - Description: link description (optional, truncated to 150 chars)
 var linkPreviewTemplate = `{{define "link-preview"}}<a href="{{.URL}}" target="_blank" rel="noopener" class="link-preview">{{if .Image}}<img src="{{.Image}}" alt="" class="link-preview-image" loading="lazy">{{end}}<div class="link-preview-content">{{if .SiteName}}<div class="link-preview-site">{{.SiteName}}</div>{{end}}<div class="link-preview-title">{{.Title}}</div>{{if .Description}}<div class="link-preview-desc">{{.Description}}</div>{{end}}</div></a>{{end}}`
+
+// GetWavlakePlayerTemplate returns the Wavlake audio player template.
+func GetWavlakePlayerTemplate() string {
+	return wavlakePlayerTemplate
+}
+
+// wavlakePlayerTemplate renders a native audio player for Wavlake tracks.
+// Data fields:
+//   - Icon: 🎵 for music, 🎙️ for podcasts
+//   - Title: track title
+//   - Creator: artist/creator name
+//   - Duration: formatted duration (e.g., "3:45")
+//   - AudioURL: URL to the audio stream
+//   - PageURL: URL to the Wavlake page
+var wavlakePlayerTemplate = `{{define "wavlake-player"}}<div class="wavlake-player"><div class="wavlake-info"><span class="wavlake-icon">{{.Icon}}</span><div class="wavlake-meta"><a href="{{.PageURL}}" target="_blank" rel="noopener" class="wavlake-title">{{.Title}}</a><span class="wavlake-creator">{{.Creator}}{{if .Duration}} · {{.Duration}}{{end}}</span></div></div><audio src="{{.AudioURL}}" controls preload="metadata" class="wavlake-audio"></audio></div>{{end}}`
 
 // GetOOBFlashTemplate returns the OOB flash message template for HelmJS updates.
 func GetOOBFlashTemplate() string {

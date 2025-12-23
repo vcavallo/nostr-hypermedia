@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"nostr-server/internal/nips"
 )
 
 // NWC (Nostr Wallet Connect) client implementation - NIP-47
@@ -134,19 +135,19 @@ func ParseNWCURI(nwcURI string) (*NWCConfig, error) {
 	}
 
 	// Derive client public key from secret
-	clientPubKey, err := GetPublicKey(secret)
+	clientPubKey, err := nips.GetPublicKey(secret)
 	if err != nil {
 		return nil, fmt.Errorf("failed to derive public key: %v", err)
 	}
 
 	// Pre-compute conversation key for NIP-44 encryption
-	conversationKey, err := GetConversationKey(secret, walletPubKey)
+	conversationKey, err := nips.GetConversationKey(secret, walletPubKey)
 	if err != nil {
 		return nil, fmt.Errorf("failed to compute conversation key: %v", err)
 	}
 
 	// Pre-compute NIP-04 shared secret (for wallets that don't support NIP-44)
-	nip04SharedKey, err := GetNip04SharedSecret(secret, walletPubKey)
+	nip04SharedKey, err := nips.GetNip04SharedSecret(secret, walletPubKey)
 	if err != nil {
 		return nil, fmt.Errorf("failed to compute NIP-04 shared key: %v", err)
 	}
@@ -273,12 +274,16 @@ func (c *NWCClient) readLoop() {
 		c.pendingMu.Unlock()
 	}()
 
+	// Read timeout - longer than request timeout to allow for slow wallet responses
+	const nwcReadTimeout = 60 * time.Second
+
 	for {
 		select {
 		case <-c.done:
 			slog.Debug("NWC: readLoop received done signal")
 			return
 		default:
+			c.conn.SetReadDeadline(time.Now().Add(nwcReadTimeout))
 			var rawMsg json.RawMessage
 			if err := c.conn.ReadJSON(&rawMsg); err != nil {
 				if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
@@ -349,7 +354,11 @@ func (c *NWCClient) readLoop() {
 				// NIP-42 AUTH challenge - respond with signed auth event
 				if len(msg) >= 2 {
 					challenge, _ := msg[1].(string)
-					slog.Debug("NWC: received AUTH challenge", "challenge", challenge[:16]+"...")
+					challengeLog := challenge
+					if len(challengeLog) > 16 {
+						challengeLog = challengeLog[:16] + "..."
+					}
+					slog.Debug("NWC: received AUTH challenge", "challenge", challengeLog)
 					c.handleAuth(challenge)
 				}
 			} else {
@@ -415,7 +424,7 @@ func (c *NWCClient) handleEvent(eventData interface{}) {
 	}
 
 	// Decrypt content (using NIP-04)
-	decrypted, err := Nip04Decrypt(event.Content, c.config.Nip04SharedKey)
+	decrypted, err := nips.Nip04Decrypt(event.Content, c.config.Nip04SharedKey)
 	if err != nil {
 		slog.Error("NWC: failed to decrypt response", "error", err)
 		return
@@ -494,7 +503,7 @@ func (c *NWCClient) PayInvoice(ctx context.Context, bolt11Invoice string) (*NWCP
 	slog.Debug("NWC: request JSON built", "json", string(requestJSON))
 
 	// Encrypt with NIP-04 (many wallets don't support NIP-44 yet)
-	encrypted, err := Nip04Encrypt(string(requestJSON), c.config.Nip04SharedKey)
+	encrypted, err := nips.Nip04Encrypt(string(requestJSON), c.config.Nip04SharedKey)
 	if err != nil {
 		return nil, fmt.Errorf("failed to encrypt request: %v", err)
 	}
@@ -584,7 +593,11 @@ func (c *NWCClient) sendPayInvoiceRequest(ctx context.Context, encrypted string,
 		if err := json.Unmarshal(resp.Result, &result); err != nil {
 			return nil, fmt.Errorf("failed to parse result: %v", err)
 		}
-		slog.Debug("NWC: payment successful", "preimage", result.Preimage[:16]+"...")
+		preimageLog := result.Preimage
+		if len(preimageLog) > 16 {
+			preimageLog = preimageLog[:16] + "..."
+		}
+		slog.Debug("NWC: payment successful", "preimage", preimageLog)
 		return &result, nil
 	}
 }
@@ -649,7 +662,7 @@ func (c *NWCClient) GetBalance(ctx context.Context) (*NWCBalanceResult, error) {
 	slog.Debug("NWC: get_balance request JSON", "json", string(requestJSON))
 
 	// Encrypt with NIP-04 (many wallets don't support NIP-44 yet)
-	encrypted, err := Nip04Encrypt(string(requestJSON), c.config.Nip04SharedKey)
+	encrypted, err := nips.Nip04Encrypt(string(requestJSON), c.config.Nip04SharedKey)
 	if err != nil {
 		return nil, fmt.Errorf("failed to encrypt request: %v", err)
 	}
@@ -748,7 +761,7 @@ func (c *NWCClient) ListTransactions(ctx context.Context, limit int) (*NWCListTr
 	slog.Debug("NWC: list_transactions request JSON", "json", string(requestJSON))
 
 	// Encrypt with NIP-04
-	encrypted, err := Nip04Encrypt(string(requestJSON), c.config.Nip04SharedKey)
+	encrypted, err := nips.Nip04Encrypt(string(requestJSON), c.config.Nip04SharedKey)
 	if err != nil {
 		return nil, fmt.Errorf("failed to encrypt request: %v", err)
 	}

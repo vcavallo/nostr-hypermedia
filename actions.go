@@ -3,6 +3,8 @@ package main
 import (
 	"os"
 	"strings"
+
+	"nostr-server/internal/config"
 )
 
 // disabledActions holds globally disabled actions (parsed from ACTIONS_DISABLE env var)
@@ -37,11 +39,11 @@ type ActionDefinition struct {
 	Icon      string            // Optional icon
 	IconOnly  string            // "always", "mobile", "desktop", or "" (never) - controls icon-only display
 	Fields    []FieldDefinition // Form fields (for POST actions)
-	Disabled  bool              // If true, render as non-interactive text (deprecated, use Completed)
 	Completed bool              // If true, action already performed (filled pill style, no-op on click)
 	Count     int               // Count to display (if HasCount is true in config)
 	HasCount  bool              // Whether to show count
 	GroupWith string            // If set, this action appears in another action's dropdown
+	Amounts   []int             // Preset amounts for zap action dropdown (in sats)
 }
 
 // FieldDefinition defines a form field for POST actions
@@ -56,6 +58,7 @@ type ActionContext struct {
 	EventID        string
 	EventPubkey    string
 	Kind           int
+	DTag           string // d-tag for addressable events (kind 30xxx)
 	IsBookmarked   bool
 	IsReacted      bool  // Whether user has already reacted to this event
 	IsReposted     bool  // Whether user has already reposted this event
@@ -198,7 +201,7 @@ func getRegisteredActionsForKind(ctx ActionContext) []ActionDefinition {
 func buildLoggedOutRegisteredAction(action *RegisteredAction, ctx ActionContext) ActionDefinition {
 	return ActionDefinition{
 		Name:   action.Name,
-		Title:  I18n(action.Config.TitleKey),
+		Title:  config.I18n(action.Config.TitleKey),
 		Method: "GET",
 		Href:   ctx.LoginURL,
 		Class:  action.Config.Class + " action-disabled",
@@ -252,11 +255,11 @@ func (a ActionDefinition) ToHTMLAction() HTMLAction {
 		IconOnly:  a.IconOnly,
 		CSRFToken: csrfToken,
 		Fields:    fields,
-		Disabled:  a.Disabled,
 		Completed: a.Completed,
 		Count:     a.Count,
 		HasCount:  a.HasCount,
 		GroupWith: a.GroupWith,
+		Amounts:   a.Amounts,
 	}
 }
 
@@ -290,8 +293,36 @@ func GroupActionsForKind(actions []ActionDefinition, kind int) []HTMLActionGroup
 		}
 	}
 
-	// Second pass: build groups in display order
+	// Sort grouped children according to displayOrder
 	displayOrder := ConfigGetDisplayOrder()
+	displayOrderIndex := make(map[string]int)
+	for i, name := range displayOrder {
+		displayOrderIndex[name] = i
+	}
+	for parent, children := range groupChildren {
+		sortedChildren := make([]HTMLAction, len(children))
+		copy(sortedChildren, children)
+		// Sort by displayOrder position (actions not in displayOrder go last)
+		for i := 0; i < len(sortedChildren)-1; i++ {
+			for j := i + 1; j < len(sortedChildren); j++ {
+				iIdx, iExists := displayOrderIndex[sortedChildren[i].Name]
+				jIdx, jExists := displayOrderIndex[sortedChildren[j].Name]
+				// Actions not in displayOrder get max int value (go last)
+				if !iExists {
+					iIdx = 999999
+				}
+				if !jExists {
+					jIdx = 999999
+				}
+				if iIdx > jIdx {
+					sortedChildren[i], sortedChildren[j] = sortedChildren[j], sortedChildren[i]
+				}
+			}
+		}
+		groupChildren[parent] = sortedChildren
+	}
+
+	// Second pass: build groups in display order
 	var groups []HTMLActionGroup
 	processedActions := make(map[string]bool)
 

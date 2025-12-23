@@ -11,6 +11,10 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"nostr-server/internal/config"
+	"nostr-server/internal/types"
+	"nostr-server/internal/util"
 )
 
 type TimelineResponse struct {
@@ -33,22 +37,9 @@ type EventItem struct {
 	ReplyCount    int               `json:"reply_count"`
 }
 
-type ProfileInfo struct {
-	Name        string `json:"name,omitempty"`
-	DisplayName string `json:"display_name,omitempty"`
-	Picture     string `json:"picture,omitempty"`
-	Nip05       string `json:"nip05,omitempty"`
-	About       string `json:"about,omitempty"`
-	Banner      string `json:"banner,omitempty"`
-	Lud16       string `json:"lud16,omitempty"`
-	Lud06       string `json:"lud06,omitempty"`
-	Website     string `json:"website,omitempty"`
-}
-
-type ReactionsSummary struct {
-	Total  int            `json:"total"`
-	ByType map[string]int `json:"by_type"` // Kept for API compatibility and user reaction detection
-}
+// Type aliases for internal/types
+type ProfileInfo = types.ProfileInfo
+type ReactionsSummary = types.ReactionsSummary
 
 type PageInfo struct {
 	Until *int64  `json:"until,omitempty"`
@@ -87,7 +78,7 @@ func timelineHandler(w http.ResponseWriter, r *http.Request) {
 
 	relays := parseStringList(q.Get("relays"))
 	if len(relays) == 0 {
-		relays = ConfigGetDefaultRelays()
+		relays = config.GetDefaultRelays()
 	}
 
 	authors := parseStringList(q.Get("authors"))
@@ -107,25 +98,18 @@ func timelineHandler(w http.ResponseWriter, r *http.Request) {
 
 	events, eose := fetchEventsFromRelaysCached(relays, filter)
 
-	// Filter replies (except kinds like reposts that use e-tags for references)
-	if noReplies {
-		filtered := make([]Event, 0, len(events))
-		for _, evt := range events {
-			kindDef := GetKindDefinition(evt.Kind)
-			if !isReply(evt) || kindDef.ExcludeFromReplyFilter {
-				filtered = append(filtered, evt)
-			}
-		}
-		events = filtered
-	}
-
-	// Filter events missing required tags
+	// Filter events in a single pass: remove replies (if enabled) and events missing required tags
 	{
 		filtered := make([]Event, 0, len(events))
 		for _, evt := range events {
 			kindDef := GetKindDefinition(evt.Kind)
+			// Skip replies unless kind is excluded from reply filter
+			if noReplies && isReply(evt) && !kindDef.ExcludeFromReplyFilter {
+				continue
+			}
+			// Skip events missing required tags
 			if !kindDef.HasRequiredTags(evt.Tags) {
-				continue // Skip events missing required tags
+				continue
 			}
 			filtered = append(filtered, evt)
 		}
@@ -133,62 +117,13 @@ func timelineHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Collect pubkeys and event IDs for profile/reaction enrichment
-	pubkeySet := make(map[string]bool)
-	eventIDs := make([]string, 0, len(events))
-	for _, evt := range events {
-		pubkeySet[evt.PubKey] = true
-		eventIDs = append(eventIDs, evt.ID)
-	}
+	pubkeys, eventIDs := CollectEventData(events)
 
-	profiles := make(map[string]*ProfileInfo)
-	reactions := make(map[string]*ReactionsSummary)
-	replyCounts := make(map[string]int)
-	var wg sync.WaitGroup
+	// Fetch enrichment data in parallel
+	enrichment := FetchEventEnrichment(relays, pubkeys, eventIDs, false)
 
-	if len(pubkeySet) > 0 {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			pubkeys := make([]string, 0, len(pubkeySet))
-			for pk := range pubkeySet {
-				pubkeys = append(pubkeys, pk)
-			}
-			profiles = fetchProfiles(relays, pubkeys)
-		}()
-	}
-
-	if len(eventIDs) > 0 {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			reactions = fetchReactions(relays, eventIDs)
-		}()
-
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			replyCounts = fetchReplyCounts(relays, eventIDs)
-		}()
-	}
-
-	wg.Wait()
-
-	items := make([]EventItem, len(events))
-	for i, evt := range events {
-		items[i] = EventItem{
-			ID:            evt.ID,
-			Kind:          evt.Kind,
-			Pubkey:        evt.PubKey,
-			CreatedAt:     evt.CreatedAt,
-			Content:       evt.Content,
-			Tags:          evt.Tags,
-			Sig:           evt.Sig,
-			RelaysSeen:    evt.RelaysSeen,
-			AuthorProfile: profiles[evt.PubKey],
-			Reactions:     reactions[evt.ID],
-			ReplyCount:    replyCounts[evt.ID],
-		}
-	}
+	// Convert to EventItems
+	items := EventsToItems(events, enrichment.Profiles, enrichment.Reactions, enrichment.ReplyCounts)
 
 	resp := TimelineResponse{
 		Items: items,
@@ -316,14 +251,14 @@ func threadHandler(w http.ResponseWriter, r *http.Request) {
 
 	eventID := strings.TrimPrefix(r.URL.Path, "/thread/")
 	if eventID == "" {
-		http.Error(w, "Event ID required", http.StatusBadRequest)
+		util.RespondBadRequest(w, "Event ID required")
 		return
 	}
 
 	q := r.URL.Query()
 	relays := parseStringList(q.Get("relays"))
 	if len(relays) == 0 {
-		relays = ConfigGetDefaultRelays()
+		relays = config.GetDefaultRelays()
 	}
 
 	// Fetch thread for eventID
@@ -357,7 +292,7 @@ func threadHandler(w http.ResponseWriter, r *http.Request) {
 	wg.Wait()
 
 	if rootEvent == nil {
-		http.Error(w, "Event not found", http.StatusNotFound)
+		util.RespondNotFound(w, "Event not found")
 		return
 	}
 
@@ -423,10 +358,5 @@ func threadHandler(w http.ResponseWriter, r *http.Request) {
 
 // isReply returns true if event has e-tags (is a reply)
 func isReply(evt Event) bool {
-	for _, tag := range evt.Tags {
-		if len(tag) >= 2 && tag[0] == "e" {
-			return true
-		}
-	}
-	return false
+	return util.HasTag(evt.Tags, "e")
 }

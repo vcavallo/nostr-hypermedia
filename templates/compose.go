@@ -20,7 +20,7 @@ var composeContent = `{{define "content"}}
   </div>
   {{end}}
 
-  <form method="POST" action="/html/post" class="compose-form">
+  <form method="POST" action="/post" class="compose-form">
     <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
     {{if .MediaURL}}
     <input type="hidden" name="gif_url" value="{{.MediaURL}}">
@@ -28,7 +28,7 @@ var composeContent = `{{define "content"}}
     <label for="compose-content" class="sr-only">Write your note</label>
     <textarea id="compose-content" name="content" placeholder="What's on your mind?" autofocus></textarea>
     <div class="compose-actions">
-      <a href="/html/gifs" class="compose-change-media">Change GIF</a>
+      <a href="/gifs" class="compose-change-media">Change GIF</a>
       <button type="submit">{{i18n "btn.post"}}</button>
     </div>
   </form>

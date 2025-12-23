@@ -4,6 +4,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"nostr-server/internal/nips"
 )
 
 // ParsedActionTemplate represents an action definition parsed from Nostr event tags.
@@ -330,7 +332,7 @@ func FetchActionRegistry(naddr string, relays []string) []ParsedActionTemplate {
 	}
 
 	// Decode the naddr
-	na, err := DecodeNAddr(naddr)
+	na, err := nips.DecodeNAddr(naddr)
 	if err != nil {
 		CacheActionRegistryNotFound(naddr)
 		return nil

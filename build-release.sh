@@ -30,9 +30,23 @@ cp -r config/i18n/* release/config/i18n/
 # Copy and compress static files
 echo "  Copying static files..."
 cp static/avatar.jpg static/favicon.ico static/og-image.png release/static/
+echo "  Building CSS from modules..."
+cat static/css/base.css \
+    static/css/layout.css \
+    static/css/notes.css \
+    static/css/kinds/*.css \
+    static/css/components.css \
+    static/css/pages.css > release/static/style.css
+echo "  Minifying CSS..."
+# Remove comments, collapse whitespace, remove space around punctuation
+sed -i 's|/\*[^*]*\*\+\([^/][^*]*\*\+\)*/||g' release/static/style.css
+tr -s ' \t\n' ' ' < release/static/style.css | \
+    sed 's/ *{ */{/g; s/ *} */}\n/g; s/ *: */:/g; s/ *; */;/g; s/ *, */,/g; s/;}/}/g' > release/static/style.min.css
+mv release/static/style.min.css release/static/style.css
 echo "  Compressing JS/CSS..."
 gzip -c -9 static/helm.js > release/static/helm.js.gz
-gzip -c -9 static/style.css > release/static/style.css.gz
+gzip -c -9 release/static/style.css > release/static/style.css.gz
+rm release/static/style.css
 
 # Copy .env.example
 cp .env.example release/
@@ -41,7 +55,7 @@ cp .env.example release/
 cat > release/start.sh << 'EOF'
 #!/bin/bash
 
-# Dynamic startup script for nostr-hypermedia
+# Dynamic startup script for nostr-server
 # Usage: ./start.sh [flags]
 #
 # Flags:

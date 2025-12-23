@@ -19,6 +19,11 @@ import (
 	"time"
 
 	"github.com/skip2/go-qrcode"
+
+	cfgpkg "nostr-server/internal/config"
+	"nostr-server/internal/nips"
+	"nostr-server/internal/util"
+	"nostr-server/templates"
 )
 
 // trustedProxyCount is loaded from TRUSTED_PROXY_COUNT env var at startup.
@@ -44,6 +49,14 @@ const sessionMaxAge = 24 * time.Hour
 const anonSessionCookieName = "anon_session"
 const anonSessionMaxAge = 300 // 5 minutes
 
+// addClientTag adds the NIP-89 client tag to an event if enabled for that kind
+func addClientTag(event *UnsignedEvent) {
+	clientConfig := cfgpkg.GetClientConfig()
+	if clientTag := clientConfig.GetClientTag(); clientTag != nil && clientConfig.ShouldTagKind(event.Kind) {
+		event.Tags = append(event.Tags, clientTag)
+	}
+}
+
 // getClientIP extracts the real client IP from the request.
 // Uses TRUSTED_PROXY_COUNT to determine which IP in X-Forwarded-For to trust.
 // This prevents IP spoofing attacks where attackers set fake X-Forwarded-For headers.
@@ -61,7 +74,9 @@ func getClientIP(r *http.Request) string {
 		// This skips the trusted proxy IPs at the end that we know are legitimate
 		idx := len(ips) - trustedProxyCount
 		if idx < 0 {
-			idx = 0
+			// Not enough IPs for trusted proxy count - header might be spoofed
+			// Fall back to RemoteAddr for safety instead of trusting index 0
+			return parseRemoteAddr(r.RemoteAddr)
 		}
 		return strings.TrimSpace(ips[idx])
 	}
@@ -111,7 +126,7 @@ var cachedLoginTemplate *template.Template
 
 func initAuthTemplates() {
 	var err error
-	cachedLoginTemplate, err = template.New("login").Parse(htmlLoginTemplate)
+	cachedLoginTemplate, err = template.New("login").Funcs(templateFuncMap).Parse(htmlLoginTemplate)
 	if err != nil {
 		slog.Error("failed to compile login template", "error", err)
 		os.Exit(1)
@@ -134,6 +149,9 @@ const prefetchTimeout = 30 * time.Second
 
 // prefetchUserProfile caches the user's profile (call after login)
 func prefetchUserProfile(pubkeyHex string, relays []string) {
+	if pubkeyHex == "" {
+		return
+	}
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), prefetchTimeout)
 		defer cancel()
@@ -148,7 +166,7 @@ func prefetchUserProfile(pubkeyHex string, relays []string) {
 		case <-done:
 			// Success
 		case <-ctx.Done():
-			slog.Debug("prefetchUserProfile timed out", "pubkey", pubkeyHex[:12])
+			slog.Debug("prefetchUserProfile timed out", "pubkey", shortID(pubkeyHex))
 		}
 	}()
 }
@@ -160,6 +178,10 @@ func prefetchUserContactList(session *BunkerSession, relays []string) {
 		defer cancel()
 
 		pubkeyHex := hex.EncodeToString(session.UserPubKey)
+		if pubkeyHex == "" {
+			slog.Debug("prefetchUserContactList skipped: no user pubkey")
+			return
+		}
 
 		done := make(chan struct{})
 		var contacts []string
@@ -181,7 +203,7 @@ func prefetchUserContactList(session *BunkerSession, relays []string) {
 				}
 			}
 		case <-ctx.Done():
-			slog.Debug("prefetchUserContactList timed out", "pubkey", pubkeyHex[:12])
+			slog.Debug("prefetchUserContactList timed out", "pubkey", shortID(pubkeyHex))
 		}
 	}()
 }
@@ -189,7 +211,7 @@ func prefetchUserContactList(session *BunkerSession, relays []string) {
 // prefetchContactProfiles prefetches profiles for followed users in batches
 func prefetchContactProfiles(contacts []string) {
 	const batchSize = 50
-	profileRelays := ConfigGetProfileRelays()
+	profileRelays := cfgpkg.GetProfileRelays()
 
 	for i := 0; i < len(contacts); i += batchSize {
 		end := i + batchSize
@@ -247,6 +269,10 @@ func prefetchUserData(session *BunkerSession, fallbackRelays []string) {
 		defer cancel()
 
 		pubkeyHex := hex.EncodeToString(session.UserPubKey)
+		if pubkeyHex == "" {
+			slog.Debug("prefetch skipped: no user pubkey")
+			return
+		}
 		relays := getSessionRelays(session, fallbackRelays)
 
 		var wg sync.WaitGroup
@@ -261,14 +287,8 @@ func prefetchUserData(session *BunkerSession, fallbackRelays []string) {
 			}
 			bookmarkEvents := fetchKind10003(relays, pubkeyHex)
 			if len(bookmarkEvents) > 0 {
-				var eventIDs []string
-				for _, tag := range bookmarkEvents[0].Tags {
-					if tag[0] == "e" && len(tag) > 1 {
-						eventIDs = append(eventIDs, tag[1])
-					}
-				}
 				session.mu.Lock()
-				session.BookmarkedEventIDs = eventIDs
+				session.BookmarkedEventIDs = util.GetTagValues(bookmarkEvents[0].Tags, "e")
 				session.mu.Unlock()
 			}
 		}()
@@ -284,11 +304,8 @@ func prefetchUserData(session *BunkerSession, fallbackRelays []string) {
 			if len(reactionEvents) > 0 {
 				var eventIDs []string
 				for _, event := range reactionEvents {
-					for _, tag := range event.Tags {
-						if tag[0] == "e" && len(tag) > 1 {
-							eventIDs = append(eventIDs, tag[1])
-							break
-						}
+					if eid := util.GetTagValue(event.Tags, "e"); eid != "" {
+						eventIDs = append(eventIDs, eid)
 					}
 				}
 				session.mu.Lock()
@@ -308,11 +325,8 @@ func prefetchUserData(session *BunkerSession, fallbackRelays []string) {
 			if len(repostEvents) > 0 {
 				var eventIDs []string
 				for _, event := range repostEvents {
-					for _, tag := range event.Tags {
-						if tag[0] == "e" && len(tag) > 1 {
-							eventIDs = append(eventIDs, tag[1])
-							break
-						}
+					if eid := util.GetTagValue(event.Tags, "e"); eid != "" {
+						eventIDs = append(eventIDs, eid)
 					}
 				}
 				session.mu.Lock()
@@ -328,9 +342,9 @@ func prefetchUserData(session *BunkerSession, fallbackRelays []string) {
 				return
 			default:
 			}
-			slog.Debug("fetching mute list", "pubkey", pubkeyHex[:12], "relays", len(relays))
+			slog.Debug("fetching mute list", "pubkey", shortID(pubkeyHex), "relays", len(relays))
 			muteEvents := fetchKind10000(relays, pubkeyHex)
-			slog.Debug("mute list fetch result", "pubkey", pubkeyHex[:12], "events", len(muteEvents))
+			slog.Debug("mute list fetch result", "pubkey", shortID(pubkeyHex), "events", len(muteEvents))
 			if len(muteEvents) > 0 {
 				pubkeys, eventIDs, hashtags, words := parseMuteList(muteEvents[0])
 				session.mu.Lock()
@@ -339,7 +353,7 @@ func prefetchUserData(session *BunkerSession, fallbackRelays []string) {
 				session.MutedHashtags = hashtags
 				session.MutedWords = words
 				session.mu.Unlock()
-				slog.Debug("loaded mute list", "pubkey", pubkeyHex[:12],
+				slog.Debug("loaded mute list", "pubkey", shortID(pubkeyHex),
 					"pubkeys", len(pubkeys), "events", len(eventIDs),
 					"hashtags", len(hashtags), "words", len(words))
 			}
@@ -359,7 +373,7 @@ func prefetchUserData(session *BunkerSession, fallbackRelays []string) {
 				slog.Debug("failed to save session after prefetch", "error", err)
 			}
 		case <-ctx.Done():
-			slog.Debug("prefetchUserData timed out", "pubkey", pubkeyHex[:12])
+			slog.Debug("prefetchUserData timed out", "pubkey", shortID(pubkeyHex))
 		}
 	}()
 }
@@ -377,7 +391,7 @@ func getUserDisplayName(pubkeyHex string) string {
 	if npub, err := encodeBech32Pubkey(pubkeyHex); err == nil {
 		return "@" + formatNpubShort(npub)
 	}
-	return "@" + pubkeyHex[:12] + "..."
+	return "@" + shortID(pubkeyHex) + "..."
 }
 
 // getUserAvatarURL returns the user's profile picture URL, or empty string if not available
@@ -391,7 +405,7 @@ func getUserAvatarURL(pubkeyHex string) string {
 	}
 
 	// Not in cache - fetch with short timeout to avoid blocking
-	profiles := fetchProfilesWithTimeout(ConfigGetProfileRelays(), []string{pubkeyHex}, 500*time.Millisecond)
+	profiles := fetchProfilesWithTimeout(cfgpkg.GetProfileRelays(), []string{pubkeyHex}, 500*time.Millisecond)
 	if profile := profiles[pubkeyHex]; profile != nil && profile.Picture != "" {
 		return GetValidatedAvatarURL(profile.Picture)
 	}
@@ -413,10 +427,43 @@ func htmlLoginHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Generate nostrconnect:// URL for the user
-	nostrConnectURL, secret, err := GenerateNostrConnectURL(defaultNostrConnectRelays())
-	if err != nil {
-		slog.Error("failed to generate nostrconnect URL", "error", err)
+	// Check if we're returning from a check-connection attempt with an existing secret
+	// This preserves the pending connection when the user needs to retry
+	existingSecret := r.URL.Query().Get("secret")
+	var nostrConnectURL, secret string
+	var err error
+
+	if existingSecret != "" {
+		// Verify this pending connection still exists
+		pending := pendingConnections.Get(existingSecret)
+		if pending != nil {
+			// Reuse the existing secret and regenerate the nostrconnect URL
+			secret = existingSecret
+			kp, kpErr := GetServerKeypair()
+			if kpErr == nil {
+				u := url.URL{
+					Scheme: "nostrconnect",
+					Host:   hex.EncodeToString(kp.PubKey),
+				}
+				q := u.Query()
+				for _, relay := range pending.Relays {
+					q.Add("relay", relay)
+				}
+				q.Set("secret", secret)
+				q.Set("name", "Nostr Hypermedia")
+				q.Set("perms", "sign_event:1")
+				u.RawQuery = q.Encode()
+				nostrConnectURL = u.String()
+			}
+		}
+	}
+
+	// Generate new nostrconnect URL if we don't have an existing one
+	if nostrConnectURL == "" {
+		nostrConnectURL, secret, err = GenerateNostrConnectURL(defaultNostrConnectRelays())
+		if err != nil {
+			slog.Error("failed to generate nostrconnect URL", "error", err)
+		}
 	}
 
 	// Generate QR code
@@ -443,15 +490,7 @@ func htmlLoginHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Store anonymous session ID in cookie (SameSite=Strict for login security)
-	http.SetCookie(w, &http.Cookie{
-		Name:     anonSessionCookieName,
-		Value:    anonSessionID,
-		Path:     "/html/login",
-		MaxAge:   anonSessionMaxAge,
-		HttpOnly: true,
-		Secure:   shouldSecureCookie(r),
-		SameSite: http.SameSiteStrictMode,
-	})
+	SetCookie(w, r, anonSessionCookieName, anonSessionID, "/login", anonSessionMaxAge, http.SameSiteStrictMode)
 
 	// Generate CSRF token bound to this specific anonymous session
 	csrfToken := generateCSRFToken(anonSessionID)
@@ -487,48 +526,43 @@ func htmlLoginHandler(w http.ResponseWriter, r *http.Request) {
 // htmlLoginSubmitHandler processes the bunker URL submission
 func htmlLoginSubmitHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Redirect(w, r, "/html/login", http.StatusSeeOther)
+		http.Redirect(w, r, "/login", http.StatusSeeOther)
 		return
 	}
 
 	// Get anonymous session from cookie for CSRF validation
 	anonCookie, err := r.Cookie(anonSessionCookieName)
 	if err != nil {
-		redirectWithError(w, r, "/html/login", "Session expired, please try again")
+		redirectWithError(w, r, "/login", "Session expired, please try again")
 		return
 	}
 
 	// Validate CSRF token against this anonymous session
 	csrfToken := r.FormValue("csrf_token")
 	if !validateCSRFToken(anonCookie.Value, csrfToken) {
-		redirectWithError(w, r, "/html/login", "Invalid security token, please try again")
+		redirectWithError(w, r, "/login", "Invalid security token, please try again")
 		return
 	}
 
 	// Clear the anonymous session cookie (it's single-use)
-	http.SetCookie(w, &http.Cookie{
-		Name:   anonSessionCookieName,
-		Value:  "",
-		Path:   "/html/login",
-		MaxAge: -1,
-	})
+	DeleteCookie(w, r, anonSessionCookieName, "/login")
 
 	// Rate limit login attempts by IP
 	if err := CheckLoginRateLimit(getClientIP(r)); err != nil {
-		redirectWithError(w, r, "/html/login", "Too many login attempts. Please wait a minute and try again.")
+		redirectWithError(w, r, "/login", "Too many login attempts. Please wait a minute and try again.")
 		return
 	}
 
 	bunkerURL := strings.TrimSpace(r.FormValue("bunker_url"))
 	if bunkerURL == "" {
-		redirectWithError(w, r, "/html/login", "Please enter a bunker URL")
+		redirectWithError(w, r, "/login", "Please enter a bunker URL")
 		return
 	}
 
 	// Parse bunker URL
 	session, err := ParseBunkerURL(bunkerURL)
 	if err != nil {
-		redirectWithError(w, r, "/html/login", sanitizeErrorForUser("Parse bunker URL", err))
+		redirectWithError(w, r, "/login", sanitizeErrorForUser("Parse bunker URL", err))
 		return
 	}
 
@@ -537,7 +571,7 @@ func htmlLoginSubmitHandler(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 
 	if err := session.Connect(ctx); err != nil {
-		redirectWithError(w, r, "/html/login", sanitizeErrorForUser("Connect to bunker", err))
+		redirectWithError(w, r, "/login", sanitizeErrorForUser("Connect to bunker", err))
 		return
 	}
 
@@ -545,15 +579,7 @@ func htmlLoginSubmitHandler(w http.ResponseWriter, r *http.Request) {
 	bunkerSessions.Set(session)
 
 	// Set session cookie
-	http.SetCookie(w, &http.Cookie{
-		Name:     sessionCookieName,
-		Value:    session.ID,
-		Path:     "/",
-		MaxAge:   int(sessionMaxAge.Seconds()),
-		HttpOnly: true,
-		Secure:   shouldSecureCookie(r),
-		SameSite: http.SameSiteLaxMode,
-	})
+	SetSessionCookie(w, r, sessionCookieName, session.ID, int(sessionMaxAge.Seconds()))
 
 	// Prefetch user profile, contact list, bookmarks, reactions, and reposts in background so they're ready for display
 	prefetchUserProfile(hex.EncodeToString(session.UserPubKey), session.Relays)
@@ -571,15 +597,13 @@ func htmlLoginSubmitHandler(w http.ResponseWriter, r *http.Request) {
 
 // htmlCheckConnectionHandler checks if a nostrconnect session is ready
 func htmlCheckConnectionHandler(w http.ResponseWriter, r *http.Request) {
-	// Rate limit connection checks by IP
-	if err := CheckLoginRateLimit(getClientIP(r)); err != nil {
-		redirectWithError(w, r, "/html/login", "Too many connection attempts. Please wait a minute and try again.")
-		return
-	}
+	// Note: Connection checks are user-initiated polling, separate from login attempts.
+	// We don't rate-limit these aggressively since users may need to click multiple times
+	// while waiting for their signer app to respond.
 
 	secret := r.URL.Query().Get("secret")
 	if secret == "" {
-		redirectWithError(w, r, "/html/login", "Missing connection secret")
+		redirectWithError(w, r, "/login", "Missing connection secret")
 		return
 	}
 
@@ -587,22 +611,14 @@ func htmlCheckConnectionHandler(w http.ResponseWriter, r *http.Request) {
 	if session == nil {
 		// Not connected yet - keep secret in URL so user can retry
 		setFlashError(w, r, "Connection not ready. Make sure you approved in your signer app, then try again.")
-		http.Redirect(w, r, "/html/login?secret="+escapeURLParam(secret), http.StatusSeeOther)
+		http.Redirect(w, r, util.BuildURL("/login", map[string]string{"secret": secret}), http.StatusSeeOther)
 		return
 	}
 
 	// Connected! Store session and set cookie
 	bunkerSessions.Set(session)
 
-	http.SetCookie(w, &http.Cookie{
-		Name:     sessionCookieName,
-		Value:    session.ID,
-		Path:     "/",
-		MaxAge:   int(sessionMaxAge.Seconds()),
-		HttpOnly: true,
-		Secure:   shouldSecureCookie(r),
-		SameSite: http.SameSiteLaxMode,
-	})
+	SetSessionCookie(w, r, sessionCookieName, session.ID, int(sessionMaxAge.Seconds()))
 
 	// Prefetch user profile, contact list, bookmarks, reactions, and reposts in background so they're ready for display
 	prefetchUserProfile(hex.EncodeToString(session.UserPubKey), session.Relays)
@@ -621,35 +637,30 @@ func htmlCheckConnectionHandler(w http.ResponseWriter, r *http.Request) {
 // htmlReconnectHandler tries to reconnect to an existing approved signer
 func htmlReconnectHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Redirect(w, r, "/html/login", http.StatusSeeOther)
+		http.Redirect(w, r, "/login", http.StatusSeeOther)
 		return
 	}
 
 	// Get anonymous session from cookie for CSRF validation
 	anonCookie, err := r.Cookie(anonSessionCookieName)
 	if err != nil {
-		redirectWithError(w, r, "/html/login", "Session expired, please try again")
+		redirectWithError(w, r, "/login", "Session expired, please try again")
 		return
 	}
 
 	// Validate CSRF token against this anonymous session
 	csrfToken := r.FormValue("csrf_token")
 	if !validateCSRFToken(anonCookie.Value, csrfToken) {
-		redirectWithError(w, r, "/html/login", "Invalid security token, please try again")
+		redirectWithError(w, r, "/login", "Invalid security token, please try again")
 		return
 	}
 
 	// Clear the anonymous session cookie (it's single-use)
-	http.SetCookie(w, &http.Cookie{
-		Name:   anonSessionCookieName,
-		Value:  "",
-		Path:   "/html/login",
-		MaxAge: -1,
-	})
+	DeleteCookie(w, r, anonSessionCookieName, "/login")
 
 	signerPubKey := strings.TrimSpace(r.FormValue("signer_pubkey"))
 	if signerPubKey == "" {
-		redirectWithError(w, r, "/html/login", "Please enter your signer pubkey")
+		redirectWithError(w, r, "/login", "Please enter your signer pubkey")
 		return
 	}
 
@@ -658,7 +669,7 @@ func htmlReconnectHandler(w http.ResponseWriter, r *http.Request) {
 		// Decode bech32 npub to hex
 		decoded, err := decodeBech32Pubkey(signerPubKey)
 		if err != nil {
-			redirectWithError(w, r, "/html/login", "Invalid npub format")
+			redirectWithError(w, r, "/login", "Invalid npub format")
 			return
 		}
 		signerPubKey = decoded
@@ -666,28 +677,20 @@ func htmlReconnectHandler(w http.ResponseWriter, r *http.Request) {
 
 	// Validate hex
 	if len(signerPubKey) != 64 {
-		redirectWithError(w, r, "/html/login", "Invalid pubkey length (expected 64 hex chars or npub)")
+		redirectWithError(w, r, "/login", "Invalid pubkey length (expected 64 hex chars or npub)")
 		return
 	}
 
 	session, err := TryReconnectToSigner(signerPubKey, defaultNostrConnectRelays())
 	if err != nil {
-		redirectWithError(w, r, "/html/login", sanitizeErrorForUser("Reconnect to signer", err))
+		redirectWithError(w, r, "/login", sanitizeErrorForUser("Reconnect to signer", err))
 		return
 	}
 
 	// Success! Store session and set cookie
 	bunkerSessions.Set(session)
 
-	http.SetCookie(w, &http.Cookie{
-		Name:     sessionCookieName,
-		Value:    session.ID,
-		Path:     "/",
-		MaxAge:   int(sessionMaxAge.Seconds()),
-		HttpOnly: true,
-		Secure:   shouldSecureCookie(r),
-		SameSite: http.SameSiteLaxMode,
-	})
+	SetSessionCookie(w, r, sessionCookieName, session.ID, int(sessionMaxAge.Seconds()))
 
 	// Prefetch user profile, contact list, bookmarks, reactions, and reposts in background so they're ready for display
 	prefetchUserProfile(hex.EncodeToString(session.UserPubKey), session.Relays)
@@ -711,13 +714,13 @@ func decodeBech32Pubkey(npub string) (string, error) {
 	}
 
 	// Use standard bech32 decode
-	_, data, err := bech32Decode(npub)
+	_, data, err := nips.Bech32Decode(npub)
 	if err != nil {
 		return "", err
 	}
 
 	// Convert 5-bit groups to 8-bit bytes
-	decoded, err := bech32ConvertBits(data, 5, 8, false)
+	decoded, err := nips.Bech32ConvertBits(data, 5, 8, false)
 	if err != nil {
 		return "", err
 	}
@@ -729,165 +732,14 @@ func decodeBech32Pubkey(npub string) (string, error) {
 	return hex.EncodeToString(decoded), nil
 }
 
-// bech32 charset
-const bech32Charset = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
-
-func bech32Decode(bech string) (string, []byte, error) {
-	if len(bech) < 8 {
-		return "", nil, errors.New("too short")
-	}
-
-	// Find separator
-	pos := strings.LastIndex(bech, "1")
-	if pos < 1 || pos+7 > len(bech) {
-		return "", nil, errors.New("invalid separator position")
-	}
-
-	hrp := bech[:pos]
-	data := bech[pos+1:]
-
-	// Decode data
-	var values []byte
-	for _, c := range data {
-		idx := strings.IndexRune(bech32Charset, c)
-		if idx == -1 {
-			return "", nil, errors.New("invalid character")
-		}
-		values = append(values, byte(idx))
-	}
-
-	// Remove checksum (last 6 chars)
-	if len(values) < 6 {
-		return "", nil, errors.New("too short for checksum")
-	}
-	values = values[:len(values)-6]
-
-	return hrp, values, nil
-}
-
-func bech32ConvertBits(data []byte, fromBits, toBits int, pad bool) ([]byte, error) {
-	acc := 0
-	bits := 0
-	var ret []byte
-	maxv := (1 << toBits) - 1
-
-	for _, value := range data {
-		acc = (acc << fromBits) | int(value)
-		bits += fromBits
-		for bits >= toBits {
-			bits -= toBits
-			ret = append(ret, byte((acc>>bits)&maxv))
-		}
-	}
-
-	if pad {
-		if bits > 0 {
-			ret = append(ret, byte((acc<<(toBits-bits))&maxv))
-		}
-	} else if bits >= fromBits || ((acc<<(toBits-bits))&maxv) != 0 {
-		return nil, errors.New("invalid padding")
-	}
-
-	return ret, nil
-}
-
 // encodeBech32Pubkey encodes a hex pubkey to npub format
 func encodeBech32Pubkey(hexPubkey string) (string, error) {
-	pubkeyBytes, err := hex.DecodeString(hexPubkey)
-	if err != nil {
-		return "", err
-	}
-	if len(pubkeyBytes) != 32 {
-		return "", errors.New("invalid pubkey length")
-	}
-
-	// Convert 8-bit bytes to 5-bit groups
-	data, err := bech32ConvertBits(pubkeyBytes, 8, 5, true)
-	if err != nil {
-		return "", err
-	}
-
-	return bech32Encode("npub", data)
+	return nips.EncodePubkey(hexPubkey)
 }
 
+// encodeBech32EventID encodes a hex event ID to note format
 func encodeBech32EventID(hexEventID string) (string, error) {
-	eventIDBytes, err := hex.DecodeString(hexEventID)
-	if err != nil {
-		return "", err
-	}
-	if len(eventIDBytes) != 32 {
-		return "", errors.New("invalid event ID length")
-	}
-
-	// Convert 8-bit bytes to 5-bit groups
-	data, err := bech32ConvertBits(eventIDBytes, 8, 5, true)
-	if err != nil {
-		return "", err
-	}
-
-	return bech32Encode("note", data)
-}
-
-// bech32Encode encodes data with the given HRP
-func bech32Encode(hrp string, data []byte) (string, error) {
-	// Create checksum
-	values := append([]byte{}, data...)
-	checksum := bech32CreateChecksum(hrp, values)
-	combined := append(values, checksum...)
-
-	// Build result
-	var result strings.Builder
-	result.WriteString(hrp)
-	result.WriteByte('1')
-	for _, v := range combined {
-		result.WriteByte(bech32Charset[v])
-	}
-
-	return result.String(), nil
-}
-
-// bech32 polymod for checksum calculation
-func bech32Polymod(values []int) int {
-	gen := []int{0x3b6a57b2, 0x26508e6d, 0x1ea119fa, 0x3d4233dd, 0x2a1462b3}
-	chk := 1
-	for _, v := range values {
-		top := chk >> 25
-		chk = (chk&0x1ffffff)<<5 ^ v
-		for i := 0; i < 5; i++ {
-			if (top>>i)&1 != 0 {
-				chk ^= gen[i]
-			}
-		}
-	}
-	return chk
-}
-
-func bech32HrpExpand(hrp string) []int {
-	var ret []int
-	for _, c := range hrp {
-		ret = append(ret, int(c>>5))
-	}
-	ret = append(ret, 0)
-	for _, c := range hrp {
-		ret = append(ret, int(c&31))
-	}
-	return ret
-}
-
-func bech32CreateChecksum(hrp string, data []byte) []byte {
-	values := bech32HrpExpand(hrp)
-	for _, d := range data {
-		values = append(values, int(d))
-	}
-	for i := 0; i < 6; i++ {
-		values = append(values, 0)
-	}
-	polymod := bech32Polymod(values) ^ 1
-	var checksum []byte
-	for i := 0; i < 6; i++ {
-		checksum = append(checksum, byte((polymod>>(5*(5-i)))&31))
-	}
-	return checksum
+	return nips.EncodeEventID(hexEventID)
 }
 
 // htmlLogoutHandler logs out the user
@@ -900,16 +752,9 @@ func htmlLogoutHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Clear cookie
-	http.SetCookie(w, &http.Cookie{
-		Name:     sessionCookieName,
-		Value:    "",
-		Path:     "/",
-		MaxAge:   -1,
-		HttpOnly: true,
-		Secure:   shouldSecureCookie(r),
-	})
+	DeleteCookie(w, r, sessionCookieName, "/")
 
-	redirectWithSuccess(w, r, "/html/login", "Logged out")
+	redirectWithSuccess(w, r, "/login", "Logged out")
 }
 
 // htmlPostNoteHandler handles note posting via POST form
@@ -932,28 +777,45 @@ func htmlPostNoteHandler(w http.ResponseWriter, r *http.Request) {
 
 	content := strings.TrimSpace(r.FormValue("content"))
 	gifURL := strings.TrimSpace(r.FormValue("gif_url"))
+	contentWarning := strings.TrimSpace(r.FormValue("content_warning"))
+	contentWarningCustom := strings.TrimSpace(r.FormValue("content_warning_custom"))
+	mentionsJSON := r.FormValue("mentions")
 
-	// Append GIF URL to content if present
-	if gifURL != "" {
-		if content != "" {
-			content = content + "\n\n" + gifURL
-		} else {
-			content = gifURL
-		}
-	}
+	content = util.AppendGifToContent(content, gifURL)
+
+	// Process @mentions: replace @displayname with nostr:nprofile1...
+	content, mentionedPubkeys := processMentions(content, mentionsJSON)
 
 	if content == "" {
 		redirectWithError(w, r, DefaultTimelineURL(), "You cannot post an empty note!")
 		return
 	}
 
+	// Build tags
+	tags := [][]string{}
+
+	// Add p-tags for mentioned users (enables notifications per NIP-27)
+	for _, pubkey := range mentionedPubkeys {
+		tags = append(tags, []string{"p", pubkey})
+	}
+
+	// Add content-warning tag if specified (NIP-36)
+	// Custom reason takes priority over preset
+	if contentWarningCustom != "" {
+		tags = append(tags, []string{"content-warning", contentWarningCustom})
+	} else if contentWarning != "" {
+		tags = append(tags, []string{"content-warning", contentWarning})
+	}
+
 	// Create unsigned event
 	event := UnsignedEvent{
 		Kind:      1,
 		Content:   content,
-		Tags:      [][]string{},
+		Tags:      tags,
 		CreatedAt: time.Now().Unix(),
 	}
+
+	addClientTag(&event)
 
 	// Sign via bunker
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -963,19 +825,15 @@ func htmlPostNoteHandler(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		slog.Error("failed to sign event", "error", err)
 		if isHelmRequest(r) {
-			http.Error(w, sanitizeErrorForUser("Sign event", err), http.StatusInternalServerError)
+			util.RespondInternalError(w, sanitizeErrorForUser("Sign event", err))
 			return
 		}
 		redirectWithError(w, r, DefaultTimelineURL(), sanitizeErrorForUser("Sign event", err))
 		return
 	}
 
-	// Publish to relays (use NIP-65 write relays if available, otherwise defaults)
-	relays := ConfigGetPublishRelays()
-	if session.UserRelayList != nil && len(session.UserRelayList.Write) > 0 {
-		relays = session.UserRelayList.Write
-	}
-
+	// Publish to relays following outbox model (author write + tagged users' read)
+	relays := getPublishRelaysForEvent(session, signedEvent)
 	publishEvent(ctx, relays, signedEvent)
 
 	// For HelmJS requests, return the cleared form + new note as OOB
@@ -988,10 +846,7 @@ func htmlPostNoteHandler(w http.ResponseWriter, r *http.Request) {
 		npub, _ := encodeBech32Pubkey(userPubkey)
 
 		// Get user's profile for display
-		var authorProfile *ProfileInfo
-		if profile, _, inCache := profileCache.Get(userPubkey); inCache && profile != nil {
-			authorProfile = profile
-		}
+		authorProfile := getCachedProfile(userPubkey)
 
 		// Build actions for the new note
 		actionCtx := ActionContext{
@@ -1029,7 +884,7 @@ func htmlPostNoteHandler(w http.ResponseWriter, r *http.Request) {
 		html, err := renderPostResponse(newCSRFToken, newNote)
 		if err != nil {
 			slog.Error("failed to render post response", "error", err)
-			http.Error(w, "Failed to render response", http.StatusInternalServerError)
+			util.RespondInternalError(w, "Failed to render response")
 			return
 		}
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -1040,7 +895,9 @@ func htmlPostNoteHandler(w http.ResponseWriter, r *http.Request) {
 	redirectWithSuccess(w, r, DefaultTimelineURLLoggedIn(), "Note published")
 }
 
-// htmlReplyHandler handles replying to a note via POST form
+// htmlReplyHandler handles replying to events via POST form
+// For kind 1 notes: creates NIP-10 reply (kind 1)
+// For other kinds: creates NIP-22 comment (kind 1111)
 func htmlReplyHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Redirect(w, r, DefaultTimelineURL(), http.StatusSeeOther)
@@ -1062,14 +919,23 @@ func htmlReplyHandler(w http.ResponseWriter, r *http.Request) {
 	gifURL := strings.TrimSpace(r.FormValue("gif_url"))
 	replyTo := strings.TrimSpace(r.FormValue("reply_to"))
 	replyToPubkey := strings.TrimSpace(r.FormValue("reply_to_pubkey"))
+	replyToKindStr := r.FormValue("reply_to_kind")
+	replyToDTag := strings.TrimSpace(r.FormValue("reply_to_dtag"))
 	replyCountStr := r.FormValue("reply_count")
+	contentWarning := strings.TrimSpace(r.FormValue("content_warning"))
+	contentWarningCustom := strings.TrimSpace(r.FormValue("content_warning_custom"))
+	mentionsJSON := r.FormValue("mentions")
 
-	// Append GIF URL to content if present
-	if gifURL != "" {
-		if content != "" {
-			content = content + "\n\n" + gifURL
-		} else {
-			content = gifURL
+	content = util.AppendGifToContent(content, gifURL)
+
+	// Process @mentions: replace @displayname with nostr:nprofile1...
+	content, mentionedPubkeys := processMentions(content, mentionsJSON)
+
+	// Parse target kind, default to 1 (note)
+	replyToKind := 1
+	if replyToKindStr != "" {
+		if k, err := strconv.Atoi(replyToKindStr); err == nil && k > 0 {
+			replyToKind = k
 		}
 	}
 
@@ -1080,32 +946,85 @@ func htmlReplyHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if content == "" {
-		redirectWithError(w, r, "/html/thread/"+replyTo, "You cannot post an empty note!")
+		replyToNote, _ := nips.EncodeEventID(replyTo)
+		if replyToNote == "" {
+			replyToNote = replyTo
+		}
+		redirectWithError(w, r, "/thread/"+replyToNote, "You cannot post an empty note!")
 		return
 	}
 
-	// Build tags for reply
-	// NIP-10: e tag with "reply" marker, p tag to mention the author
-	tags := [][]string{
-		{"e", replyTo, "", "reply"},
-	}
-	if replyToPubkey != "" {
-		// Validate pubkey is valid 64-char hex (32 bytes)
-		if decoded, err := hex.DecodeString(replyToPubkey); err != nil || len(decoded) != 32 {
-			slog.Warn("reply: invalid pubkey format", "pubkey", replyToPubkey)
-			// Skip invalid pubkey but continue with reply
-		} else {
-			tags = append(tags, []string{"p", replyToPubkey})
+	// Determine event kind and build tags based on target event kind
+	// NIP-10 for kind 1 notes, NIP-22 for everything else
+	var eventKind int
+	var tags [][]string
+
+	if replyToKind == 1 {
+		// NIP-10 reply (kind 1): e tag with "reply" marker, p tag
+		eventKind = 1
+		tags = [][]string{
+			{"e", replyTo, "", "reply"},
 		}
+		if replyToPubkey != "" {
+			if decoded, err := hex.DecodeString(replyToPubkey); err == nil && len(decoded) == 32 {
+				tags = append(tags, []string{"p", replyToPubkey})
+			}
+		}
+	} else {
+		// NIP-22 comment (kind 1111): uppercase tags for root, lowercase for parent
+		eventKind = 1111
+		kindStr := strconv.Itoa(replyToKind)
+
+		// For addressable events (kind 30xxx), use A tag; otherwise use E tag
+		if replyToKind >= 30000 && replyToKind < 40000 && replyToDTag != "" && replyToPubkey != "" {
+			// Addressable event: A tag format is "kind:pubkey:d-tag"
+			aTagValue := fmt.Sprintf("%d:%s:%s", replyToKind, replyToPubkey, replyToDTag)
+			tags = [][]string{
+				{"A", aTagValue, ""},      // Root scope (uppercase)
+				{"a", aTagValue, ""},      // Parent (same as root for top-level comment)
+				{"K", kindStr},            // Root kind
+				{"k", kindStr},            // Parent kind
+			}
+		} else {
+			// Regular event: E tag
+			tags = [][]string{
+				{"E", replyTo, ""},        // Root scope (uppercase)
+				{"e", replyTo, ""},        // Parent (same as root for top-level comment)
+				{"K", kindStr},            // Root kind
+				{"k", kindStr},            // Parent kind
+			}
+		}
+		// Add author p/P tags
+		if replyToPubkey != "" {
+			if decoded, err := hex.DecodeString(replyToPubkey); err == nil && len(decoded) == 32 {
+				tags = append(tags, []string{"P", replyToPubkey}) // Root author
+				tags = append(tags, []string{"p", replyToPubkey}) // Parent author
+			}
+		}
+	}
+
+	// Add p-tags for mentioned users (enables notifications per NIP-27)
+	for _, pubkey := range mentionedPubkeys {
+		tags = append(tags, []string{"p", pubkey})
+	}
+
+	// Add content-warning tag if specified (NIP-36)
+	// Custom reason takes priority over preset
+	if contentWarningCustom != "" {
+		tags = append(tags, []string{"content-warning", contentWarningCustom})
+	} else if contentWarning != "" {
+		tags = append(tags, []string{"content-warning", contentWarning})
 	}
 
 	// Create unsigned event
 	event := UnsignedEvent{
-		Kind:      1,
+		Kind:      eventKind,
 		Content:   content,
 		Tags:      tags,
 		CreatedAt: time.Now().Unix(),
 	}
+
+	addClientTag(&event)
 
 	// Sign via bunker
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -1115,19 +1034,19 @@ func htmlReplyHandler(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		slog.Error("failed to sign reply", "error", err)
 		if isHelmRequest(r) {
-			http.Error(w, sanitizeErrorForUser("Sign event", err), http.StatusInternalServerError)
+			util.RespondInternalError(w, sanitizeErrorForUser("Sign event", err))
 			return
 		}
-		redirectWithError(w, r, "/html/thread/"+replyTo, sanitizeErrorForUser("Sign event", err))
+		replyToNote, _ := nips.EncodeEventID(replyTo)
+		if replyToNote == "" {
+			replyToNote = replyTo
+		}
+		redirectWithError(w, r, "/thread/"+replyToNote, sanitizeErrorForUser("Sign event", err))
 		return
 	}
 
-	// Publish to relays (use NIP-65 write relays if available, otherwise defaults)
-	relays := ConfigGetPublishRelays()
-	if session.UserRelayList != nil && len(session.UserRelayList.Write) > 0 {
-		relays = session.UserRelayList.Write
-	}
-
+	// Publish to relays following outbox model (author write + tagged users' read)
+	relays := getPublishRelaysForEvent(session, signedEvent)
 	publishEvent(ctx, relays, signedEvent)
 
 	// For HelmJS requests, return the cleared form + new reply as OOB
@@ -1140,21 +1059,22 @@ func htmlReplyHandler(w http.ResponseWriter, r *http.Request) {
 		npub, _ := encodeBech32Pubkey(userPubkey)
 
 		// Get user's profile for display
-		var authorProfile *ProfileInfo
-		if profile, _, inCache := profileCache.Get(userPubkey); inCache && profile != nil {
-			authorProfile = profile
-		}
+		authorProfile := getCachedProfile(userPubkey)
 
 		// Get user display name and avatar
 		userDisplayName := getUserDisplayName(userPubkey)
 		userAvatarURL := getUserAvatarURL(userPubkey)
 
-		// Build actions for the new reply
-		returnURL := "/html/thread/" + replyTo
+		// Build actions for the new reply/comment
+		replyToNote, _ := nips.EncodeEventID(replyTo)
+		if replyToNote == "" {
+			replyToNote = replyTo
+		}
+		returnURL := "/thread/" + replyToNote
 		actionCtx := ActionContext{
 			EventID:      signedEvent.ID,
 			EventPubkey:  userPubkey,
-			Kind:         1,
+			Kind:         eventKind,
 			IsBookmarked: false,
 			IsReacted:    false,
 			IsReposted:   false,
@@ -1166,21 +1086,26 @@ func htmlReplyHandler(w http.ResponseWriter, r *http.Request) {
 			ReturnURL:    returnURL,
 		}
 		entity := BuildHypermediaEntity(actionCtx, signedEvent.Tags, nil)
-		actionGroups := GroupActionsForKind(entity.Actions, 1)
+		actionGroups := GroupActionsForKind(entity.Actions, eventKind)
+
+		// Get template name for the created event kind
+		kindDef := GetKindDefinition(eventKind)
 
 		newReply := &HTMLEventItem{
-			ID:            signedEvent.ID,
-			Pubkey:        userPubkey,
-			Npub:          npub,
-			NpubShort:     formatNpubShort(npub),
-			Kind:          1,
-			Tags:          signedEvent.Tags,
-			Content:       content,
-			ContentHTML:   processContentToHTML(content),
-			AuthorProfile: authorProfile,
-			CreatedAt:     signedEvent.CreatedAt,
-			ActionGroups:  actionGroups,
-			LoggedIn:      true,
+			ID:             signedEvent.ID,
+			Pubkey:         userPubkey,
+			Npub:           npub,
+			NpubShort:      formatNpubShort(npub),
+			Kind:           eventKind,
+			TemplateName:   kindDef.TemplateName,
+			RenderTemplate: "render-" + kindDef.TemplateName,
+			Tags:           signedEvent.Tags,
+			Content:        content,
+			ContentHTML:    processContentToHTML(content),
+			AuthorProfile:  authorProfile,
+			CreatedAt:      signedEvent.CreatedAt,
+			ActionGroups:   actionGroups,
+			LoggedIn:       true,
 		}
 
 		// Increment reply count from form (avoids relay query, matches displayed count)
@@ -1189,10 +1114,10 @@ func htmlReplyHandler(w http.ResponseWriter, r *http.Request) {
 			replyCount = n + 1
 		}
 
-		html, err := renderReplyResponse(newCSRFToken, replyTo, replyToPubkey, userDisplayName, userAvatarURL, npub, newReply, replyCount)
+		html, err := renderReplyResponse(newCSRFToken, replyTo, replyToPubkey, replyToKind, replyToDTag, userDisplayName, userAvatarURL, npub, newReply, replyCount)
 		if err != nil {
 			slog.Error("failed to render reply response", "error", err)
-			http.Error(w, "Failed to render response", http.StatusInternalServerError)
+			util.RespondInternalError(w, "Failed to render response")
 			return
 		}
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -1200,7 +1125,11 @@ func htmlReplyHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	redirectWithSuccess(w, r, "/html/thread/"+replyTo, "Reply published")
+	replyToNoteFinal, _ := nips.EncodeEventID(replyTo)
+	if replyToNoteFinal == "" {
+		replyToNoteFinal = replyTo
+	}
+	redirectWithSuccess(w, r, "/thread/"+replyToNoteFinal, "Reply published")
 }
 
 // htmlReactHandler handles adding a reaction to a note
@@ -1264,6 +1193,8 @@ func htmlReactHandler(w http.ResponseWriter, r *http.Request) {
 		CreatedAt: time.Now().Unix(),
 	}
 
+	addClientTag(&event)
+
 	// Sign via bunker
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -1273,43 +1204,66 @@ func htmlReactHandler(w http.ResponseWriter, r *http.Request) {
 		slog.Error("failed to sign reaction", "error", err)
 		// For HelmJS requests, return an error response
 		if isHelmRequest(r) {
-			http.Error(w, sanitizeErrorForUser("Sign event", err), http.StatusInternalServerError)
+			util.RespondInternalError(w, sanitizeErrorForUser("Sign event", err))
 			return
 		}
 		redirectWithError(w, r, returnURL, sanitizeErrorForUser("Sign event", err))
 		return
 	}
 
-	// Get relays to publish to (use NIP-65 if available, otherwise defaults)
-	relays := ConfigGetPublishRelays()
-	if session.UserRelayList != nil && len(session.UserRelayList.Write) > 0 {
-		relays = session.UserRelayList.Write
-	}
-
-	publishEvent(ctx, relays, signedEvent)
-
-	// Update session's reaction cache
+	// Update session's reaction cache optimistically (before publish)
 	session.mu.Lock()
 	session.ReactedEventIDs = append(session.ReactedEventIDs, eventID)
 	session.mu.Unlock()
 
-	// For HelmJS requests, return the updated footer fragment
+	// Get read relays for rendering footer
+	readRelays := cfgpkg.GetDefaultRelays()
+	if session.UserRelayList != nil && len(session.UserRelayList.Read) > 0 {
+		readRelays = session.UserRelayList.Read
+	}
+
+	// Check current state for footer display
+	isBookmarked := session.IsEventBookmarked(eventID)
+	isReposted := session.IsEventReposted(eventID)
+	hasWallet := session.HasWallet()
+
+	// Capture data for failure callback (will run async after response is sent)
+	sessionID := session.ID
+
+	// Publish asynchronously - response is sent before relay confirmation
+	relays := getPublishRelaysForEvent(session, signedEvent)
+	publishEventAsync(relays, signedEvent, func(failedEventID string, err error) {
+		// Remove from session cache on failure
+		session.mu.Lock()
+		for i, id := range session.ReactedEventIDs {
+			if id == eventID {
+				session.ReactedEventIDs = append(session.ReactedEventIDs[:i], session.ReactedEventIDs[i+1:]...)
+				break
+			}
+		}
+		session.mu.Unlock()
+
+		// Render corrected footer (isReacted = false, add error indicator)
+		newCSRFToken := generateCSRFToken(sessionID)
+		html, renderErr := renderFooterFragmentWithError(eventID, eventPubkey, kind, true, newCSRFToken, returnURL, isBookmarked, false, isReposted, false, hasWallet, "", readRelays)
+		if renderErr != nil {
+			slog.Error("failed to render correction footer", "error", renderErr)
+			return
+		}
+
+		// Send correction via SSE
+		SendCorrectionToSession(sessionID, "#footer-"+eventID, html, "react")
+	})
+
+	// For HelmJS requests, return the updated footer fragment immediately (optimistic)
 	if isHelmRequest(r) {
 		// Generate new CSRF token for the updated form
 		newCSRFToken := generateCSRFToken(session.ID)
-		// Get read relays to fetch existing reactions
-		readRelays := ConfigGetDefaultRelays()
-		if session.UserRelayList != nil && len(session.UserRelayList.Read) > 0 {
-			readRelays = session.UserRelayList.Read
-		}
-		// Check if user had bookmarked or reposted this event (for footer display)
-		isBookmarked := session.IsEventBookmarked(eventID)
-		isReposted := session.IsEventReposted(eventID)
 		// Pass the reaction so it shows in the UI, isReacted is true since user just reacted
-		html, err := renderFooterFragment(eventID, eventPubkey, kind, true, newCSRFToken, returnURL, isBookmarked, true, isReposted, false, session.HasWallet(), reaction, readRelays)
+		html, err := renderFooterFragment(eventID, eventPubkey, kind, true, newCSRFToken, returnURL, isBookmarked, true, isReposted, false, hasWallet, reaction, readRelays)
 		if err != nil {
 			slog.Error("failed to render footer fragment", "error", err)
-			http.Error(w, "Failed to render response", http.StatusInternalServerError)
+			util.RespondInternalError(w, "Failed to render response")
 			return
 		}
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -1320,7 +1274,7 @@ func htmlReactHandler(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, returnURL, http.StatusSeeOther)
 }
 
-// htmlRepostHandler handles reposting a note (kind 6)
+// htmlRepostHandler handles reposting an event (kind 6 for notes, kind 16 for other events)
 func htmlRepostHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Redirect(w, r, DefaultTimelineURL(), http.StatusSeeOther)
@@ -1343,11 +1297,11 @@ func htmlRepostHandler(w http.ResponseWriter, r *http.Request) {
 	kindStr := strings.TrimSpace(r.FormValue("kind"))
 	returnURL := sanitizeReturnURL(strings.TrimSpace(r.FormValue("return_url")), true) // logged in (requireAuth passed)
 
-	// Parse kind, default to 1 (note) if not provided or invalid
-	kind := 1
+	// Parse target event kind, default to 1 (note) if not provided or invalid
+	targetKind := 1
 	if kindStr != "" {
 		if parsedKind, err := strconv.Atoi(kindStr); err == nil && parsedKind > 0 {
-			kind = parsedKind
+			targetKind = parsedKind
 		}
 	}
 
@@ -1358,6 +1312,7 @@ func htmlRepostHandler(w http.ResponseWriter, r *http.Request) {
 
 	// Build tags for repost (NIP-18)
 	// e tag for the reposted event, p tag to mention the original author
+	// k tag for the target event kind (required for kind 16)
 	tags := [][]string{
 		{"e", eventID, ""},
 	}
@@ -1365,13 +1320,24 @@ func htmlRepostHandler(w http.ResponseWriter, r *http.Request) {
 		tags = append(tags, []string{"p", eventPubkey})
 	}
 
-	// Create unsigned event (kind 6 = repost)
+	// Determine repost kind per NIP-18:
+	// - Kind 6: repost of kind 1 notes
+	// - Kind 16: generic repost for all other event kinds
+	repostKind := 6
+	if targetKind != 1 {
+		repostKind = 16
+		tags = append(tags, []string{"k", strconv.Itoa(targetKind)})
+	}
+
+	// Create unsigned event
 	event := UnsignedEvent{
-		Kind:      6,
+		Kind:      repostKind,
 		Content:   "", // Repost content is typically empty
 		Tags:      tags,
 		CreatedAt: time.Now().Unix(),
 	}
+
+	addClientTag(&event)
 
 	// Sign via bunker
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -1381,41 +1347,65 @@ func htmlRepostHandler(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		slog.Error("failed to sign repost", "error", err)
 		if isHelmRequest(r) {
-			http.Error(w, sanitizeErrorForUser("Sign event", err), http.StatusInternalServerError)
+			util.RespondInternalError(w, sanitizeErrorForUser("Sign event", err))
 			return
 		}
 		redirectWithError(w, r, returnURL, sanitizeErrorForUser("Sign event", err))
 		return
 	}
 
-	// Get relays to publish to (use NIP-65 if available, otherwise defaults)
-	relays := ConfigGetPublishRelays()
-	if session.UserRelayList != nil && len(session.UserRelayList.Write) > 0 {
-		relays = session.UserRelayList.Write
-	}
-
-	publishEvent(ctx, relays, signedEvent)
-
-	// Update session cache to reflect new repost
+	// Update session cache optimistically (before publish)
 	session.mu.Lock()
 	session.RepostedEventIDs = append(session.RepostedEventIDs, eventID)
 	session.mu.Unlock()
 
-	// For HelmJS partial update, return updated footer
+	// Get read relays for rendering footer
+	readRelays := cfgpkg.GetDefaultRelays()
+	if session.UserRelayList != nil && len(session.UserRelayList.Read) > 0 {
+		readRelays = session.UserRelayList.Read
+	}
+
+	// Check current state for footer display
+	isBookmarked := session.IsEventBookmarked(eventID)
+	isReacted := session.IsEventReacted(eventID)
+	hasWallet := session.HasWallet()
+
+	// Capture data for failure callback
+	sessionID := session.ID
+
+	// Publish asynchronously - response is sent before relay confirmation
+	relays := getPublishRelaysForEvent(session, signedEvent)
+	publishEventAsync(relays, signedEvent, func(failedEventID string, err error) {
+		// Remove from session cache on failure
+		session.mu.Lock()
+		for i, id := range session.RepostedEventIDs {
+			if id == eventID {
+				session.RepostedEventIDs = append(session.RepostedEventIDs[:i], session.RepostedEventIDs[i+1:]...)
+				break
+			}
+		}
+		session.mu.Unlock()
+
+		// Render corrected footer (isReposted = false)
+		newCSRFToken := generateCSRFToken(sessionID)
+		html, renderErr := renderFooterFragmentWithError(eventID, eventPubkey, targetKind, true, newCSRFToken, returnURL, isBookmarked, isReacted, false, false, hasWallet, "", readRelays)
+		if renderErr != nil {
+			slog.Error("failed to render correction footer", "error", renderErr)
+			return
+		}
+
+		// Send correction via SSE
+		SendCorrectionToSession(sessionID, "#footer-"+eventID, html, "repost")
+	})
+
+	// For HelmJS partial update, return updated footer immediately (optimistic)
 	if isHelmRequest(r) {
 		newCSRFToken := generateCSRFToken(session.ID)
-		readRelays := ConfigGetDefaultRelays()
-		if session.UserRelayList != nil && len(session.UserRelayList.Read) > 0 {
-			readRelays = session.UserRelayList.Read
-		}
-		// Check other state for footer display
-		isBookmarked := session.IsEventBookmarked(eventID)
-		isReacted := session.IsEventReacted(eventID)
-		// isReposted is now true since user just reposted
-		html, err := renderFooterFragment(eventID, eventPubkey, kind, true, newCSRFToken, returnURL, isBookmarked, isReacted, true, false, session.HasWallet(), "", readRelays)
+		// isReposted is true since user just reposted
+		html, err := renderFooterFragment(eventID, eventPubkey, targetKind, true, newCSRFToken, returnURL, isBookmarked, isReacted, true, false, hasWallet, "", readRelays)
 		if err != nil {
 			slog.Error("failed to render footer fragment", "error", err)
-			http.Error(w, "Failed to render response", http.StatusInternalServerError)
+			util.RespondInternalError(w, "Failed to render response")
 			return
 		}
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -1472,7 +1462,7 @@ func htmlBookmarkHandler(w http.ResponseWriter, r *http.Request) {
 	userPubkey := hex.EncodeToString(session.UserPubKey)
 
 	// Get relays (use NIP-65 if available, otherwise defaults)
-	relays := ConfigGetPublishRelays()
+	relays := cfgpkg.GetPublishRelays()
 	if session.UserRelayList != nil && len(session.UserRelayList.Write) > 0 {
 		relays = session.UserRelayList.Write
 	}
@@ -1525,17 +1515,15 @@ func htmlBookmarkHandler(w http.ResponseWriter, r *http.Request) {
 		slog.Error("failed to sign bookmark list", "error", err)
 		// For HelmJS requests, return an error response
 		if isHelmRequest(r) {
-			http.Error(w, sanitizeErrorForUser("Sign event", err), http.StatusInternalServerError)
+			util.RespondInternalError(w, sanitizeErrorForUser("Sign event", err))
 			return
 		}
 		redirectWithError(w, r, returnURL, sanitizeErrorForUser("Sign event", err))
 		return
 	}
 
-	// Publish to relays
-	publishEvent(ctx, relays, signedEvent)
-
-	// Update session's bookmark cache
+	// Update session's bookmark cache optimistically (before publish)
+	newBookmarkState := action == "add"
 	session.mu.Lock()
 	if action == "add" {
 		session.BookmarkedEventIDs = append(session.BookmarkedEventIDs, eventID)
@@ -1551,25 +1539,60 @@ func htmlBookmarkHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	session.mu.Unlock()
 
-	// For HelmJS requests, return the updated footer fragment
-	if isHelmRequest(r) {
-		// Generate new CSRF token for the updated form
-		newCSRFToken := generateCSRFToken(session.ID)
-		// isBookmarked is now the opposite of what it was (we toggled it)
-		newBookmarkState := action == "add"
-		// Get read relays to fetch existing reactions
-		readRelays := ConfigGetDefaultRelays()
-		if session.UserRelayList != nil && len(session.UserRelayList.Read) > 0 {
-			readRelays = session.UserRelayList.Read
+	// Get read relays for rendering footer
+	readRelays := cfgpkg.GetDefaultRelays()
+	if session.UserRelayList != nil && len(session.UserRelayList.Read) > 0 {
+		readRelays = session.UserRelayList.Read
+	}
+
+	// Check current state for footer display
+	isReacted := session.IsEventReacted(eventID)
+	isReposted := session.IsEventReposted(eventID)
+	hasWallet := session.HasWallet()
+
+	// Capture data for failure callback
+	sessionID := session.ID
+	wasAdding := action == "add"
+
+	// Publish asynchronously - response is sent before relay confirmation
+	publishEventAsync(relays, signedEvent, func(failedEventID string, err error) {
+		// Revert session cache on failure
+		session.mu.Lock()
+		if wasAdding {
+			// Was adding, so remove it
+			newBookmarks := make([]string, 0, len(session.BookmarkedEventIDs))
+			for _, id := range session.BookmarkedEventIDs {
+				if id != eventID {
+					newBookmarks = append(newBookmarks, id)
+				}
+			}
+			session.BookmarkedEventIDs = newBookmarks
+		} else {
+			// Was removing, so add it back
+			session.BookmarkedEventIDs = append(session.BookmarkedEventIDs, eventID)
 		}
-		// Check if user had reacted or reposted this event (for footer display)
-		isReacted := session.IsEventReacted(eventID)
-		isReposted := session.IsEventReposted(eventID)
-		// Empty string for userReaction since this is a bookmark action
-		html, err := renderFooterFragment(eventID, "", kind, true, newCSRFToken, returnURL, newBookmarkState, isReacted, isReposted, false, session.HasWallet(), "", readRelays)
+		session.mu.Unlock()
+
+		// Render corrected footer (revert bookmark state)
+		newCSRFToken := generateCSRFToken(sessionID)
+		revertedBookmarkState := !wasAdding
+		html, renderErr := renderFooterFragmentWithError(eventID, "", kind, true, newCSRFToken, returnURL, revertedBookmarkState, isReacted, isReposted, false, hasWallet, "", readRelays)
+		if renderErr != nil {
+			slog.Error("failed to render correction footer", "error", renderErr)
+			return
+		}
+
+		// Send correction via SSE
+		SendCorrectionToSession(sessionID, "#footer-"+eventID, html, "bookmark")
+	})
+
+	// For HelmJS requests, return the updated footer fragment immediately (optimistic)
+	if isHelmRequest(r) {
+		newCSRFToken := generateCSRFToken(session.ID)
+		html, err := renderFooterFragment(eventID, "", kind, true, newCSRFToken, returnURL, newBookmarkState, isReacted, isReposted, false, hasWallet, "", readRelays)
 		if err != nil {
 			slog.Error("failed to render footer fragment", "error", err)
-			http.Error(w, "Failed to render response", http.StatusInternalServerError)
+			util.RespondInternalError(w, "Failed to render response")
 			return
 		}
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -1628,7 +1651,7 @@ func parseMuteList(event Event) (pubkeys []string, eventIDs []string, hashtags [
 // htmlMuteHandler handles muting/unmuting a user (kind 10000)
 func htmlMuteHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		util.RespondMethodNotAllowed(w, "Method not allowed")
 		return
 	}
 
@@ -1668,7 +1691,7 @@ func htmlMuteHandler(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 
 	// Get relays (use NIP-65 if available, otherwise defaults)
-	relays := ConfigGetPublishRelays()
+	relays := cfgpkg.GetPublishRelays()
 	if session.UserRelayList != nil && len(session.UserRelayList.Write) > 0 {
 		relays = session.UserRelayList.Write
 	}
@@ -1719,21 +1742,29 @@ func htmlMuteHandler(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		slog.Error("failed to sign mute list", "error", err)
 		if isHelmRequest(r) {
-			http.Error(w, sanitizeErrorForUser("Sign event", err), http.StatusInternalServerError)
+			util.RespondInternalError(w, sanitizeErrorForUser("Sign event", err))
 			return
 		}
 		redirectWithError(w, r, returnURL, sanitizeErrorForUser("Sign event", err))
 		return
 	}
 
-	// Publish to relays
-	publishEvent(ctx, relays, signedEvent)
-
-	// Update session's mute cache
+	// Update session's mute cache optimistically (before publish)
+	newMuteState := action == "mute"
 	session.mu.Lock()
 	if action == "mute" {
-		session.MutedPubkeys = append(session.MutedPubkeys, pubkeyToMute)
-		slog.Debug("muted user", "pubkey", pubkeyToMute[:12])
+		// Check if already muted to avoid duplicates
+		alreadyMuted := false
+		for _, pk := range session.MutedPubkeys {
+			if pk == pubkeyToMute {
+				alreadyMuted = true
+				break
+			}
+		}
+		if !alreadyMuted {
+			session.MutedPubkeys = append(session.MutedPubkeys, pubkeyToMute)
+		}
+		slog.Debug("muted user", "pubkey", shortID(pubkeyToMute))
 	} else {
 		// Remove from mute list
 		newMuted := make([]string, 0, len(session.MutedPubkeys))
@@ -1743,17 +1774,65 @@ func htmlMuteHandler(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		session.MutedPubkeys = newMuted
-		slog.Debug("unmuted user", "pubkey", pubkeyToMute[:12])
+		slog.Debug("unmuted user", "pubkey", shortID(pubkeyToMute))
 	}
 	session.mu.Unlock()
 
-	// For HelmJS requests, return empty response (h-swap="delete" removes the element)
+	// Capture data for failure callback
+	sessionID := session.ID
+	wasMuting := action == "mute"
+
+	// Publish asynchronously - response is sent before relay confirmation
+	publishEventAsync(relays, signedEvent, func(failedEventID string, err error) {
+		// Revert session cache on failure
+		session.mu.Lock()
+		if wasMuting {
+			// Was muting, so remove it
+			newMuted := make([]string, 0, len(session.MutedPubkeys))
+			for _, pk := range session.MutedPubkeys {
+				if pk != pubkeyToMute {
+					newMuted = append(newMuted, pk)
+				}
+			}
+			session.MutedPubkeys = newMuted
+		} else {
+			// Was unmuting, so add it back
+			session.MutedPubkeys = append(session.MutedPubkeys, pubkeyToMute)
+		}
+		session.mu.Unlock()
+
+		// Render corrected mute button (revert mute state)
+		newCSRFToken := generateCSRFToken(sessionID)
+		revertedMuteState := !wasMuting
+		html, renderErr := renderMuteButtonWithError(pubkeyToMute, newCSRFToken, returnURL, revertedMuteState)
+		if renderErr != nil {
+			slog.Error("failed to render correction mute button", "error", renderErr)
+			return
+		}
+
+		// Send correction via SSE
+		SendCorrectionToSession(sessionID, "#mute-btn-"+pubkeyToMute, html, "mute")
+	})
+
+	// For HelmJS requests, return updated mute button immediately (optimistic)
 	if isHelmRequest(r) {
-		w.WriteHeader(http.StatusOK)
+		newCSRFToken := generateCSRFToken(session.ID)
+		data := map[string]interface{}{
+			"Pubkey":    pubkeyToMute,
+			"IsMuted":   newMuteState,
+			"CSRFToken": newCSRFToken,
+			"ReturnURL": returnURL,
+		}
+		tmpl := util.MustCompileTemplate("mute-button", templateFuncMap, templates.GetMuteButtonTemplate())
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		if err := tmpl.ExecuteTemplate(w, "mute-button", data); err != nil {
+			slog.Error("failed to render mute button", "error", err)
+			util.RespondInternalError(w, "Error rendering response")
+		}
 		return
 	}
 
-	// For unmute or non-HelmJS requests, redirect back
+	// For non-HelmJS requests, redirect back
 	http.Redirect(w, r, returnURL, http.StatusSeeOther)
 }
 
@@ -1783,13 +1862,388 @@ func fetchUserReposts(relays []string, pubkey string) []Event {
 	return events
 }
 
+// htmlReportHandler handles both displaying the report form (GET) and submitting (POST)
+func htmlReportHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodPost {
+		// Handle report submission
+		htmlReportSubmitHandler(w, r)
+		return
+	}
+
+	// GET: Show report form
+	// Extract event ID from path: /report/{identifier}
+	identifier := strings.TrimPrefix(r.URL.Path, "/report/")
+	if identifier == "" {
+		util.RespondBadRequest(w, "Invalid event ID")
+		return
+	}
+
+	// Decode bech32 to hex if needed
+	var eventID string
+	switch {
+	case strings.HasPrefix(identifier, "note1"):
+		decoded, err := nips.DecodeNote(identifier)
+		if err != nil {
+			util.RespondBadRequest(w, "Invalid note ID")
+			return
+		}
+		eventID = decoded
+	case strings.HasPrefix(identifier, "nevent1"):
+		decoded, err := nips.DecodeNEvent(identifier)
+		if err != nil {
+			util.RespondBadRequest(w, "Invalid nevent ID")
+			return
+		}
+		eventID = decoded.EventID
+	default:
+		// Assume hex format
+		if !isValidEventID(identifier) {
+			util.RespondBadRequest(w, "Invalid event ID")
+			return
+		}
+		eventID = identifier
+	}
+
+	themeClass, themeLabel := getThemeFromRequest(r)
+
+	// Check login status
+	session := getSessionFromRequest(r)
+	loggedIn := session != nil && session.Connected
+
+	relays := cfgpkg.GetDefaultRelays()
+
+	// Fetch the event to be reported
+	events := fetchEventByID(relays, eventID)
+	if len(events) == 0 {
+		util.RespondNotFound(w, "Event not found")
+		return
+	}
+	rawEvent := events[0]
+
+	// Fetch author profile
+	profiles := fetchProfiles(relays, []string{rawEvent.PubKey})
+	authorProfile := profiles[rawEvent.PubKey]
+
+	// Build HTMLEventItem for rendering
+	npub, _ := encodeBech32Pubkey(rawEvent.PubKey)
+	resolvedRefs := batchResolveNostrRefs(extractNostrRefs([]string{rawEvent.Content}), relays)
+	linkPreviews := FetchLinkPreviews(ExtractPreviewableURLs(rawEvent.Content))
+	kindDef := GetKindDefinition(rawEvent.Kind)
+
+	reportedEventItem := HTMLEventItem{
+		ID:             rawEvent.ID,
+		Kind:           rawEvent.Kind,
+		TemplateName:   kindDef.TemplateName,
+		RenderTemplate: computeRenderTemplate(kindDef.TemplateName, rawEvent.Tags),
+		Pubkey:         rawEvent.PubKey,
+		Npub:           npub,
+		NpubShort:      formatNpubShort(npub),
+		CreatedAt:      rawEvent.CreatedAt,
+		Content:        rawEvent.Content,
+		ContentHTML:    processContentToHTMLFull(rawEvent.Content, relays, resolvedRefs, linkPreviews),
+		AuthorProfile:  authorProfile,
+	}
+
+	// Extract title/summary for long-form content
+	if kindDef.ExtractTitle {
+		reportedEventItem.Title = util.GetTagValue(rawEvent.Tags, "title")
+	}
+	if kindDef.ExtractSummary {
+		reportedEventItem.Summary = util.GetTagValue(rawEvent.Tags, "summary")
+	}
+
+	// Get return URL from query param or referer
+	returnURL := r.URL.Query().Get("return_url")
+	if returnURL == "" {
+		returnURL = r.Header.Get("Referer")
+	}
+	returnURL = sanitizeReturnURL(returnURL, loggedIn)
+
+	// Generate CSRF token for forms (use session ID if logged in)
+	var csrfToken string
+	if session != nil && session.Connected {
+		csrfToken = generateCSRFToken(session.ID)
+	}
+
+	// Get flash messages from cookies
+	flash := getFlashMessages(w, r)
+
+	data := struct {
+		Title                  string
+		PageDescription        string
+		PageImage              string
+		CanonicalURL           string
+		ThemeClass             string
+		ThemeLabel             string
+		LoggedIn               bool
+		ReportedEvent          HTMLEventItem
+		ReturnURL              string
+		Error                  string
+		Success                string
+		GeneratedAt            time.Time
+		CSRFToken              string
+		FeedModes              []FeedMode
+		KindFilters            []KindFilter
+		NavItems               []NavItem
+		SettingsItems          []SettingsItem
+		SettingsToggle         SettingsToggle
+		ActiveRelays           []string
+		ShowPostForm           bool
+		HasUnreadNotifications bool
+		CurrentURL             string
+	}{
+		Title:           cfgpkg.I18n("report.title"),
+		PageDescription: "Report content",
+		PageImage:       "",
+		CanonicalURL:    r.URL.Path,
+		ThemeClass:      themeClass,
+		ThemeLabel:      themeLabel,
+		LoggedIn:        loggedIn,
+		ReportedEvent:   reportedEventItem,
+		ReturnURL:       returnURL,
+		Error:           flash.Error,
+		Success:         flash.Success,
+		GeneratedAt:     time.Now(),
+		CSRFToken:       csrfToken,
+		FeedModes: GetFeedModes(FeedModeContext{
+			LoggedIn:    loggedIn,
+			ActiveFeed:  "",
+			CurrentPage: "report",
+		}),
+		KindFilters: GetKindFilters(KindFilterContext{
+			LoggedIn:    loggedIn,
+			ActiveFeed:  "",
+			ActiveKinds: "",
+		}),
+		NavItems: GetNavItems(NavContext{
+			LoggedIn:   loggedIn,
+			ActivePage: "",
+		}),
+		SettingsItems: GetSettingsItems(SettingsContext{
+			LoggedIn:      loggedIn,
+			ThemeLabel:    themeLabel,
+			UserAvatarURL: func() string {
+				if session != nil {
+					return getUserAvatarURL(hex.EncodeToString(session.UserPubKey))
+				}
+				return ""
+			}(),
+		}),
+		SettingsToggle: GetSettingsToggle(SettingsContext{
+			LoggedIn:      loggedIn,
+			ThemeLabel:    themeLabel,
+			UserAvatarURL: func() string {
+				if session != nil {
+					return getUserAvatarURL(hex.EncodeToString(session.UserPubKey))
+				}
+				return ""
+			}(),
+		}),
+		ActiveRelays: relays,
+		CurrentURL:   r.URL.String(),
+	}
+
+	// Determine if this is a HelmJS fragment request
+	isFragment := isHelmRequest(r)
+
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	if isFragment {
+		if err := cachedReportFragment.ExecuteTemplate(w, tmplFragment, data); err != nil {
+			slog.Error("report fragment template error", "error", err)
+			util.RespondInternalError(w, "Internal server error")
+		}
+	} else {
+		if err := cachedReportTemplate.ExecuteTemplate(w, tmplBase, data); err != nil {
+			slog.Error("report template error", "error", err)
+			util.RespondInternalError(w, "Internal server error")
+		}
+	}
+}
+
+// htmlReportSubmitHandler handles the POST submission of a report
+func htmlReportSubmitHandler(w http.ResponseWriter, r *http.Request) {
+	session := requireAuth(w, r)
+	if session == nil {
+		return
+	}
+
+	// Validate CSRF token
+	csrfToken := r.FormValue("csrf_token")
+	if !requireCSRF(w, session.ID, csrfToken) {
+		return
+	}
+
+	eventID := strings.TrimSpace(r.FormValue("event_id"))
+	eventPubkey := strings.TrimSpace(r.FormValue("event_pubkey"))
+	category := strings.TrimSpace(r.FormValue("category"))
+	content := strings.TrimSpace(r.FormValue("content"))
+	muteUser := r.FormValue("mute_user") == "1"
+	returnURL := sanitizeReturnURL(strings.TrimSpace(r.FormValue("return_url")), true)
+
+	// Validate event ID
+	if !isValidEventID(eventID) {
+		redirectWithError(w, r, returnURL, "Invalid event ID")
+		return
+	}
+
+	// Validate category
+	validCategories := map[string]bool{
+		"spam": true, "impersonation": true, "illegal": true,
+		"nudity": true, "malware": true, "profanity": true, "other": true,
+	}
+	if !validCategories[category] {
+		redirectWithError(w, r, returnURL, "Invalid report category")
+		return
+	}
+
+	// Validate pubkey format
+	if eventPubkey != "" && len(eventPubkey) != 64 {
+		redirectWithError(w, r, returnURL, "Invalid pubkey")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// Build report event (NIP-56 kind 1984)
+	// Tags: p tag for reported user, e tag for reported event with category
+	tags := [][]string{}
+
+	// Add p tag for the reported user
+	if eventPubkey != "" {
+		tags = append(tags, []string{"p", eventPubkey, category})
+	}
+
+	// Add e tag for the reported event
+	tags = append(tags, []string{"e", eventID, category})
+
+	event := UnsignedEvent{
+		Kind:      1984,
+		Tags:      tags,
+		Content:   content,
+		CreatedAt: time.Now().Unix(),
+	}
+
+	// Sign the event
+	signedEvent, err := session.SignEvent(ctx, event)
+	if err != nil {
+		slog.Error("failed to sign report event", "error", err)
+		redirectWithError(w, r, returnURL, "Failed to sign report")
+		return
+	}
+
+	// Publish to user's write relays
+	relays := cfgpkg.GetPublishRelays()
+	if session.UserRelayList != nil && len(session.UserRelayList.Write) > 0 {
+		relays = session.UserRelayList.Write
+	}
+	publishEvent(ctx, relays, signedEvent)
+
+	slog.Info("report published",
+		"event_id", eventID,
+		"category", category,
+		"reporter", hex.EncodeToString(session.UserPubKey)[:16],
+	)
+
+	// If mute checkbox was checked, also mute the user
+	if muteUser && eventPubkey != "" {
+		userPubkey := hex.EncodeToString(session.UserPubKey)
+
+		// Don't allow muting yourself
+		if eventPubkey != userPubkey {
+			// Fetch user's current mute list (kind 10000)
+			existingTags := [][]string{}
+			muteEvents := fetchKind10000(relays, userPubkey)
+			if len(muteEvents) > 0 {
+				existingTags = muteEvents[0].Tags
+			}
+
+			// Check if already muted
+			alreadyMuted := false
+			for _, tag := range existingTags {
+				if len(tag) >= 2 && tag[0] == "p" && tag[1] == eventPubkey {
+					alreadyMuted = true
+					break
+				}
+			}
+
+			// Add to mute list if not already muted
+			if !alreadyMuted {
+				newTags := append(existingTags, []string{"p", eventPubkey})
+
+				muteEvent := UnsignedEvent{
+					Kind:      10000,
+					Content:   "",
+					Tags:      newTags,
+					CreatedAt: time.Now().Unix(),
+				}
+
+				signedMuteEvent, err := session.SignEvent(ctx, muteEvent)
+				if err != nil {
+					slog.Error("failed to sign mute list after report", "error", err)
+					// Continue anyway - report was successful
+				} else {
+					publishEvent(ctx, relays, signedMuteEvent)
+
+					// Update session's mute cache
+					session.mu.Lock()
+					// Check if already muted to avoid duplicates
+					alreadyMuted := false
+					for _, pk := range session.MutedPubkeys {
+						if pk == eventPubkey {
+							alreadyMuted = true
+							break
+						}
+					}
+					if !alreadyMuted {
+						session.MutedPubkeys = append(session.MutedPubkeys, eventPubkey)
+					}
+					session.mu.Unlock()
+
+					slog.Info("muted user after report", "pubkey", shortID(eventPubkey))
+				}
+			}
+		}
+	}
+
+	// Redirect back with success message
+	redirectWithSuccess(w, r, returnURL, cfgpkg.I18n("report.success"))
+}
+
 // htmlQuoteHandler handles both displaying the quote form (GET) and submitting (POST)
 func htmlQuoteHandler(w http.ResponseWriter, r *http.Request) {
-	// Extract event ID from path: /html/quote/{eventId}
-	eventID := strings.TrimPrefix(r.URL.Path, "/html/quote/")
-	if eventID == "" || !isValidEventID(eventID) {
-		http.Error(w, "Invalid event ID", http.StatusBadRequest)
+	// Extract event ID from path: /quote/{identifier}
+	// Accepts hex, note1, or nevent1 format
+	identifier := strings.TrimPrefix(r.URL.Path, "/quote/")
+	if identifier == "" {
+		util.RespondBadRequest(w, "Invalid event ID")
 		return
+	}
+
+	// Decode bech32 to hex if needed
+	var eventID string
+	switch {
+	case strings.HasPrefix(identifier, "note1"):
+		decoded, err := nips.DecodeNote(identifier)
+		if err != nil {
+			util.RespondBadRequest(w, "Invalid note ID")
+			return
+		}
+		eventID = decoded
+	case strings.HasPrefix(identifier, "nevent1"):
+		decoded, err := nips.DecodeNEvent(identifier)
+		if err != nil {
+			util.RespondBadRequest(w, "Invalid nevent ID")
+			return
+		}
+		eventID = decoded.EventID
+	default:
+		// Assume hex format
+		if !isValidEventID(identifier) {
+			util.RespondBadRequest(w, "Invalid event ID")
+			return
+		}
+		eventID = identifier
 	}
 
 	themeClass, themeLabel := getThemeFromRequest(r)
@@ -1801,7 +2255,7 @@ func htmlQuoteHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodPost {
 		// Handle quote submission
 		if !loggedIn {
-			redirectWithError(w, r, "/html/login", "Please login first")
+			redirectWithError(w, r, "/login", "Please login first")
 			return
 		}
 
@@ -1814,18 +2268,15 @@ func htmlQuoteHandler(w http.ResponseWriter, r *http.Request) {
 		content := strings.TrimSpace(r.FormValue("content"))
 		quotedPubkey := strings.TrimSpace(r.FormValue("quoted_pubkey"))
 		gifURL := strings.TrimSpace(r.FormValue("gif_url"))
+		mentionsJSON := r.FormValue("mentions")
 
-		// Append GIF URL to content if present
-		if gifURL != "" {
-			if content != "" {
-				content = content + "\n\n" + gifURL
-			} else {
-				content = gifURL
-			}
-		}
+		content = util.AppendGifToContent(content, gifURL)
+
+		// Process @mentions: replace @displayname with nostr:nprofile1...
+		content, mentionedPubkeys := processMentions(content, mentionsJSON)
 
 		if content == "" {
-			redirectWithError(w, r, "/html/quote/"+eventID, "You cannot post an empty note!")
+			redirectWithError(w, r, "/quote/"+identifier, "You cannot post an empty note!")
 			return
 		}
 
@@ -1848,6 +2299,11 @@ func htmlQuoteHandler(w http.ResponseWriter, r *http.Request) {
 			tags = append(tags, []string{"p", quotedPubkey})
 		}
 
+		// Add p-tags for mentioned users (enables notifications per NIP-27)
+		for _, pubkey := range mentionedPubkeys {
+			tags = append(tags, []string{"p", pubkey})
+		}
+
 		// Create unsigned event
 		event := UnsignedEvent{
 			Kind:      1,
@@ -1855,6 +2311,8 @@ func htmlQuoteHandler(w http.ResponseWriter, r *http.Request) {
 			Tags:      tags,
 			CreatedAt: time.Now().Unix(),
 		}
+
+		addClientTag(&event)
 
 		// Sign via bunker
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -1864,19 +2322,15 @@ func htmlQuoteHandler(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			slog.Error("failed to sign quote", "error", err)
 			if isHelmRequest(r) {
-				http.Error(w, sanitizeErrorForUser("Sign event", err), http.StatusInternalServerError)
+				util.RespondInternalError(w, sanitizeErrorForUser("Sign event", err))
 				return
 			}
-			redirectWithError(w, r, "/html/quote/"+eventID, sanitizeErrorForUser("Sign event", err))
+			redirectWithError(w, r, "/quote/"+identifier, sanitizeErrorForUser("Sign event", err))
 			return
 		}
 
-		// Publish to relays
-		relays := ConfigGetPublishRelays()
-		if session.UserRelayList != nil && len(session.UserRelayList.Write) > 0 {
-			relays = session.UserRelayList.Write
-		}
-
+		// Publish to relays following outbox model (author write + tagged users' read)
+		relays := getPublishRelaysForEvent(session, signedEvent)
 		publishEvent(ctx, relays, signedEvent)
 
 		redirectWithSuccess(w, r, DefaultTimelineURLLoggedIn(), "Quote published")
@@ -1884,18 +2338,33 @@ func htmlQuoteHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// GET: Show quote form with preview of the quoted note
-	relays := ConfigGetDefaultRelays()
+	relays := cfgpkg.GetDefaultRelays()
 
 	// Fetch the event to be quoted
 	events := fetchEventByID(relays, eventID)
 	if len(events) == 0 {
-		http.Error(w, "Event not found", http.StatusNotFound)
+		util.RespondNotFound(w, "Event not found")
 		return
 	}
 	rawEvent := events[0]
 
-	// Fetch author profile
-	profiles := fetchProfiles(relays, []string{rawEvent.PubKey})
+	// Use outbox model: fetch author's relay list and refetch from their write relays if not found in content
+	// (This helps resolve events that only exist on the author's relays)
+	if rawEvent.Content == "" || len(rawEvent.Tags) == 0 {
+		if outboxRelays := buildOutboxRelaysForPubkey(rawEvent.PubKey, 3); len(outboxRelays) > 0 {
+			if outboxEvents := fetchEventByID(outboxRelays, eventID); len(outboxEvents) > 0 && outboxEvents[0].Content != "" {
+				rawEvent = outboxEvents[0]
+				slog.Debug("quote: found event via outbox", "author", shortID(rawEvent.PubKey))
+			}
+		}
+	}
+
+	// Fetch author profile (use outbox relays if available for better profile discovery)
+	profileRelays := relays
+	if authorRelayList := fetchRelayList(rawEvent.PubKey); authorRelayList != nil && len(authorRelayList.Write) > 0 {
+		profileRelays = append(authorRelayList.Write, relays...)
+	}
+	profiles := fetchProfiles(profileRelays, []string{rawEvent.PubKey})
 	authorProfile := profiles[rawEvent.PubKey]
 
 	// Build HTMLEventItem for proper rendering (with processed content)
@@ -1952,6 +2421,9 @@ func htmlQuoteHandler(w http.ResponseWriter, r *http.Request) {
 
 	data := struct {
 		Title                  string
+		PageDescription        string
+		PageImage              string
+		CanonicalURL           string
 		ThemeClass             string
 		ThemeLabel             string
 		LoggedIn               bool
@@ -1976,6 +2448,9 @@ func htmlQuoteHandler(w http.ResponseWriter, r *http.Request) {
 		ShowGifButton          bool     // For GIF picker
 	}{
 		Title:           "Quote Note",
+		PageDescription: "Quote and comment on a note",
+		PageImage:       "",
+		CanonicalURL:    r.URL.Path,
 		ThemeClass:      themeClass,
 		ThemeLabel:      themeLabel,
 		LoggedIn:        loggedIn,
@@ -2017,10 +2492,20 @@ func htmlQuoteHandler(w http.ResponseWriter, r *http.Request) {
 		ShowGifButton: GiphyEnabled(),
 	}
 
+	// Determine if this is a HelmJS fragment request
+	isFragment := isHelmRequest(r)
+
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	if err := cachedQuoteTemplate.ExecuteTemplate(w, tmplBase, data); err != nil {
-		slog.Error("quote template error", "error", err)
-		http.Error(w, "Internal server error", http.StatusInternalServerError)
+	if isFragment {
+		if err := cachedQuoteFragment.ExecuteTemplate(w, tmplFragment, data); err != nil {
+			slog.Error("quote fragment template error", "error", err)
+			util.RespondInternalError(w, "Internal server error")
+		}
+	} else {
+		if err := cachedQuoteTemplate.ExecuteTemplate(w, tmplBase, data); err != nil {
+			slog.Error("quote template error", "error", err)
+			util.RespondInternalError(w, "Internal server error")
+		}
 	}
 }
 
@@ -2038,7 +2523,7 @@ func getSessionFromRequest(r *http.Request) *BunkerSession {
 func requireAuth(w http.ResponseWriter, r *http.Request) *BunkerSession {
 	session := getSessionFromRequest(r)
 	if session == nil || !session.Connected {
-		redirectWithError(w, r, "/html/login", "Please login first")
+		redirectWithError(w, r, "/login", "Please login first")
 		return nil
 	}
 	return session
@@ -2055,39 +2540,116 @@ func isValidEventID(id string) bool {
 // sanitizeReturnURL ensures the return URL is a local path to prevent open redirects
 // loggedIn determines which default timeline to use when returnURL is empty or invalid
 func sanitizeReturnURL(returnURL string, loggedIn bool) string {
-	if returnURL == "" {
-		if loggedIn {
-			return DefaultTimelineURLLoggedIn()
-		}
-		return DefaultTimelineURL()
+	defaultURL := DefaultTimelineURL()
+	if loggedIn {
+		defaultURL = DefaultTimelineURLLoggedIn()
 	}
+
+	if returnURL == "" {
+		return defaultURL
+	}
+
 	// Must start with / and not // (which could be protocol-relative URL)
 	if !strings.HasPrefix(returnURL, "/") || strings.HasPrefix(returnURL, "//") {
-		if loggedIn {
-			return DefaultTimelineURLLoggedIn()
-		}
-		return DefaultTimelineURL()
+		return defaultURL
 	}
-	return returnURL
-}
 
-// escapeURLParam properly escapes a string for use in URL query parameters
-func escapeURLParam(s string) string {
-	return url.QueryEscape(s)
-}
+	// Parse URL to ensure it's valid and has no host component
+	parsed, err := url.Parse(returnURL)
+	if err != nil {
+		return defaultURL
+	}
 
+	// Reject if URL has scheme or host (shouldn't be possible after prefix check, but defense in depth)
+	if parsed.Scheme != "" || parsed.Host != "" {
+		return defaultURL
+	}
+
+	// Reject if path contains dangerous patterns
+	if strings.Contains(parsed.Path, "..") || strings.Contains(parsed.Path, "\\") {
+		return defaultURL
+	}
+
+	// Strip fragment to prevent javascript: URIs in anchors (defense in depth)
+	parsed.Fragment = ""
+
+	// Reconstruct the safe URL (path + query, no fragment)
+	result := parsed.Path
+	if parsed.RawQuery != "" {
+		result += "?" + parsed.RawQuery
+	}
+	return result
+}
 
 // publishEvent publishes a signed event to relays
-func publishEvent(ctx context.Context, relays []string, event *Event) {
+func publishEvent(_ context.Context, relays []string, event *Event) {
+	// Create independent context for publishing - this ensures publish operations
+	// complete even after the HTTP handler returns and cancels its context.
+	// Each relay gets 15 seconds to accept the event.
+	publishCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+
+	var wg sync.WaitGroup
 	for _, relay := range relays {
+		wg.Add(1)
 		go func(relayURL string) {
-			if err := publishToRelay(ctx, relayURL, event); err != nil {
+			defer wg.Done()
+			if err := publishToRelay(publishCtx, relayURL, event); err != nil {
 				slog.Warn("failed to publish", "relay", relayURL, "error", err)
 			}
 		}(relay)
 	}
-	// Give relays a moment to receive
+
+	// Wait for at least some relays to respond (500ms), then continue
+	// The goroutines will complete in the background
+	go func() {
+		wg.Wait()
+		cancel()
+	}()
+
 	time.Sleep(500 * time.Millisecond)
+}
+
+// PublishFailureCallback is called when an async publish fails on all relays
+type PublishFailureCallback func(eventID string, err error)
+
+// publishEventAsync publishes a signed event to relays without blocking.
+// Returns immediately. If publish fails on all relays, calls onFailure.
+// Used for optimistic UI where the response is sent before relay confirmation.
+func publishEventAsync(relays []string, event *Event, onFailure PublishFailureCallback) {
+	go func() {
+		publishCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+
+		var successCount int
+		var lastErr error
+		var mu sync.Mutex
+		var wg sync.WaitGroup
+
+		for _, relay := range relays {
+			wg.Add(1)
+			go func(relayURL string) {
+				defer wg.Done()
+				if err := publishToRelay(publishCtx, relayURL, event); err != nil {
+					mu.Lock()
+					lastErr = err
+					mu.Unlock()
+					slog.Warn("async publish failed", "relay", relayURL, "error", err)
+				} else {
+					mu.Lock()
+					successCount++
+					mu.Unlock()
+					slog.Debug("async publish succeeded", "relay", relayURL, "event", event.ID[:8])
+				}
+			}(relay)
+		}
+
+		wg.Wait()
+
+		if successCount == 0 && onFailure != nil {
+			slog.Error("async publish failed on all relays", "event", event.ID[:8], "relays", len(relays))
+			onFailure(event.ID, lastErr)
+		}
+	}()
 }
 
 func publishToRelay(ctx context.Context, relayURL string, event *Event) error {
@@ -2102,6 +2664,77 @@ func publishToRelay(ctx context.Context, relayURL string, event *Event) error {
 		return fmt.Errorf("relay rejected event %s: %s", resp.EventID, resp.Message)
 	}
 	return nil
+}
+
+// getPublishRelaysForEvent returns relays for publishing an event following the outbox model:
+// - Author's write relays (where the author publishes)
+// - Tagged users' read relays (so they see notifications)
+// - Fallback to default publish relays if author has no relay list
+func getPublishRelaysForEvent(session *BunkerSession, event *Event) []string {
+	relaySet := make(map[string]bool)
+
+	// 1. Author's write relays (primary destination)
+	if session.UserRelayList != nil && len(session.UserRelayList.Write) > 0 {
+		for _, r := range session.UserRelayList.Write {
+			relaySet[r] = true
+		}
+	} else {
+		// Fallback to default publish relays
+		for _, r := range cfgpkg.GetPublishRelays() {
+			relaySet[r] = true
+		}
+	}
+
+	// 2. Extract tagged pubkeys from p-tags
+	var taggedPubkeys []string
+	for _, tag := range event.Tags {
+		if len(tag) >= 2 && tag[0] == "p" {
+			pk := tag[1]
+			// Validate it looks like a hex pubkey
+			if len(pk) == 64 {
+				taggedPubkeys = append(taggedPubkeys, pk)
+			}
+		}
+	}
+
+	// 3. Fetch relay lists for tagged users and collect their READ relays
+	if len(taggedPubkeys) > 0 {
+		// Limit to first 10 tagged users to avoid excessive relay fetching
+		if len(taggedPubkeys) > 10 {
+			taggedPubkeys = taggedPubkeys[:10]
+		}
+
+		relayLists := fetchRelayLists(taggedPubkeys)
+		for _, pk := range taggedPubkeys {
+			if rl, ok := relayLists[pk]; ok && rl != nil && len(rl.Read) > 0 {
+				// Add up to 2 read relays per tagged user
+				added := 0
+				for _, r := range rl.Read {
+					if !relaySet[r] && added < 2 {
+						relaySet[r] = true
+						added++
+					}
+				}
+			}
+		}
+	}
+
+	// Convert to slice
+	relays := make([]string, 0, len(relaySet))
+	for r := range relaySet {
+		relays = append(relays, r)
+	}
+
+	authorRelayCount := 0
+	if session.UserRelayList != nil {
+		authorRelayCount = len(session.UserRelayList.Write)
+	}
+	slog.Debug("publish relays for event",
+		"author_relays", authorRelayCount,
+		"tagged_users", len(taggedPubkeys),
+		"total_relays", len(relays))
+
+	return relays
 }
 
 var htmlLoginTemplate = `<!DOCTYPE html>
@@ -2439,7 +3072,7 @@ var htmlLoginTemplate = `<!DOCTYPE html>
     </header>
 
     <nav>
-      <a href="/html/timeline?kinds=1&limit=20">Timeline</a>
+      <a href="/timeline?feed=global&amp;kinds=1&amp;limit=20">Timeline</a>
     </nav>
 
     <main>
@@ -2467,7 +3100,7 @@ var htmlLoginTemplate = `<!DOCTYPE html>
             {{.NostrConnectURL}}
           </div>
         </details>
-        <a href="/html/check-connection?secret={{.Secret}}" class="submit-btn submit-btn-block">
+        <a href="{{buildURL "/check-connection" "secret" .Secret}}" class="submit-btn submit-btn-block">
           Check Connection
         </a>
         <p class="form-help">
@@ -2480,7 +3113,7 @@ var htmlLoginTemplate = `<!DOCTYPE html>
       </div>
       {{end}}
 
-      <form class="login-form login-section" method="POST" action="/html/login">
+      <form class="login-form login-section" method="POST" action="/login">
         <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
         <h2>Option 2: Paste Bunker URL</h2>
         <div class="form-group">
@@ -2499,7 +3132,7 @@ var htmlLoginTemplate = `<!DOCTYPE html>
         &mdash; or &mdash;
       </div>
 
-      <form class="login-form login-section" method="POST" action="/html/reconnect">
+      <form class="login-form login-section" method="POST" action="/reconnect">
         <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
         <h2>Option 3: Reconnect to Existing Bunker</h2>
         <p class="server-info">
@@ -2590,7 +3223,7 @@ func htmlFollowHandler(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 
 	// Get relays to use
-	relays := ConfigGetPublishRelays()
+	relays := cfgpkg.GetPublishRelays()
 	if session.UserRelayList != nil && len(session.UserRelayList.Write) > 0 {
 		relays = session.UserRelayList.Write
 	}
@@ -2641,7 +3274,7 @@ func htmlFollowHandler(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		slog.Error("failed to sign contact list", "error", err)
 		if isHelmRequest(r) {
-			http.Error(w, sanitizeErrorForUser("Sign event", err), http.StatusInternalServerError)
+			util.RespondInternalError(w, sanitizeErrorForUser("Sign event", err))
 			return
 		}
 		redirectWithError(w, r, returnURL, sanitizeErrorForUser("Sign event", err))
@@ -2676,7 +3309,7 @@ func htmlFollowHandler(w http.ResponseWriter, r *http.Request) {
 		html, err := renderFollowButtonFragment(targetPubkey, newCSRFToken, returnURL, newFollowingState)
 		if err != nil {
 			slog.Error("failed to render follow button fragment", "error", err)
-			http.Error(w, "Failed to render response", http.StatusInternalServerError)
+			util.RespondInternalError(w, "Failed to render response")
 			return
 		}
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -2711,12 +3344,12 @@ func fetchKind0(relays []string, pubkey string) []Event {
 	return events
 }
 
-// htmlProfileEditHandler handles GET and POST for /html/profile/edit
+// htmlProfileEditHandler handles GET and POST for /profile/edit
 func htmlProfileEditHandler(w http.ResponseWriter, r *http.Request) {
 	// Get session
 	session := getSessionFromRequest(r)
 	if session == nil {
-		http.Redirect(w, r, "/html/login", http.StatusSeeOther)
+		http.Redirect(w, r, "/login", http.StatusSeeOther)
 		return
 	}
 
@@ -2792,11 +3425,7 @@ func htmlProfileEditHandler(w http.ResponseWriter, r *http.Request) {
 				ActiveFeed:  "me",
 				CurrentPage: "profile",
 			}),
-			KindFilters: GetKindFilters(KindFilterContext{
-				LoggedIn:    true,
-				ActiveFeed:  "me",
-				ActiveKinds: "",
-			}),
+			KindFilters: nil, // Hide kind submenu in edit mode
 			NavItems: GetNavItems(NavContext{
 				LoggedIn:   true,
 				ActivePage: "",
@@ -2816,26 +3445,26 @@ func htmlProfileEditHandler(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		if err := cachedProfileTemplate.ExecuteTemplate(w, tmplBase, data); err != nil {
 			slog.Error("template error", "error", err)
-			http.Error(w, "Internal server error", http.StatusInternalServerError)
+			util.RespondInternalError(w, "Internal server error")
 		}
 		return
 	}
 
 	// POST - save profile
 	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		util.RespondMethodNotAllowed(w, "Method not allowed")
 		return
 	}
 
 	// Validate CSRF
 	if err := r.ParseForm(); err != nil {
-		redirectWithError(w, r, "/html/profile/edit", "Invalid form data")
+		redirectWithError(w, r, "/profile/edit", "Invalid form data")
 		return
 	}
 
 	csrfToken := r.FormValue("csrf_token")
 	if !validateCSRFToken(session.ID, csrfToken) {
-		redirectWithError(w, r, "/html/profile/edit", "Invalid session, please try again")
+		redirectWithError(w, r, "/profile/edit", "Invalid session, please try again")
 		return
 	}
 
@@ -2852,15 +3481,15 @@ func htmlProfileEditHandler(w http.ResponseWriter, r *http.Request) {
 
 	// Basic URL validation for picture and banner
 	if picture != "" && !isValidURL(picture) {
-		redirectWithError(w, r, "/html/profile/edit", "Invalid picture URL")
+		redirectWithError(w, r, "/profile/edit", "Invalid picture URL")
 		return
 	}
 	if banner != "" && !isValidURL(banner) {
-		redirectWithError(w, r, "/html/profile/edit", "Invalid banner URL")
+		redirectWithError(w, r, "/profile/edit", "Invalid banner URL")
 		return
 	}
 	if website != "" && !isValidURL(website) {
-		redirectWithError(w, r, "/html/profile/edit", "Invalid website URL")
+		redirectWithError(w, r, "/profile/edit", "Invalid website URL")
 		return
 	}
 
@@ -2895,7 +3524,7 @@ func htmlProfileEditHandler(w http.ResponseWriter, r *http.Request) {
 	// Serialize profile content
 	contentJSON, err := json.Marshal(profileData)
 	if err != nil {
-		redirectWithError(w, r, "/html/profile/edit", "Failed to encode profile")
+		redirectWithError(w, r, "/profile/edit", "Failed to encode profile")
 		return
 	}
 
@@ -2914,7 +3543,7 @@ func htmlProfileEditHandler(w http.ResponseWriter, r *http.Request) {
 	signedEvent, err := session.SignEvent(ctx, event)
 	if err != nil {
 		slog.Error("failed to sign profile update", "error", err)
-		redirectWithError(w, r, "/html/profile/edit", sanitizeErrorForUser("Sign profile", err))
+		redirectWithError(w, r, "/profile/edit", sanitizeErrorForUser("Sign profile", err))
 		return
 	}
 
@@ -2938,7 +3567,7 @@ func htmlProfileEditHandler(w http.ResponseWriter, r *http.Request) {
 	// Invalidate cached profile
 	profileCache.Delete(userPubKeyHex)
 
-	redirectWithSuccess(w, r, "/html/profile/"+userPubKeyHex, "Profile updated")
+	redirectWithSuccess(w, r, "/profile/"+userPubKeyHex, "Profile updated")
 }
 
 // isValidURL checks if a string is a valid HTTP/HTTPS URL
@@ -2953,7 +3582,7 @@ func isValidURL(s string) bool {
 // htmlWalletConnectHandler handles wallet connection via NWC URI
 func htmlWalletConnectHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Redirect(w, r, "/html/wallet", http.StatusSeeOther)
+		http.Redirect(w, r, "/wallet", http.StatusSeeOther)
 		return
 	}
 
@@ -2971,14 +3600,14 @@ func htmlWalletConnectHandler(w http.ResponseWriter, r *http.Request) {
 	// Parse NWC URI
 	nwcURI := strings.TrimSpace(r.FormValue("nwc_uri"))
 	if nwcURI == "" {
-		redirectWithError(w, r, "/html/wallet", I18n("wallet.error_empty_uri"))
+		redirectWithError(w, r, "/wallet", cfgpkg.I18n("wallet.error_empty_uri"))
 		return
 	}
 
 	config, err := ParseNWCURI(nwcURI)
 	if err != nil {
 		slog.Warn("invalid NWC URI", "error", err)
-		redirectWithError(w, r, "/html/wallet", I18n("wallet.error_invalid_uri"))
+		redirectWithError(w, r, "/wallet", cfgpkg.I18n("wallet.error_invalid_uri"))
 		return
 	}
 
@@ -2996,18 +3625,18 @@ func htmlWalletConnectHandler(w http.ResponseWriter, r *http.Request) {
 	// so when user eventually visits wallet page, everything is ready
 	PrefetchWalletInfo(userPubkeyHex, config)
 
-	// Redirect to return URL or wallet page
-	returnURL := r.FormValue("return_url")
-	if returnURL == "" {
-		returnURL = "/html/wallet"
+	// Redirect to return URL or wallet page (sanitize to prevent open redirect)
+	returnURL := sanitizeReturnURL(r.FormValue("return_url"), true)
+	if returnURL == DefaultTimelineURLLoggedIn() {
+		returnURL = "/wallet" // Default to wallet page, not timeline
 	}
-	redirectWithSuccess(w, r, returnURL, I18n("wallet.connected_success"))
+	redirectWithSuccess(w, r, returnURL, cfgpkg.I18n("wallet.connected_success"))
 }
 
 // htmlWalletDisconnectHandler handles wallet disconnection
 func htmlWalletDisconnectHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Redirect(w, r, "/html/wallet", http.StatusSeeOther)
+		http.Redirect(w, r, "/wallet", http.StatusSeeOther)
 		return
 	}
 
@@ -3035,12 +3664,12 @@ func htmlWalletDisconnectHandler(w http.ResponseWriter, r *http.Request) {
 
 	slog.Info("wallet disconnected", "user", userPubkeyHex[:8])
 
-	// Redirect to return URL or wallet page
-	returnURL := r.FormValue("return_url")
-	if returnURL == "" {
-		returnURL = "/html/wallet"
+	// Redirect to return URL or wallet page (sanitize to prevent open redirect)
+	returnURL := sanitizeReturnURL(r.FormValue("return_url"), true)
+	if returnURL == DefaultTimelineURLLoggedIn() {
+		returnURL = "/wallet" // Default to wallet page, not timeline
 	}
-	redirectWithSuccess(w, r, returnURL, I18n("wallet.disconnected_success"))
+	redirectWithSuccess(w, r, returnURL, cfgpkg.I18n("wallet.disconnected_success"))
 }
 
 // HTMLWalletInfoData holds data for the wallet info fragment
@@ -3074,7 +3703,7 @@ func htmlWalletInfoHandler(w http.ResponseWriter, r *http.Request) {
 	if session.NWCConfig == nil {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.Header().Set("Cache-Control", "no-cache")
-		w.Write([]byte(`<div class="wallet-info-error">` + I18n("wallet.not_connected") + `</div>`))
+		w.Write([]byte(`<div class="wallet-info-error">` + cfgpkg.I18n("wallet.not_connected") + `</div>`))
 		return
 	}
 
@@ -3088,7 +3717,7 @@ func htmlWalletInfoHandler(w http.ResponseWriter, r *http.Request) {
 		html, err := renderWalletInfoFragment(data)
 		if err != nil {
 			slog.Error("wallet info: failed to render cached data", "error", err)
-			http.Error(w, "Failed to render wallet info", http.StatusInternalServerError)
+			util.RespondInternalError(w, "Failed to render wallet info")
 			return
 		}
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -3104,7 +3733,7 @@ func htmlWalletInfoHandler(w http.ResponseWriter, r *http.Request) {
 		html, err := renderWalletInfoFragment(data)
 		if err != nil {
 			slog.Error("wallet info: failed to render prefetch data", "error", err)
-			http.Error(w, "Failed to render wallet info", http.StatusInternalServerError)
+			util.RespondInternalError(w, "Failed to render wallet info")
 			return
 		}
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -3119,7 +3748,7 @@ func htmlWalletInfoHandler(w http.ResponseWriter, r *http.Request) {
 	if cached == nil {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.Header().Set("Cache-Control", "no-cache")
-		w.Write([]byte(`<div class="wallet-info-error">` + I18n("wallet.connection_failed") + `</div>`))
+		w.Write([]byte(`<div class="wallet-info-error">` + cfgpkg.I18n("wallet.connection_failed") + `</div>`))
 		return
 	}
 
@@ -3130,7 +3759,7 @@ func htmlWalletInfoHandler(w http.ResponseWriter, r *http.Request) {
 	html, err := renderWalletInfoFragment(data)
 	if err != nil {
 		slog.Error("wallet info: failed to render", "error", err)
-		http.Error(w, "Failed to render wallet info", http.StatusInternalServerError)
+		util.RespondInternalError(w, "Failed to render wallet info")
 		return
 	}
 
@@ -3154,7 +3783,7 @@ func fetchWalletInfo(ctx context.Context, userPubkeyHex string, config *NWCConfi
 	balanceResult, err := nwcClient.GetBalance(ctx)
 	if err != nil {
 		slog.Warn("fetchWalletInfo: failed to get balance", "error", err)
-		result.Error = I18n("wallet.balance_failed")
+		result.Error = cfgpkg.I18n("wallet.balance_failed")
 	} else {
 		result.BalanceMsats = balanceResult.Balance
 		sats := balanceResult.Balance / 1000
@@ -3196,7 +3825,7 @@ func fetchWalletInfo(ctx context.Context, userPubkeyHex string, config *NWCConfi
 
 		// Batch fetch profiles for zap pubkeys
 		if len(pubkeysToFetch) > 0 {
-			relays := ConfigGetProfileRelays()
+			relays := cfgpkg.GetProfileRelays()
 			profiles := fetchProfiles(relays, pubkeysToFetch)
 
 			// Second pass: update transactions with display names
@@ -3407,7 +4036,7 @@ func htmlZapHandler(w http.ResponseWriter, r *http.Request) {
 	// Helper to render footer fragment for error responses (preserves UI)
 	renderFooterForError := func() string {
 		newCSRFToken := generateCSRFToken(session.ID)
-		readRelays := ConfigGetDefaultRelays()
+		readRelays := cfgpkg.GetDefaultRelays()
 		if session.UserRelayList != nil && len(session.UserRelayList.Read) > 0 {
 			readRelays = session.UserRelayList.Read
 		}
@@ -3426,14 +4055,14 @@ func htmlZapHandler(w http.ResponseWriter, r *http.Request) {
 	slog.Info("zap: checking wallet", "hasWallet", session.HasWallet())
 	if !session.HasWallet() {
 		slog.Warn("zap: no wallet connected")
-		walletURL := "/html/wallet?return=" + url.QueryEscape(returnURL)
+		walletURL := util.BuildURL("/wallet", map[string]string{"return": returnURL})
 		if isHelmRequest(r) {
 			// For HelmJS: show error with link, keep footer intact
-			errorMsg := I18n("wallet.connect_to_zap") + ` <a href="` + template.HTMLEscapeString(walletURL) + `">` + I18n("wallet.connect") + `</a>`
+			errorMsg := cfgpkg.I18n("wallet.connect_to_zap") + ` <a href="` + template.HTMLEscapeString(walletURL) + `">` + cfgpkg.I18n("wallet.connect") + `</a>`
 			respondWithErrorAndFragment(w, r, returnURL, errorMsg, renderFooterForError())
 		} else {
 			// For regular requests: redirect to wallet page
-			setFlashError(w, r, I18n("wallet.connect_to_zap"))
+			setFlashError(w, r, cfgpkg.I18n("wallet.connect_to_zap"))
 			http.Redirect(w, r, walletURL, http.StatusSeeOther)
 		}
 		return
@@ -3442,7 +4071,7 @@ func htmlZapHandler(w http.ResponseWriter, r *http.Request) {
 
 	// Fetch recipient's profile to get their lightning address
 	slog.Info("zap: fetching profile", "pubkey", eventPubkey[:16])
-	relays := ConfigGetProfileRelays()
+	relays := cfgpkg.GetProfileRelays()
 	if session.UserRelayList != nil && len(session.UserRelayList.Read) > 0 {
 		relays = session.UserRelayList.Read
 	}
@@ -3462,18 +4091,37 @@ func htmlZapHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Resolve LNURL to get payment info
+	// Resolve LNURL to get payment info (check cache first)
 	slog.Info("zap: resolving LNURL", "lud16", profile.Lud16)
-	lnurlInfo, err := ResolveLNURLFromProfile(profile)
-	if err != nil {
-		slog.Error("zap: failed to resolve LNURL", "error", err, "pubkey", eventPubkey[:8])
-		respondWithErrorAndFragment(w, r, returnURL, "Could not resolve recipient's Lightning address", renderFooterForError())
-		return
+	lnurlInfo, cached := GetCachedLNURLPayInfo(eventPubkey)
+	if !cached || lnurlInfo == nil {
+		// Not cached or was a "not found" entry - resolve fresh
+		var err error
+		lnurlInfo, err = ResolveLNURLFromProfile(profile)
+		if err != nil {
+			slog.Error("zap: failed to resolve LNURL", "error", err, "pubkey", eventPubkey[:8])
+			respondWithErrorAndFragment(w, r, returnURL, "Could not resolve recipient's Lightning address", renderFooterForError())
+			return
+		}
+		// Cache for future requests
+		if lnurlCacheStore != nil {
+			lnurlCacheStore.Set(eventPubkey, lnurlInfo)
+		}
+		slog.Info("zap: LNURL resolved (fresh)", "allowsNostr", lnurlInfo.AllowsNostr, "nostrPubkey", lnurlInfo.NostrPubkey != "")
+	} else {
+		slog.Info("zap: LNURL cache hit", "allowsNostr", lnurlInfo.AllowsNostr, "nostrPubkey", lnurlInfo.NostrPubkey != "")
 	}
-	slog.Info("zap: LNURL resolved", "allowsNostr", lnurlInfo.AllowsNostr, "nostrPubkey", lnurlInfo.NostrPubkey != "")
 
-	// Fixed zap amount: 21 sats = 21000 msats
-	amountMsats := int64(21000)
+	// Parse amount from form (in sats), default to 21 sats
+	amountStr := strings.TrimSpace(r.FormValue("amount"))
+	amountSats := int64(21) // Default 21 sats
+	if amountStr != "" {
+		if parsed, err := strconv.ParseInt(amountStr, 10, 64); err == nil && parsed > 0 {
+			amountSats = parsed
+		}
+	}
+	amountMsats := amountSats * 1000 // Convert sats to millisats
+	slog.Info("zap: amount", "sats", amountSats, "msats", amountMsats)
 
 	// Check amount is within recipient's limits
 	if amountMsats < lnurlInfo.MinSendable {
@@ -3504,7 +4152,7 @@ func htmlZapHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Add relays to the relays tag
-	writeRelays := ConfigGetPublishRelays()
+	writeRelays := cfgpkg.GetPublishRelays()
 	if session.UserRelayList != nil && len(session.UserRelayList.Write) > 0 {
 		writeRelays = session.UserRelayList.Write
 	}
@@ -3598,7 +4246,7 @@ func htmlZapHandler(w http.ResponseWriter, r *http.Request) {
 	// For HelmJS requests, return the updated footer fragment
 	if isHelmRequest(r) {
 		newCSRFToken := generateCSRFToken(session.ID)
-		readRelays := ConfigGetDefaultRelays()
+		readRelays := cfgpkg.GetDefaultRelays()
 		if session.UserRelayList != nil && len(session.UserRelayList.Read) > 0 {
 			readRelays = session.UserRelayList.Read
 		}
@@ -3611,7 +4259,7 @@ func htmlZapHandler(w http.ResponseWriter, r *http.Request) {
 		html, err := renderFooterFragment(eventID, eventPubkey, kind, true, newCSRFToken, returnURL, isBookmarked, isReacted, isReposted, true, true, "", readRelays)
 		if err != nil {
 			slog.Error("failed to render footer fragment", "error", err)
-			http.Error(w, "Failed to render response", http.StatusInternalServerError)
+			util.RespondInternalError(w, "Failed to render response")
 			return
 		}
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -3621,4 +4269,56 @@ func htmlZapHandler(w http.ResponseWriter, r *http.Request) {
 
 	// Redirect with success
 	redirectWithSuccess(w, r, returnURL, "Zapped 21 sats ⚡")
+}
+
+// processMentions parses the mentions JSON mapping and replaces @displayname with nostr:nprofile1...
+// Returns the modified content and a slice of mentioned pubkeys for p-tags.
+// If mentions JSON is empty or invalid, returns original content unchanged.
+func processMentions(content string, mentionsJSON string) (string, []string) {
+	if mentionsJSON == "" || mentionsJSON == "{}" {
+		return content, nil
+	}
+
+	// Parse JSON: {"displayname": "pubkeyhex", ...}
+	var mentions map[string]string
+	if err := json.Unmarshal([]byte(mentionsJSON), &mentions); err != nil {
+		slog.Warn("failed to parse mentions JSON", "error", err, "json", mentionsJSON)
+		return content, nil
+	}
+
+	if len(mentions) == 0 {
+		return content, nil
+	}
+
+	var mentionedPubkeys []string
+	modifiedContent := content
+
+	for displayName, pubkeyHex := range mentions {
+		if displayName == "" || pubkeyHex == "" {
+			continue
+		}
+
+		// Encode as nprofile with relay hints (use publish relays for discoverability)
+		relayHints := cfgpkg.GetPublishRelays()
+		if len(relayHints) > 2 {
+			relayHints = relayHints[:2] // Limit to 2 relay hints
+		}
+
+		nprofile, err := nips.EncodeNProfile(pubkeyHex, relayHints)
+		if err != nil {
+			slog.Warn("failed to encode nprofile for mention", "error", err, "pubkey", pubkeyHex)
+			continue
+		}
+
+		// Replace @displayname with nostr:nprofile1...
+		// Use case-insensitive replacement since display names may vary
+		searchPattern := "@" + displayName
+		replacement := "nostr:" + nprofile
+		modifiedContent = strings.Replace(modifiedContent, searchPattern, replacement, -1)
+
+		// Track pubkey for p-tag
+		mentionedPubkeys = append(mentionedPubkeys, pubkeyHex)
+	}
+
+	return modifiedContent, mentionedPubkeys
 }

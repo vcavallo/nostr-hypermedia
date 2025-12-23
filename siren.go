@@ -3,6 +3,8 @@ package main
 import (
 	"strconv"
 	"strings"
+
+	"nostr-server/internal/util"
 )
 
 type SirenEntity struct {
@@ -93,10 +95,16 @@ func toSirenTimeline(resp TimelineResponse, relays []string, authors []string, k
 
 		// Build actions for this event using unified action system
 		// For Siren API, we show all available actions (auth required on submission)
+		// Extract d-tag for addressable events (kind 30xxx)
+		var dTag string
+		if item.Kind >= 30000 && item.Kind < 40000 {
+			dTag = util.GetTagValue(item.Tags, "d")
+		}
 		ctx := ActionContext{
 			EventID:      item.ID,
 			EventPubkey:  item.Pubkey,
 			Kind:         item.Kind,
+			DTag:         dTag,
 			ReplyCount:   item.ReplyCount,
 			LoggedIn:     true, // Show all actions in API
 			HasWallet:    true, // Show zap in API (consumer checks wallet status)

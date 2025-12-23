@@ -1,0 +1,43 @@
+/* Kind 20 picture note styles */
+.picture-note { margin: 12px 0; }
+.picture-title {
+  font-size: 18px;
+  font-weight: 600;
+  color: var(--text-primary);
+  margin-bottom: 12px;
+}
+.picture-gallery {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 8px;
+}
+.picture-image {
+  width: 100%;
+  max-height: 400px;
+  object-fit: cover;
+  border-radius: 8px;
+  display: block;
+}
+/* Single image: full width, no height constraint */
+.picture-gallery.single-image {
+  display: block;
+}
+.picture-single {
+  width: 100%;
+  min-width: 100%;
+  max-width: none;
+  height: auto;
+  max-height: none;
+}
+/* Odd count: last image spans full width (exclude single-image galleries) */
+.picture-gallery:not(.single-image) > img:last-child:nth-child(odd) {
+  grid-column: span 2;
+  max-height: 500px;
+  object-fit: contain;
+}
+.picture-caption {
+  font-size: 14px;
+  color: var(--text-muted);
+  margin-top: 12px;
+  line-height: 1.5;
+}

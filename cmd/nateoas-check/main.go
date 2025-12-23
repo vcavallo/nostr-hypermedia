@@ -323,6 +323,8 @@ func checkTemplatesUseCentralizedActions() Check {
 
 	templatesPath := filepath.Join(projectPath, "templates")
 	templateFiles, _ := filepath.Glob(filepath.Join(templatesPath, "*.go"))
+	kindTemplates, _ := filepath.Glob(filepath.Join(templatesPath, "kinds", "*.go"))
+	templateFiles = append(templateFiles, kindTemplates...)
 
 	templatesWithActions := 0
 	templatesNeedingActions := 0
@@ -386,12 +388,14 @@ func checkNoHardcodedActionURLs() Check {
 
 	templatesPath := filepath.Join(projectPath, "templates")
 	templateFiles, _ := filepath.Glob(filepath.Join(templatesPath, "*.go"))
+	kindTemplates, _ := filepath.Glob(filepath.Join(templatesPath, "kinds", "*.go"))
+	templateFiles = append(templateFiles, kindTemplates...)
 
 	// Patterns for hardcoded action URLs outside of {{range .Actions}} blocks
 	// These are the inline event actions that should use centralized actions
 	hardcodedPatterns := []*regexp.Regexp{
-		regexp.MustCompile(`action="/html/(react|repost|bookmark|delete)"`),
-		regexp.MustCompile(`href="/html/(react|repost|bookmark|delete)\?`),
+		regexp.MustCompile(`action="/(react|repost|bookmark|delete)"`),
+		regexp.MustCompile(`href="/(react|repost|bookmark|delete)\?`),
 	}
 
 	hardcodedCount := 0
@@ -451,6 +455,11 @@ func checkGenericActionTemplate() Check {
 
 	templatesPath := filepath.Join(projectPath, "templates")
 	templateFiles, _ := filepath.Glob(filepath.Join(templatesPath, "*.go"))
+	kindTemplates, _ := filepath.Glob(filepath.Join(templatesPath, "kinds", "*.go"))
+	templateFiles = append(templateFiles, kindTemplates...)
+
+	var bestMatch string
+	bestScore := 0 // 0=none, 1=partial, 2=full
 
 	for _, file := range templateFiles {
 		content, err := os.ReadFile(file)
@@ -477,21 +486,29 @@ func checkGenericActionTemplate() Check {
 			strings.Contains(contentStr, "{{range $a.Fields}}")
 
 		if hasRangeActions && hasHrefUsage {
-			if hasMethodCheck && hasFieldsRange {
-				check.Status = "pass"
-				check.Score = check.Weight
-				check.Details = fmt.Sprintf("Generic action template found in %s with method switching and field iteration", filepath.Base(file))
-				return check
+			if hasMethodCheck && hasFieldsRange && bestScore < 2 {
+				bestScore = 2
+				bestMatch = filepath.Base(file)
+			} else if bestScore < 1 {
+				bestScore = 1
+				bestMatch = filepath.Base(file)
 			}
-			check.Status = "partial"
-			check.Score = check.Weight * 0.7
-			check.Details = fmt.Sprintf("Action rendering found in %s but may lack full genericity", filepath.Base(file))
-			return check
 		}
 	}
 
-	check.Status = "fail"
-	check.Details = "No generic action template found - forms may be hardcoded per action type"
+	switch bestScore {
+	case 2:
+		check.Status = "pass"
+		check.Score = check.Weight
+		check.Details = fmt.Sprintf("Generic action template found in %s with method switching and field iteration", bestMatch)
+	case 1:
+		check.Status = "partial"
+		check.Score = check.Weight * 0.7
+		check.Details = fmt.Sprintf("Action rendering found in %s but may lack full genericity", bestMatch)
+	default:
+		check.Status = "fail"
+		check.Details = "No generic action template found - forms may be hardcoded per action type"
+	}
 	return check
 }
 
@@ -1134,6 +1151,8 @@ func checkNoKindConditionals() Check {
 
 	templatesPath := filepath.Join(projectPath, "templates")
 	templateFiles, _ := filepath.Glob(filepath.Join(templatesPath, "*.go"))
+	kindTemplates, _ := filepath.Glob(filepath.Join(templatesPath, "kinds", "*.go"))
+	templateFiles = append(templateFiles, kindTemplates...)
 
 	// Patterns that indicate kind-specific conditionals (anti-patterns for Phase 4)
 	kindPatterns := []*regexp.Regexp{
@@ -1213,6 +1232,12 @@ func checkUniversalRenderer() Check {
 
 	templatesPath := filepath.Join(projectPath, "templates")
 	templateFiles, _ := filepath.Glob(filepath.Join(templatesPath, "*.go"))
+	kindTemplates, _ := filepath.Glob(filepath.Join(templatesPath, "kinds", "*.go"))
+	templateFiles = append(templateFiles, kindTemplates...)
+
+	var hasDispatcher bool
+	var hasDefaultFallback bool
+	var dispatcherFile string
 
 	for _, file := range templateFiles {
 		content, err := os.ReadFile(file)
@@ -1221,21 +1246,29 @@ func checkUniversalRenderer() Check {
 		}
 		contentStr := string(content)
 
-		// A universal renderer should:
-		// 1. NOT have kind-specific template definitions
-		// 2. Render content from .Content or .ContentHTML
-		// 3. Render actions from .Actions, .ActionGroups, or .AvailableActions
-		// 4. Use render hints, not hardcoded layouts
+		// Pattern 1: Dispatcher pattern - single entry point that routes based on metadata
+		// This is a valid universal renderer: .RenderTemplate is computed server-side from event metadata
+		hasRenderTemplateDispatch := strings.Contains(contentStr, ".RenderTemplate") &&
+			(strings.Contains(contentStr, "{{if eq .RenderTemplate") ||
+				strings.Contains(contentStr, "{{else if eq .RenderTemplate"))
+		if hasRenderTemplateDispatch {
+			hasDispatcher = true
+			dispatcherFile = filepath.Base(file)
+		}
 
+		// Check for default/fallback template
+		if strings.Contains(contentStr, `{{define "render-default"}}`) ||
+			strings.Contains(contentStr, `{{define "default"}}`) ||
+			strings.Contains(contentStr, `{{else}}{{template "render-default"`) {
+			hasDefaultFallback = true
+		}
+
+		// Pattern 2: Traditional universal renderer - single template for all events
 		hasGenericContent := strings.Contains(contentStr, "{{.Content}}") ||
 			strings.Contains(contentStr, "{{.ContentHTML}}")
 		hasGenericActions := strings.Contains(contentStr, "{{range .Actions}}") ||
 			strings.Contains(contentStr, "{{range .ActionGroups}}") ||
 			strings.Contains(contentStr, "{{range .AvailableActions}}")
-		hasRenderHint := strings.Contains(contentStr, "RenderHint") ||
-			strings.Contains(contentStr, "render-hint")
-
-		// Check it's not just a dispatcher with many kind-specific sub-templates
 		kindSpecificTemplates := strings.Count(contentStr, "{{define \"kind-")
 
 		if hasGenericContent && hasGenericActions && kindSpecificTemplates == 0 {
@@ -1244,30 +1277,26 @@ func checkUniversalRenderer() Check {
 			check.Details = "Universal renderer found without kind-specific templates"
 			return check
 		}
-
-		if hasGenericContent && hasGenericActions && hasRenderHint {
-			check.Status = "partial"
-			check.Score = check.Weight * 0.7
-			check.Details = "Generic rendering patterns found but may still have kind-specific templates"
-			return check
-		}
 	}
 
-	// Check how many kind-specific templates exist
-	kindTemplateCount := 0
-	for _, file := range templateFiles {
-		content, _ := os.ReadFile(file)
-		kindTemplateCount += strings.Count(string(content), "{{define \"kind-")
+	// Dispatcher pattern with fallback is a valid NATEOAS approach
+	// The RenderTemplate value is metadata-driven (computed from event kind/tags)
+	if hasDispatcher && hasDefaultFallback {
+		check.Status = "pass"
+		check.Score = check.Weight
+		check.Details = fmt.Sprintf("Metadata-driven dispatcher found in %s with default fallback", dispatcherFile)
+		return check
 	}
 
-	if kindTemplateCount > 0 {
-		check.Status = "fail"
-		check.Details = fmt.Sprintf("%d kind-specific templates found - not a universal renderer", kindTemplateCount)
-	} else {
-		check.Status = "fail"
-		check.Details = "No universal renderer found"
+	if hasDispatcher {
+		check.Status = "partial"
+		check.Score = check.Weight * 0.8
+		check.Details = fmt.Sprintf("Dispatcher found in %s but no default fallback template", dispatcherFile)
+		return check
 	}
 
+	check.Status = "fail"
+	check.Details = "No universal renderer or dispatcher pattern found"
 	return check
 }
 
@@ -1564,7 +1593,7 @@ func generateRecommendations(report *Report) {
 				case "Templates use centralized actions":
 					recommendations = append(recommendations, "Update templates to use {{range .Actions}} instead of hardcoded forms")
 				case "No hardcoded action URLs":
-					recommendations = append(recommendations, "Replace hardcoded /html/react, /html/repost URLs with {{.Href}}")
+					recommendations = append(recommendations, "Replace hardcoded /react, /repost URLs with {{.Href}}")
 				case "Generic action template":
 					recommendations = append(recommendations, "Create a generic action template that renders forms from ActionTemplate.Fields")
 				}
@@ -2040,6 +2069,8 @@ func scanTemplateFiles(projectPath string, patterns []string) []FileMatch {
 	templatesPath := filepath.Join(projectPath, "templates")
 
 	files, _ := filepath.Glob(filepath.Join(templatesPath, "*.go"))
+	kindFiles, _ := filepath.Glob(filepath.Join(templatesPath, "kinds", "*.go"))
+	files = append(files, kindFiles...)
 	for _, file := range files {
 		content, err := os.ReadFile(file)
 		if err != nil {

@@ -1,0 +1,67 @@
+/* Badge definition styles (kind 30009) */
+.badge-card {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  background: var(--bg-secondary);
+  border-radius: 8px;
+  padding: 16px;
+  margin: 12px 0;
+}
+.badge-image {
+  width: 64px;
+  height: 64px;
+  border-radius: 8px;
+  object-fit: contain;
+}
+.badge-placeholder {
+  width: 64px;
+  height: 64px;
+  background: var(--bg-badge);
+  border-radius: 8px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 32px;
+}
+.badge-info {
+  flex: 1;
+  min-width: 0;
+}
+.badge-name {
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--text-primary);
+  margin: 0 0 4px 0;
+}
+.badge-description {
+  font-size: 14px;
+  color: var(--text-secondary);
+  line-height: 1.4;
+}
+
+/* Badge award styles (kind 8) */
+.badge-award-card {
+  background: var(--bg-secondary);
+  border-radius: 8px;
+  padding: 16px;
+  margin: 12px 0;
+}
+.badge-award-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+.badge-award-icon {
+  font-size: 20px;
+}
+.badge-award-text {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+.badge-awardees {
+  font-size: 13px;
+  color: var(--text-secondary);
+}

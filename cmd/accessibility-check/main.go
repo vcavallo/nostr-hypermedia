@@ -84,13 +84,14 @@ type FormInfo struct {
 
 // InputInfo captures input field details
 type InputInfo struct {
-	Type         string
-	Name         string
-	ID           string
-	HasLabel     bool
-	HasAriaLabel bool
-	Placeholder  string
-	Line         int
+	Type            string
+	Name            string
+	ID              string
+	HasLabel        bool
+	HasAriaLabel    bool
+	HasWrappingLabel bool // Input is wrapped inside a <label> element
+	Placeholder     string
+	Line            int
 }
 
 // HeadingInfo captures heading hierarchy
@@ -161,13 +162,16 @@ func main() {
 		Summary:     make(map[string]CategorySummary),
 	}
 
-	// Find all template files
+	// Find all template files (including subdirectories like templates/kinds/)
 	templatesDir := filepath.Join(projectPath, "templates")
 	templateFiles, err := filepath.Glob(filepath.Join(templatesDir, "*.go"))
 	if err != nil {
 		fmt.Printf("Error finding templates: %v\n", err)
 		os.Exit(1)
 	}
+	// Also include templates/kinds/*.go
+	kindTemplates, _ := filepath.Glob(filepath.Join(templatesDir, "kinds", "*.go"))
+	templateFiles = append(templateFiles, kindTemplates...)
 
 	if len(templateFiles) == 0 {
 		fmt.Printf("No template files found in %s\n", templatesDir)
@@ -377,7 +381,16 @@ func stripGoTemplates(content string) string {
 }
 
 func extractElements(n *html.Node, analysis *TemplateAnalysis, originalContent string) {
+	extractElementsWithContext(n, analysis, originalContent, false)
+}
+
+func extractElementsWithContext(n *html.Node, analysis *TemplateAnalysis, originalContent string, insideLabel bool) {
 	if n.Type == html.ElementNode {
+		// Track if we're inside a label element
+		if n.Data == "label" {
+			insideLabel = true
+		}
+
 		switch n.Data {
 		case "html":
 			if hasAttr(n, "lang") {
@@ -428,12 +441,13 @@ func extractElements(n *html.Node, analysis *TemplateAnalysis, originalContent s
 
 		case "input", "textarea", "select":
 			inp := InputInfo{
-				Type:         getAttr(n, "type"),
-				Name:         getAttr(n, "name"),
-				ID:           getAttr(n, "id"),
-				HasAriaLabel: hasAttr(n, "aria-label") || hasAttr(n, "aria-labelledby"),
-				Placeholder:  getAttr(n, "placeholder"),
-				Line:         findLineNumber(originalContent, n),
+				Type:             getAttr(n, "type"),
+				Name:             getAttr(n, "name"),
+				ID:               getAttr(n, "id"),
+				HasAriaLabel:     hasAttr(n, "aria-label") || hasAttr(n, "aria-labelledby"),
+				HasWrappingLabel: insideLabel,
+				Placeholder:      getAttr(n, "placeholder"),
+				Line:             findLineNumber(originalContent, n),
 			}
 			analysis.Inputs = append(analysis.Inputs, inp)
 
@@ -459,7 +473,7 @@ func extractElements(n *html.Node, analysis *TemplateAnalysis, originalContent s
 	}
 
 	for c := n.FirstChild; c != nil; c = c.NextSibling {
-		extractElements(c, analysis, originalContent)
+		extractElementsWithContext(c, analysis, originalContent, insideLabel)
 	}
 }
 
@@ -571,7 +585,8 @@ func runChecks(analysis *TemplateAnalysis, originalContent string) {
 		if input.Type == "hidden" || input.Type == "submit" {
 			continue
 		}
-		hasAccessibleName := input.HasAriaLabel || input.Placeholder != "" || input.ID != ""
+		// Input has accessible name if: wrapped in label, has aria-label, has placeholder, or has id (for external label)
+		hasAccessibleName := input.HasWrappingLabel || input.HasAriaLabel || input.Placeholder != "" || input.ID != ""
 		analysis.Checks = append(analysis.Checks, CheckResult{
 			Category: CategoryPerceivable,
 			Rule:     "Form inputs have accessible names",

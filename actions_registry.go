@@ -4,6 +4,9 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+
+	"nostr-server/internal/config"
+	"nostr-server/internal/nips"
 )
 
 // ActionBuilder is a function that builds an ActionDefinition from context.
@@ -94,7 +97,7 @@ func buildActionFromConfig(name string, cfg ActionConfig, ctx ActionContext) Act
 
 	return ActionDefinition{
 		Name:   name,
-		Title:  I18n(cfg.TitleKey),
+		Title:  config.I18n(cfg.TitleKey),
 		Method: cfg.Method,
 		Href:   href,
 		Class:  cfg.Class,
@@ -104,7 +107,25 @@ func buildActionFromConfig(name string, cfg ActionConfig, ctx ActionContext) Act
 
 // replaceActionPlaceholders replaces {placeholders} in href with actual values
 func replaceActionPlaceholders(href string, ctx ActionContext) string {
-	href = strings.ReplaceAll(href, "{event_id}", ctx.EventID)
+	// For {event_id} in URLs, use bech32 format
+	// Addressable events (kind 30xxx with d-tag) use naddr1, others use note1
+	var eventRef string
+	if ctx.Kind >= 30000 && ctx.Kind < 40000 && ctx.DTag != "" {
+		naddr, err := nips.EncodeNAddr(uint32(ctx.Kind), ctx.EventPubkey, ctx.DTag)
+		if err == nil {
+			eventRef = naddr
+		}
+	}
+	if eventRef == "" {
+		// Fall back to note1 for regular events
+		note, err := nips.EncodeEventID(ctx.EventID)
+		if err == nil {
+			eventRef = note
+		} else {
+			eventRef = ctx.EventID // fallback to hex
+		}
+	}
+	href = strings.ReplaceAll(href, "{event_id}", eventRef)
 	href = strings.ReplaceAll(href, "{event_pubkey}", ctx.EventPubkey)
 	return href
 }

@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# Quality check runner for nostr-hypermedia
+# Quality check runner for nostr-server
 # Builds and runs all check tools from the cmd directory
 
 set -e

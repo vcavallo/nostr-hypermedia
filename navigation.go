@@ -2,20 +2,24 @@ package main
 
 // FeedMode represents a timeline feed mode (follows, global, me) or any nav item
 type FeedMode struct {
-	Name          string // "follows", "global", "me", "notifications", "search", etc.
-	Title         string // Display text
-	Href          string // URL
-	Icon          string // Optional icon
-	IconOnly      string // "always", "mobile", or "" (never) - controls icon-only display
-	Active        bool   // Is this the current mode
-	RequiresLogin bool   // Only show when logged in
-	Group         string // "feed", "utility", or empty for contextual
+	Name          string     // "follows", "global", "me", "notifications", "search", etc.
+	Title         string     // Display text
+	Href          string     // URL
+	Icon          string     // Optional icon
+	IconOnly      string     // "always", "mobile", or "" (never) - controls icon-only display
+	Active        bool       // Is this the current mode
+	RequiresLogin bool       // Only show when logged in
+	Group         string     // "feed", "utility", or empty for contextual
+	Children      []FeedMode // Nested items (for DVM dropdown)
+	IsDropdown    bool       // True if this has 2+ children (render as dropdown)
+	IsDVM         bool       // True if this is a DVM feed
 }
 
 // FeedModeContext provides context for building feed modes
 type FeedModeContext struct {
 	LoggedIn    bool
 	ActiveFeed  string // Current feed mode (for timeline)
+	ActiveKinds string // Current kinds parameter (preserved when switching feeds)
 	CurrentPage string // Current page type: "timeline", "profile", "thread", "search", "notifications"
 }
 
@@ -27,10 +31,12 @@ func GetFeedModes(ctx FeedModeContext) []FeedMode {
 
 // KindFilter represents a content type filter (notes, photos, longform, etc.)
 type KindFilter struct {
-	Name   string // "all", "notes", "photos", "longform", "highlights", "live"
-	Title  string // Display text
-	Href   string // URL
-	Active bool   // Is this the current filter
+	Name       string       // "all", "notes", "photos", "longform", "highlights", "live"
+	Title      string       // Display text
+	Href       string       // URL
+	Active     bool         // Is this the current filter
+	IsDropdown bool         // True if this filter has children (renders as dropdown)
+	Children   []KindFilter // Nested filters for dropdown groups
 }
 
 // KindFilterContext provides context for building kind filters
@@ -97,6 +103,7 @@ type SettingsContext struct {
 	FeedMode      string // Current feed mode
 	KindFilter    string // Current kinds filter
 	UserAvatarURL string // User's profile picture URL (for avatar icon)
+	UserNpub      string // User's npub for dynamic profile link
 }
 
 // GetSettingsItems returns the list of settings items for the current context

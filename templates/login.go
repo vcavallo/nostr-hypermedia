@@ -22,7 +22,7 @@ var loginContent = `{{define "content"}}
       {{.NostrConnectURL}}
     </div>
   </details>
-  <a href="/html/check-connection?secret={{.Secret}}" class="submit-btn submit-btn-block">
+  <a href="{{buildURL "/check-connection" "secret" .Secret}}" class="submit-btn submit-btn-block">
     Check Connection
   </a>
   <p class="form-help">
@@ -35,7 +35,7 @@ var loginContent = `{{define "content"}}
 </div>
 {{end}}
 
-<form class="login-form login-section" method="POST" action="/html/login">
+<form class="login-form login-section" method="POST" action="/login">
   <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
   <h2>Option 2: Paste Bunker URL</h2>
   <div class="form-group">
@@ -54,7 +54,7 @@ var loginContent = `{{define "content"}}
   &mdash; or &mdash;
 </div>
 
-<form class="login-form login-section" method="POST" action="/html/reconnect">
+<form class="login-form login-section" method="POST" action="/reconnect">
   <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
   <h2>Option 3: Reconnect to Existing Bunker</h2>
   <p class="server-info">

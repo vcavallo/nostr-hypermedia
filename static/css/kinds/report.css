@@ -1,0 +1,27 @@
+/* Report styles (kind 1984) */
+.report-card {
+  background: var(--error-bg);
+  border: 1px solid var(--error-border);
+  border-radius: 8px;
+  padding: 12px 16px;
+  margin: 12px 0;
+}
+.report-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 4px;
+}
+.report-icon {
+  font-size: 16px;
+}
+.report-type {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--error-accent);
+}
+.report-reason {
+  font-size: 13px;
+  color: var(--text-secondary);
+  margin: 0;
+}
