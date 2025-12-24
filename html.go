@@ -305,13 +305,14 @@ func renderPostResponse(csrfToken string, newNote *HTMLEventItem) (string, error
 }
 
 // renderReplyResponse renders the cleared reply form plus the new reply as OOB prepend
-func renderReplyResponse(csrfToken, replyTo, replyToPubkey string, replyToKind int, replyToDTag string, userDisplayName, userAvatarURL, userNpub string, newReply *HTMLEventItem, replyCount int) (string, error) {
+func renderReplyResponse(csrfToken, replyTo, replyToPubkey string, replyToKind int, replyToDTag, replyToRoot string, userDisplayName, userAvatarURL, userNpub string, newReply *HTMLEventItem, replyCount int) (string, error) {
 	data := struct {
 		CSRFToken       string
 		ReplyTo         string
 		ReplyToPubkey   string
 		ReplyToKind     int
 		ReplyToDTag     string
+		ReplyToRoot     string
 		UserDisplayName string
 		UserAvatarURL   string
 		UserNpub        string
@@ -324,6 +325,7 @@ func renderReplyResponse(csrfToken, replyTo, replyToPubkey string, replyToKind i
 		ReplyToPubkey:   replyToPubkey,
 		ReplyToKind:     replyToKind,
 		ReplyToDTag:     replyToDTag,
+		ReplyToRoot:     replyToRoot,
 		UserDisplayName: userDisplayName,
 		UserAvatarURL:   userAvatarURL,
 		UserNpub:        userNpub,
@@ -3161,6 +3163,7 @@ type HTMLThreadData struct {
 	Root                   *HTMLEventItem
 	ReplyGroups            []ReplyGroup // Two-level nested replies
 	TotalReplyCount        int          // Total number of replies across all groups
+	ThreadRootID           string       // NIP-10: thread root event ID (for proper reply threading)
 	CachedAt               int64        // Cache timestamp for stale-while-revalidate polling
 	Identifier             string       // Original identifier (note1, nevent1, hex) for polling URLs
 	LoggedIn               bool
@@ -3202,6 +3205,25 @@ func extractParentID(tags [][]string) string {
 		}
 	}
 	return parentID
+}
+
+// extractRootID extracts the thread root event ID from the "e" tags (NIP-10)
+// The root is the first "e" tag, or the one explicitly marked as "root"
+func extractRootID(tags [][]string) string {
+	var firstETag string
+	for _, tag := range tags {
+		if len(tag) >= 2 && tag[0] == "e" {
+			// Check if this tag has the "root" marker
+			if len(tag) >= 4 && tag[3] == "root" {
+				return tag[1] // This is explicitly marked as the thread root
+			}
+			// Track the first "e" tag as fallback (NIP-10 positional)
+			if firstETag == "" {
+				firstETag = tag[1]
+			}
+		}
+	}
+	return firstETag
 }
 
 func renderThreadHTML(resp ThreadResponse, relays []string, session *BunkerSession, currentURL string, identifier string, themeClass, themeLabel, successMsg, csrfToken string, hasUnreadNotifs bool, isFragment bool, repostEvents map[string]*Event) (string, error) {
@@ -3589,6 +3611,13 @@ func renderThreadHTML(resp ThreadResponse, relays []string, session *BunkerSessi
 		pageImage = root.AuthorProfile.Picture
 	}
 
+	// NIP-10: Determine the thread root for proper reply threading
+	// If the viewed event has a root tag, use that; otherwise the viewed event IS the root
+	threadRootID := extractRootID(resp.Root.Tags)
+	if threadRootID == "" {
+		threadRootID = resp.Root.ID // This event is the thread root
+	}
+
 	data := HTMLThreadData{
 		Title:           "Thread",
 		PageDescription: pageDescription,
@@ -3598,6 +3627,7 @@ func renderThreadHTML(resp ThreadResponse, relays []string, session *BunkerSessi
 		Root:            root,
 		ReplyGroups:     replyGroups,
 		TotalReplyCount: totalReplyCount,
+		ThreadRootID:    threadRootID,
 		CachedAt:        resp.Meta.GeneratedAt.Unix(),
 		Identifier:      identifier,
 		CurrentURL:      currentURL,

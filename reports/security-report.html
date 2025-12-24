@@ -1,0 +1,1164 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Security Report</title>
+    <style>
+        :root {
+            --bg: #0d1117;
+            --bg-secondary: #161b22;
+            --text: #c9d1d9;
+            --text-muted: #8b949e;
+            --border: #30363d;
+            --green: #238636;
+            --red: #da3633;
+            --amber: #d29922;
+            --blue: #58a6ff;
+            --purple: #a371f7;
+            --critical: #ff6b6b;
+            --high: #ff9f43;
+            --medium: #feca57;
+            --low: #48dbfb;
+        }
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+            background: var(--bg);
+            color: var(--text);
+            line-height: 1.6;
+            padding: 2rem;
+        }
+        .container { max-width: 1200px; margin: 0 auto; }
+        h1 { font-size: 2rem; margin-bottom: 0.5rem; }
+        h2 { font-size: 1.5rem; margin: 2rem 0 1rem; border-bottom: 1px solid var(--border); padding-bottom: 0.5rem; }
+        h3 { font-size: 1.2rem; margin: 1.5rem 0 0.5rem; color: var(--text-muted); }
+        .meta { color: var(--text-muted); margin-bottom: 2rem; }
+
+        .score-card {
+            display: flex;
+            align-items: center;
+            gap: 2rem;
+            background: var(--bg-secondary);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 2rem;
+            margin-bottom: 2rem;
+        }
+        .score-circle {
+            width: 120px;
+            height: 120px;
+            border-radius: 50%;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            font-size: 2.5rem;
+            font-weight: bold;
+            border: 4px solid;
+        }
+        .score-label { font-size: 0.8rem; color: var(--text-muted); }
+        .score-details { flex: 1; }
+
+        .severity-badges {
+            display: flex;
+            gap: 1rem;
+            margin-top: 1rem;
+        }
+        .severity-badge {
+            padding: 0.5rem 1rem;
+            border-radius: 6px;
+            font-weight: bold;
+            font-size: 0.9rem;
+        }
+        .severity-critical { background: rgba(255,107,107,0.2); color: var(--critical); }
+        .severity-high { background: rgba(255,159,67,0.2); color: var(--high); }
+        .severity-medium { background: rgba(254,202,87,0.2); color: var(--medium); }
+        .severity-low { background: rgba(72,219,251,0.2); color: var(--low); }
+
+        .category-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+            gap: 1rem;
+            margin-bottom: 2rem;
+        }
+        .category-card {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 1rem;
+        }
+        .category-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 0.5rem;
+        }
+        .category-name { font-weight: 600; }
+        .category-score {
+            font-size: 1.2rem;
+            font-weight: bold;
+        }
+        .progress-bar {
+            height: 8px;
+            background: var(--border);
+            border-radius: 4px;
+            overflow: hidden;
+        }
+        .progress-fill {
+            height: 100%;
+            border-radius: 4px;
+            transition: width 0.3s;
+        }
+        .category-stats {
+            margin-top: 0.5rem;
+            color: var(--text-muted);
+            font-size: 0.8rem;
+        }
+
+        .file-section {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            margin-bottom: 1rem;
+            overflow: hidden;
+        }
+        .file-header {
+            padding: 1rem;
+            border-bottom: 1px solid var(--border);
+            cursor: pointer;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .file-header:hover { background: rgba(255,255,255,0.02); }
+        .file-name { font-family: monospace; color: var(--blue); }
+        .file-stats { display: flex; gap: 0.5rem; }
+        .stat { padding: 0.2rem 0.5rem; border-radius: 4px; font-size: 0.8rem; }
+        .stat-pass { background: rgba(35,134,54,0.2); color: var(--green); }
+        .stat-fail { background: rgba(218,54,51,0.2); color: var(--red); }
+
+        .checks-list {
+            padding: 0;
+            display: none;
+        }
+        .file-section.open .checks-list { display: block; }
+        .check-item {
+            padding: 0.75rem 1rem;
+            border-bottom: 1px solid var(--border);
+            display: flex;
+            gap: 1rem;
+            align-items: flex-start;
+        }
+        .check-item:last-child { border-bottom: none; }
+        .check-icon {
+            width: 20px;
+            height: 20px;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 12px;
+            flex-shrink: 0;
+        }
+        .check-pass { background: var(--green); }
+        .check-fail { background: var(--red); }
+        .check-details { flex: 1; }
+        .check-rule { font-weight: 500; }
+        .check-message { color: var(--text-muted); font-size: 0.9rem; }
+        .check-remediation {
+            color: var(--blue);
+            font-size: 0.85rem;
+            margin-top: 0.25rem;
+            font-style: italic;
+        }
+        .check-location { color: var(--text-muted); font-size: 0.8rem; font-family: monospace; }
+        .check-severity {
+            font-size: 0.7rem;
+            padding: 0.15rem 0.5rem;
+            border-radius: 3px;
+            text-transform: uppercase;
+            font-weight: bold;
+        }
+        .sev-critical { background: var(--critical); color: white; }
+        .sev-high { background: var(--high); color: black; }
+        .sev-medium { background: var(--medium); color: black; }
+        .sev-low { background: var(--low); color: black; }
+        .sev-info { background: var(--border); color: var(--text-muted); }
+
+        .toggle-btn {
+            background: var(--bg);
+            border: 1px solid var(--border);
+            color: var(--text);
+            padding: 0.5rem 1rem;
+            border-radius: 6px;
+            cursor: pointer;
+            margin-bottom: 1rem;
+        }
+        .toggle-btn:hover { border-color: var(--text-muted); }
+
+        .link { color: var(--blue); text-decoration: none; }
+        .link:hover { text-decoration: underline; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Security Report</h1>
+        <p class="meta">Generated: 2025-12-24 12:12:03 | Files analyzed: 25</p>
+
+        <div class="score-card">
+            <div class="score-circle" style="border-color: #22c55e; color: #22c55e;">
+                A+
+                <span class="score-label">100%</span>
+            </div>
+            <div class="score-details">
+                <h3>Security Score</h3>
+                <p>Static analysis of source code for common security vulnerabilities.</p>
+                <div class="severity-badges">
+                    <span class="severity-badge severity-critical">0 Critical</span>
+                    <span class="severity-badge severity-high">0 High</span>
+                    <span class="severity-badge severity-medium">0 Medium</span>
+                    <span class="severity-badge severity-low">0 Low</span>
+                </div>
+            </div>
+        </div>
+
+        <h2>Security Categories</h2>
+        <div class="category-grid">
+
+            <div class="category-card">
+                <div class="category-header">
+                    <span class="category-name">CSRF Protection</span>
+                    <span class="category-score" style="color: #22c55e">100%</span>
+                </div>
+                <div class="progress-bar">
+                    <div class="progress-fill" style="width: 100%; background: #22c55e;"></div>
+                </div>
+                <p class="category-stats">26 passed / 26 total checks</p>
+            </div>
+
+            <div class="category-card">
+                <div class="category-header">
+                    <span class="category-name">HTTP Security Headers</span>
+                    <span class="category-score" style="color: #22c55e">100%</span>
+                </div>
+                <div class="progress-bar">
+                    <div class="progress-fill" style="width: 100%; background: #22c55e;"></div>
+                </div>
+                <p class="category-stats">5 passed / 5 total checks</p>
+            </div>
+
+            <div class="category-card">
+                <div class="category-header">
+                    <span class="category-name">Session Security</span>
+                    <span class="category-score" style="color: #22c55e">100%</span>
+                </div>
+                <div class="progress-bar">
+                    <div class="progress-fill" style="width: 100%; background: #22c55e;"></div>
+                </div>
+                <p class="category-stats">6 passed / 6 total checks</p>
+            </div>
+
+            <div class="category-card">
+                <div class="category-header">
+                    <span class="category-name">Nostr Security</span>
+                    <span class="category-score" style="color: #22c55e">100%</span>
+                </div>
+                <div class="progress-bar">
+                    <div class="progress-fill" style="width: 100%; background: #22c55e;"></div>
+                </div>
+                <p class="category-stats">17 passed / 17 total checks</p>
+            </div>
+
+            <div class="category-card">
+                <div class="category-header">
+                    <span class="category-name">Rate Limiting</span>
+                    <span class="category-score" style="color: #22c55e">100%</span>
+                </div>
+                <div class="progress-bar">
+                    <div class="progress-fill" style="width: 100%; background: #22c55e;"></div>
+                </div>
+                <p class="category-stats">1 passed / 1 total checks</p>
+            </div>
+
+            <div class="category-card">
+                <div class="category-header">
+                    <span class="category-name">SSRF Prevention</span>
+                    <span class="category-score" style="color: #22c55e">100%</span>
+                </div>
+                <div class="progress-bar">
+                    <div class="progress-fill" style="width: 100%; background: #22c55e;"></div>
+                </div>
+                <p class="category-stats">3 passed / 3 total checks</p>
+            </div>
+
+            <div class="category-card">
+                <div class="category-header">
+                    <span class="category-name">Cryptography</span>
+                    <span class="category-score" style="color: #22c55e">100%</span>
+                </div>
+                <div class="progress-bar">
+                    <div class="progress-fill" style="width: 100%; background: #22c55e;"></div>
+                </div>
+                <p class="category-stats">5 passed / 5 total checks</p>
+            </div>
+
+            <div class="category-card">
+                <div class="category-header">
+                    <span class="category-name">Information Disclosure</span>
+                    <span class="category-score" style="color: #22c55e">100%</span>
+                </div>
+                <div class="progress-bar">
+                    <div class="progress-fill" style="width: 100%; background: #22c55e;"></div>
+                </div>
+                <p class="category-stats">2 passed / 2 total checks</p>
+            </div>
+
+        </div>
+
+        <h2>Detailed Findings</h2>
+        <button class="toggle-btn" onclick="document.querySelectorAll('.file-section').forEach(s => s.classList.toggle('open'))">
+            Toggle All
+        </button>
+
+        <div class="file-section">
+            <div class="file-header" onclick="this.parentElement.classList.toggle('open')">
+                <span class="file-name">CSRF Protection</span>
+                <div class="file-stats">
+                    <span class="stat stat-pass">26 passed</span>
+                    <span class="stat stat-fail">0 failed</span>
+                </div>
+            </div>
+            <div class="checks-list">
+
+                <div class="check-item">
+                    <div class="check-icon check-pass">✓</div>
+                    <div class="check-details">
+                        <div class="check-rule">CSRF validation middleware</div>
+                        <div class="check-message">CSRF validation found in codebase</div>
+                        
+                        <div class="check-location">*.go</div>
+                    </div>
+                    <span class="check-severity sev-info">info</span>
+                </div>
+
+                <div class="check-item">
+                    <div class="check-icon check-pass">✓</div>
+                    <div class="check-details">
+                        <div class="check-rule">POST forms include CSRF token</div>
+                        <div class="check-message">Form has CSRF protection</div>
+                        
+                        <div class="check-location">base.go:109</div>
+                    </div>
+                    <span class="check-severity sev-info">info</span>
+                </div>
+
+                <div class="check-item">
+                    <div class="check-icon check-pass">✓</div>
+                    <div class="check-details">
+                        <div class="check-rule">POST forms include CSRF token</div>
+                        <div class="check-message">Form has CSRF protection</div>
+                        
+                        <div class="check-location">base.go:48</div>
+                    </div>
+                    <span class="check-severity sev-info">info</span>
+                </div>
+
+                <div class="check-item">
+                    <div class="check-icon check-pass">✓</div>
+                    <div class="check-details">
+                        <div class="check-rule">POST forms include CSRF token</div>
+                        <div class="check-message">Form has CSRF protection</div>
+                        
+                        <div class="check-location">compose.go:23</div>
+                    </div>
+                    <span class="check-severity sev-info">info</span>
+                </div>
+
+                <div class="check-item">
+                    <div class="check-icon check-pass">✓</div>
+                    <div class="check-details">
+                        <div class="check-rule">POST forms include CSRF token</div>
+                        <div class="check-message">Form has CSRF protection</div>
+                        
+                        <div class="check-location">fragment.go:89</div>
+                    </div>
+                    <span class="check-severity sev-info">info</span>
+                </div>
+
+                <div class="check-item">
+                    <div class="check-icon check-pass">✓</div>
+                    <div class="check-details">
+                        <div class="check-rule">POST forms include CSRF token</div>
+                        <div class="check-message">Form has CSRF protection</div>
+                        
+                        <div class="check-location">fragment.go:111</div>
+                    </div>
+                    <span class="check-severity sev-info">info</span>
+                </div>
+
+                <div class="check-item">
+                    <div class="check-icon check-pass">✓</div>
+                    <div class="check-details">
+                        <div class="check-rule">POST forms include CSRF token</div>
+                        <div class="check-message">Form has CSRF protection</div>
+                        
+                        <div class="check-location">fragment.go:215</div>
+                    </div>
+                    <span class="check-severity sev-info">info</span>
+                </div>
+
+                <div class="check-item">
+                    <div class="check-icon check-pass">✓</div>
+                    <div class="check-details">
+                        <div class="check-rule">POST forms include CSRF token</div>
+                        <div class="check-message">Form has CSRF protection</div>
+                        
+                        <div class="check-location">fragment.go:264</div>
+                    </div>
+                    <span class="check-severity sev-info">info</span>
+                </div>
+
+                <div class="check-item">
+                    <div class="check-icon check-pass">✓</div>
+                    <div class="check-details">
+                        <div class="check-rule">POST forms include CSRF token</div>
+                        <div class="check-message">Form has CSRF protection</div>
+                        
+                        <div class="check-location">fragment.go:31</div>
+                    </div>
+                    <span class="check-severity sev-info">info</span>
+                </div>
+
+                <div class="check-item">
+                    <div class="check-icon check-pass">✓</div>
+                    <div class="check-details">
+                        <div class="check-rule">POST forms include CSRF token</div>
+                        <div class="check-message">Form has CSRF protection</div>
+                        
+                        <div class="check-location">partials.go:83</div>
+                    </div>
+                    <span class="check-severity sev-info">info</span>
+                </div>
+
+                <div class="check-item">
+                    <div class="check-icon check-pass">✓</div>
+                    <div class="check-details">
+                        <div class="check-rule">POST forms include CSRF token</div>
+                        <div class="check-message">Form has CSRF protection</div>
+                        
+                        <div class="check-location">partials.go:126</div>
+                    </div>
+                    <span class="check-severity sev-info">info</span>
+                </div>
+
+                <div class="check-item">
+                    <div class="check-icon check-pass">✓</div>
+                    <div class="check-details">
+                        <div class="check-rule">POST forms include CSRF token</div>
+                        <div class="check-message">Form has CSRF protection</div>
+                        
+                        <div class="check-location">partials.go:120</div>
+                    </div>
+                    <span class="check-severity sev-info">info</span>
+                </div>
+
+                <div class="check-item">
+                    <div class="check-icon check-pass">✓</div>
+                    <div class="check-details">
+                        <div class="check-rule">POST forms include CSRF token</div>
+                        <div class="check-message">Form has CSRF protection</div>
+                        
+                        <div class="check-location">partials.go:106</div>
+                    </div>
+                    <span class="check-severity sev-info">info</span>
+                </div>
+
+                <div class="check-item">
+                    <div class="check-icon check-pass">✓</div>
+                    <div class="check-details">
+                        <div class="check-rule">POST forms include CSRF token</div>
+                        <div class="check-message">Form has CSRF protection</div>
+                        
+                        <div class="check-location">partials.go:96</div>
+                    </div>
+                    <span class="check-severity sev-info">info</span>
+                </div>
+
+                <div class="check-item">
+                    <div class="check-icon check-pass">✓</div>
+                    <div class="check-details">
+                        <div class="check-rule">POST forms include CSRF token</div>
+                        <div class="check-message">Form has CSRF protection</div>
+                        
+                        <div class="check-location">login.go:38</div>
+                    </div>
+                    <span class="check-severity sev-info">info</span>
+                </div>
+
+                <div class="check-item">
+                    <div class="check-icon check-pass">✓</div>
+                    <div class="check-details">
+                        <div class="check-rule">POST forms include CSRF token</div>
+                        <div class="check-message">Form has CSRF protection</div>
+                        
+                        <div class="check-location">login.go:57</div>
+                    </div>
+                    <span class="check-severity sev-info">info</span>
+                </div>
+
+                <div class="check-item">
+                    <div class="check-icon check-pass">✓</div>
+                    <div class="check-details">
+                        <div class="check-rule">POST forms include CSRF token</div>
+                        <div class="check-message">Form has CSRF protection</div>
+                        
+                        <div class="check-location">mutes.go:31</div>
+                    </div>
+                    <span class="check-severity sev-info">info</span>
+                </div>
+
+                <div class="check-item">
+                    <div class="check-icon check-pass">✓</div>
+                    <div class="check-details">
+                        <div class="check-rule">POST forms include CSRF token</div>
+                        <div class="check-message">Form has CSRF protection</div>
+                        
+                        <div class="check-location">profile.go:43</div>
+                    </div>
+                    <span class="check-severity sev-info">info</span>
+                </div>
+
+                <div class="check-item">
+                    <div class="check-icon check-pass">✓</div>
+                    <div class="check-details">
+                        <div class="check-rule">POST forms include CSRF token</div>
+                        <div class="check-message">Form has CSRF protection</div>
+                        
+                        <div class="check-location">profile.go:74</div>
+                    </div>
+                    <span class="check-severity sev-info">info</span>
+                </div>
+
+                <div class="check-item">
+                    <div class="check-icon check-pass">✓</div>
+                    <div class="check-details">
+                        <div class="check-rule">POST forms include CSRF token</div>
+                        <div class="check-message">Form has CSRF protection</div>
+                        
+                        <div class="check-location">profile.go:29</div>
+                    </div>
+                    <span class="check-severity sev-info">info</span>
+                </div>
+
+                <div class="check-item">
+                    <div class="check-icon check-pass">✓</div>
+                    <div class="check-details">
+                        <div class="check-rule">POST forms include CSRF token</div>
+                        <div class="check-message">Form has CSRF protection</div>
+                        
+                        <div class="check-location">quote.go:29</div>
+                    </div>
+                    <span class="check-severity sev-info">info</span>
+                </div>
+
+                <div class="check-item">
+                    <div class="check-icon check-pass">✓</div>
+                    <div class="check-details">
+                        <div class="check-rule">POST forms include CSRF token</div>
+                        <div class="check-message">Form has CSRF protection</div>
+                        
+                        <div class="check-location">report.go:29</div>
+                    </div>
+                    <span class="check-severity sev-info">info</span>
+                </div>
+
+                <div class="check-item">
+                    <div class="check-icon check-pass">✓</div>
+                    <div class="check-details">
+                        <div class="check-rule">POST forms include CSRF token</div>
+                        <div class="check-message">Form has CSRF protection</div>
+                        
+                        <div class="check-location">thread.go:94</div>
+                    </div>
+                    <span class="check-severity sev-info">info</span>
+                </div>
+
+                <div class="check-item">
+                    <div class="check-icon check-pass">✓</div>
+                    <div class="check-details">
+                        <div class="check-rule">POST forms include CSRF token</div>
+                        <div class="check-message">Form has CSRF protection</div>
+                        
+                        <div class="check-location">timeline.go:57</div>
+                    </div>
+                    <span class="check-severity sev-info">info</span>
+                </div>
+
+                <div class="check-item">
+                    <div class="check-icon check-pass">✓</div>
+                    <div class="check-details">
+                        <div class="check-rule">POST forms include CSRF token</div>
+                        <div class="check-message">Form has CSRF protection</div>
+                        
+                        <div class="check-location">wallet.go:41</div>
+                    </div>
+                    <span class="check-severity sev-info">info</span>
+                </div>
+
+                <div class="check-item">
+                    <div class="check-icon check-pass">✓</div>
+                    <div class="check-details">
+                        <div class="check-rule">POST forms include CSRF token</div>
+                        <div class="check-message">Form has CSRF protection</div>
+                        
+                        <div class="check-location">wallet.go:57</div>
+                    </div>
+                    <span class="check-severity sev-info">info</span>
+                </div>
+
+            </div>
+        </div>
+
+        <div class="file-section">
+            <div class="file-header" onclick="this.parentElement.classList.toggle('open')">
+                <span class="file-name">HTTP Security Headers</span>
+                <div class="file-stats">
+                    <span class="stat stat-pass">5 passed</span>
+                    <span class="stat stat-fail">0 failed</span>
+                </div>
+            </div>
+            <div class="checks-list">
+
+                <div class="check-item">
+                    <div class="check-icon check-pass">✓</div>
+                    <div class="check-details">
+                        <div class="check-rule">Clickjacking protection (X-Frame-Options)</div>
+                        <div class="check-message">Frame protection header configured</div>
+                        
+                        <div class="check-location">main.go</div>
+                    </div>
+                    <span class="check-severity sev-info">info</span>
+                </div>
+
+                <div class="check-item">
+                    <div class="check-icon check-pass">✓</div>
+                    <div class="check-details">
+                        <div class="check-rule">MIME sniffing protection</div>
+                        <div class="check-message">X-Content-Type-Options configured</div>
+                        
+                        <div class="check-location">main.go</div>
+                    </div>
+                    <span class="check-severity sev-info">info</span>
+                </div>
+
+                <div class="check-item">
+                    <div class="check-icon check-pass">✓</div>
+                    <div class="check-details">
+                        <div class="check-rule">HSTS support</div>
+                        <div class="check-message">HSTS configured</div>
+                        
+                        <div class="check-location">main.go</div>
+                    </div>
+                    <span class="check-severity sev-info">info</span>
+                </div>
+
+                <div class="check-item">
+                    <div class="check-icon check-pass">✓</div>
+                    <div class="check-details">
+                        <div class="check-rule">Content Security Policy</div>
+                        <div class="check-message">CSP configured</div>
+                        
+                        <div class="check-location">main.go</div>
+                    </div>
+                    <span class="check-severity sev-info">info</span>
+                </div>
+
+                <div class="check-item">
+                    <div class="check-icon check-pass">✓</div>
+                    <div class="check-details">
+                        <div class="check-rule">CSP policy parseable</div>
+                        <div class="check-message">CSP configured (policy value not statically parseable)</div>
+                        
+                        <div class="check-location">main.go</div>
+                    </div>
+                    <span class="check-severity sev-info">info</span>
+                </div>
+
+            </div>
+        </div>
+
+        <div class="file-section">
+            <div class="file-header" onclick="this.parentElement.classList.toggle('open')">
+                <span class="file-name">Session Security</span>
+                <div class="file-stats">
+                    <span class="stat stat-pass">6 passed</span>
+                    <span class="stat stat-fail">0 failed</span>
+                </div>
+            </div>
+            <div class="checks-list">
+
+                <div class="check-item">
+                    <div class="check-icon check-pass">✓</div>
+                    <div class="check-details">
+                        <div class="check-rule">Session regeneration on login</div>
+                        <div class="check-message">Session appears to be regenerated on login</div>
+                        
+                        <div class="check-location">html_auth.go</div>
+                    </div>
+                    <span class="check-severity sev-low">low</span>
+                </div>
+
+                <div class="check-item">
+                    <div class="check-icon check-pass">✓</div>
+                    <div class="check-details">
+                        <div class="check-rule">Authentication middleware</div>
+                        <div class="check-message">Auth middleware found</div>
+                        
+                        <div class="check-location">*.go</div>
+                    </div>
+                    <span class="check-severity sev-info">info</span>
+                </div>
+
+                <div class="check-item">
+                    <div class="check-icon check-pass">✓</div>
+                    <div class="check-details">
+                        <div class="check-rule">Panic recovery</div>
+                        <div class="check-message">Panic recovery found</div>
+                        
+                        <div class="check-location">*.go</div>
+                    </div>
+                    <span class="check-severity sev-info">info</span>
+                </div>
+
+                <div class="check-item">
+                    <div class="check-icon check-pass">✓</div>
+                    <div class="check-details">
+                        <div class="check-rule">Cookies have HttpOnly flag</div>
+                        <div class="check-message">HttpOnly flag set on cookies</div>
+                        
+                        <div class="check-location">cookies.go</div>
+                    </div>
+                    <span class="check-severity sev-info">info</span>
+                </div>
+
+                <div class="check-item">
+                    <div class="check-icon check-pass">✓</div>
+                    <div class="check-details">
+                        <div class="check-rule">Cookies have Secure flag</div>
+                        <div class="check-message">Secure flag set on cookies</div>
+                        
+                        <div class="check-location">cookies.go</div>
+                    </div>
+                    <span class="check-severity sev-info">info</span>
+                </div>
+
+                <div class="check-item">
+                    <div class="check-icon check-pass">✓</div>
+                    <div class="check-details">
+                        <div class="check-rule">Cookies have SameSite attribute</div>
+                        <div class="check-message">SameSite attribute set on cookies</div>
+                        
+                        <div class="check-location">cookies.go</div>
+                    </div>
+                    <span class="check-severity sev-info">info</span>
+                </div>
+
+            </div>
+        </div>
+
+        <div class="file-section">
+            <div class="file-header" onclick="this.parentElement.classList.toggle('open')">
+                <span class="file-name">Nostr Security</span>
+                <div class="file-stats">
+                    <span class="stat stat-pass">17 passed</span>
+                    <span class="stat stat-fail">0 failed</span>
+                </div>
+            </div>
+            <div class="checks-list">
+
+                <div class="check-item">
+                    <div class="check-icon check-pass">✓</div>
+                    <div class="check-details">
+                        <div class="check-rule">NIP-46 secrets not logged</div>
+                        <div class="check-message">NIP-46 remote signing in use - no secret logging detected</div>
+                        
+                        <div class="check-location">cache_memory.go</div>
+                    </div>
+                    <span class="check-severity sev-info">info</span>
+                </div>
+
+                <div class="check-item">
+                    <div class="check-icon check-pass">✓</div>
+                    <div class="check-details">
+                        <div class="check-rule">NWC secrets not logged</div>
+                        <div class="check-message">NWC wallet integration found - no secret logging detected</div>
+                        
+                        <div class="check-location">cache_memory.go</div>
+                    </div>
+                    <span class="check-severity sev-info">info</span>
+                </div>
+
+                <div class="check-item">
+                    <div class="check-icon check-pass">✓</div>
+                    <div class="check-details">
+                        <div class="check-rule">Event signature verification</div>
+                        <div class="check-message">Signature verification found</div>
+                        
+                        <div class="check-location">dvm.go</div>
+                    </div>
+                    <span class="check-severity sev-info">info</span>
+                </div>
+
+                <div class="check-item">
+                    <div class="check-icon check-pass">✓</div>
+                    <div class="check-details">
+                        <div class="check-rule">NIP-46 secrets not logged</div>
+                        <div class="check-message">NIP-46 remote signing in use - no secret logging detected</div>
+                        
+                        <div class="check-location">html_auth.go</div>
+                    </div>
+                    <span class="check-severity sev-info">info</span>
+                </div>
+
+                <div class="check-item">
+                    <div class="check-icon check-pass">✓</div>
+                    <div class="check-details">
+                        <div class="check-rule">NWC secrets not logged</div>
+                        <div class="check-message">NWC wallet integration found - no secret logging detected</div>
+                        
+                        <div class="check-location">html_auth.go</div>
+                    </div>
+                    <span class="check-severity sev-info">info</span>
+                </div>
+
+                <div class="check-item">
+                    <div class="check-icon check-pass">✓</div>
+                    <div class="check-details">
+                        <div class="check-rule">NWC URI secure storage</div>
+                        <div class="check-message">NWC URI appears to use secure storage</div>
+                        
+                        <div class="check-location">html_auth.go</div>
+                    </div>
+                    <span class="check-severity sev-info">info</span>
+                </div>
+
+                <div class="check-item">
+                    <div class="check-icon check-pass">✓</div>
+                    <div class="check-details">
+                        <div class="check-rule">Event signature verification</div>
+                        <div class="check-message">Signature verification found</div>
+                        
+                        <div class="check-location">nip46.go</div>
+                    </div>
+                    <span class="check-severity sev-info">info</span>
+                </div>
+
+                <div class="check-item">
+                    <div class="check-icon check-pass">✓</div>
+                    <div class="check-details">
+                        <div class="check-rule">NIP-46 secrets not logged</div>
+                        <div class="check-message">NIP-46 remote signing in use - no secret logging detected</div>
+                        
+                        <div class="check-location">nip46.go</div>
+                    </div>
+                    <span class="check-severity sev-info">info</span>
+                </div>
+
+                <div class="check-item">
+                    <div class="check-icon check-pass">✓</div>
+                    <div class="check-details">
+                        <div class="check-rule">NIP-44 encryption audit</div>
+                        <div class="check-message">NIP-44 encryption in use - modern authenticated encryption</div>
+                        
+                        <div class="check-location">nip46.go</div>
+                    </div>
+                    <span class="check-severity sev-info">info</span>
+                </div>
+
+                <div class="check-item">
+                    <div class="check-icon check-pass">✓</div>
+                    <div class="check-details">
+                        <div class="check-rule">Private key memory safety</div>
+                        <div class="check-message">Key zeroing patterns found</div>
+                        
+                        <div class="check-location">nip46.go</div>
+                    </div>
+                    <span class="check-severity sev-info">info</span>
+                </div>
+
+                <div class="check-item">
+                    <div class="check-icon check-pass">✓</div>
+                    <div class="check-details">
+                        <div class="check-rule">NIP-46 secrets not logged</div>
+                        <div class="check-message">NIP-46 remote signing in use - no secret logging detected</div>
+                        
+                        <div class="check-location">nostrconnect.go</div>
+                    </div>
+                    <span class="check-severity sev-info">info</span>
+                </div>
+
+                <div class="check-item">
+                    <div class="check-icon check-pass">✓</div>
+                    <div class="check-details">
+                        <div class="check-rule">Private key memory safety</div>
+                        <div class="check-message">Key zeroing patterns found</div>
+                        
+                        <div class="check-location">nostrconnect.go</div>
+                    </div>
+                    <span class="check-severity sev-info">info</span>
+                </div>
+
+                <div class="check-item">
+                    <div class="check-icon check-pass">✓</div>
+                    <div class="check-details">
+                        <div class="check-rule">Event signature verification</div>
+                        <div class="check-message">Signature verification found</div>
+                        
+                        <div class="check-location">nwc.go</div>
+                    </div>
+                    <span class="check-severity sev-info">info</span>
+                </div>
+
+                <div class="check-item">
+                    <div class="check-icon check-pass">✓</div>
+                    <div class="check-details">
+                        <div class="check-rule">NIP-04 deprecation</div>
+                        <div class="check-message">NIP-04 found but NIP-44 also present - ensure migration to NIP-44</div>
+                        
+                        <div class="check-location">nwc.go</div>
+                    </div>
+                    <span class="check-severity sev-info">info</span>
+                </div>
+
+                <div class="check-item">
+                    <div class="check-icon check-pass">✓</div>
+                    <div class="check-details">
+                        <div class="check-rule">NIP-44 encryption audit</div>
+                        <div class="check-message">NIP-44 encryption in use - modern authenticated encryption</div>
+                        
+                        <div class="check-location">nwc.go</div>
+                    </div>
+                    <span class="check-severity sev-info">info</span>
+                </div>
+
+                <div class="check-item">
+                    <div class="check-icon check-pass">✓</div>
+                    <div class="check-details">
+                        <div class="check-rule">NWC secrets not logged</div>
+                        <div class="check-message">NWC wallet integration found - no secret logging detected</div>
+                        
+                        <div class="check-location">nwc.go</div>
+                    </div>
+                    <span class="check-severity sev-info">info</span>
+                </div>
+
+                <div class="check-item">
+                    <div class="check-icon check-pass">✓</div>
+                    <div class="check-details">
+                        <div class="check-rule">Zap receipt verification</div>
+                        <div class="check-message">Zap verification logic found at ingestion layer</div>
+                        
+                        <div class="check-location">relay.go</div>
+                    </div>
+                    <span class="check-severity sev-info">info</span>
+                </div>
+
+            </div>
+        </div>
+
+        <div class="file-section">
+            <div class="file-header" onclick="this.parentElement.classList.toggle('open')">
+                <span class="file-name">Rate Limiting</span>
+                <div class="file-stats">
+                    <span class="stat stat-pass">1 passed</span>
+                    <span class="stat stat-fail">0 failed</span>
+                </div>
+            </div>
+            <div class="checks-list">
+
+                <div class="check-item">
+                    <div class="check-icon check-pass">✓</div>
+                    <div class="check-details">
+                        <div class="check-rule">Rate limiting on mutations</div>
+                        <div class="check-message">Rate limiting appears configured</div>
+                        
+                        <div class="check-location">html_auth.go</div>
+                    </div>
+                    <span class="check-severity sev-info">info</span>
+                </div>
+
+            </div>
+        </div>
+
+        <div class="file-section">
+            <div class="file-header" onclick="this.parentElement.classList.toggle('open')">
+                <span class="file-name">SSRF Prevention</span>
+                <div class="file-stats">
+                    <span class="stat stat-pass">3 passed</span>
+                    <span class="stat stat-fail">0 failed</span>
+                </div>
+            </div>
+            <div class="checks-list">
+
+                <div class="check-item">
+                    <div class="check-icon check-pass">✓</div>
+                    <div class="check-details">
+                        <div class="check-rule">Private IP blocking</div>
+                        <div class="check-message">Private IP/localhost checks found</div>
+                        
+                        <div class="check-location">link_preview.go</div>
+                    </div>
+                    <span class="check-severity sev-info">info</span>
+                </div>
+
+                <div class="check-item">
+                    <div class="check-icon check-pass">✓</div>
+                    <div class="check-details">
+                        <div class="check-rule">Redirect following limits</div>
+                        <div class="check-message">Redirect control configured</div>
+                        
+                        <div class="check-location">link_preview.go</div>
+                    </div>
+                    <span class="check-severity sev-info">info</span>
+                </div>
+
+                <div class="check-item">
+                    <div class="check-icon check-pass">✓</div>
+                    <div class="check-details">
+                        <div class="check-rule">Request timeout</div>
+                        <div class="check-message">Request timeout configured</div>
+                        
+                        <div class="check-location">link_preview.go</div>
+                    </div>
+                    <span class="check-severity sev-info">info</span>
+                </div>
+
+            </div>
+        </div>
+
+        <div class="file-section">
+            <div class="file-header" onclick="this.parentElement.classList.toggle('open')">
+                <span class="file-name">Cryptography</span>
+                <div class="file-stats">
+                    <span class="stat stat-pass">5 passed</span>
+                    <span class="stat stat-fail">0 failed</span>
+                </div>
+            </div>
+            <div class="checks-list">
+
+                <div class="check-item">
+                    <div class="check-icon check-pass">✓</div>
+                    <div class="check-details">
+                        <div class="check-rule">Cryptographic randomness</div>
+                        <div class="check-message">crypto/rand used for secure random generation</div>
+                        
+                        <div class="check-location">csrf.go</div>
+                    </div>
+                    <span class="check-severity sev-info">info</span>
+                </div>
+
+                <div class="check-item">
+                    <div class="check-icon check-pass">✓</div>
+                    <div class="check-details">
+                        <div class="check-rule">Cryptographic randomness</div>
+                        <div class="check-message">crypto/rand used for secure random generation</div>
+                        
+                        <div class="check-location">logging.go</div>
+                    </div>
+                    <span class="check-severity sev-info">info</span>
+                </div>
+
+                <div class="check-item">
+                    <div class="check-icon check-pass">✓</div>
+                    <div class="check-details">
+                        <div class="check-rule">Cryptographic randomness</div>
+                        <div class="check-message">crypto/rand used for secure random generation</div>
+                        
+                        <div class="check-location">nip46.go</div>
+                    </div>
+                    <span class="check-severity sev-info">info</span>
+                </div>
+
+                <div class="check-item">
+                    <div class="check-icon check-pass">✓</div>
+                    <div class="check-details">
+                        <div class="check-rule">Cryptographic randomness</div>
+                        <div class="check-message">crypto/rand used for secure random generation</div>
+                        
+                        <div class="check-location">nostrconnect.go</div>
+                    </div>
+                    <span class="check-severity sev-info">info</span>
+                </div>
+
+                <div class="check-item">
+                    <div class="check-icon check-pass">✓</div>
+                    <div class="check-details">
+                        <div class="check-rule">Cryptographic randomness</div>
+                        <div class="check-message">crypto/rand used for secure random generation</div>
+                        
+                        <div class="check-location">relay.go</div>
+                    </div>
+                    <span class="check-severity sev-info">info</span>
+                </div>
+
+            </div>
+        </div>
+
+        <div class="file-section">
+            <div class="file-header" onclick="this.parentElement.classList.toggle('open')">
+                <span class="file-name">Information Disclosure</span>
+                <div class="file-stats">
+                    <span class="stat stat-pass">2 passed</span>
+                    <span class="stat stat-fail">0 failed</span>
+                </div>
+            </div>
+            <div class="checks-list">
+
+                <div class="check-item">
+                    <div class="check-icon check-pass">✓</div>
+                    <div class="check-details">
+                        <div class="check-rule">Debug mode control</div>
+                        <div class="check-message">Debug mode controlled via environment variable</div>
+                        
+                        <div class="check-location">main.go</div>
+                    </div>
+                    <span class="check-severity sev-info">info</span>
+                </div>
+
+                <div class="check-item">
+                    <div class="check-icon check-pass">✓</div>
+                    <div class="check-details">
+                        <div class="check-rule">Debug mode control</div>
+                        <div class="check-message">Debug mode controlled via environment variable</div>
+                        
+                        <div class="check-location">nostrconnect.go</div>
+                    </div>
+                    <span class="check-severity sev-info">info</span>
+                </div>
+
+            </div>
+        </div>
+
+        <h2>Resources</h2>
+        <ul style="margin-left: 1.5rem; color: var(--text-muted);">
+            <li><a href="https://owasp.org/www-project-top-ten/" class="link">OWASP Top 10</a></li>
+            <li><a href="https://cheatsheetseries.owasp.org/" class="link">OWASP Cheat Sheet Series</a></li>
+            <li><a href="https://cwe.mitre.org/top25/" class="link">CWE Top 25</a></li>
+            <li><a href="https://github.com/nostr-protocol/nips" class="link">Nostr NIPs</a></li>
+        </ul>
+
+        <h2>Limitations</h2>
+        <p style="color: var(--text-muted);">
+            This static analysis cannot detect:
+        </p>
+        <ul style="margin-left: 1.5rem; color: var(--text-muted); margin-top: 0.5rem;">
+            <li>Runtime vulnerabilities (requires dynamic testing)</li>
+            <li>Logic flaws and business logic vulnerabilities</li>
+            <li>Authentication bypass via implementation bugs</li>
+            <li>Timing attacks and side-channel vulnerabilities</li>
+            <li>Infrastructure and deployment security issues</li>
+        </ul>
+    </div>
+</body>
+</html>

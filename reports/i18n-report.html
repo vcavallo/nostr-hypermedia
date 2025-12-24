@@ -1,0 +1,3241 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>i18n Compliance Report</title>
+    <style>
+        :root {
+            --bg: #0d1117;
+            --bg-secondary: #161b22;
+            --border: #30363d;
+            --text: #e6edf3;
+            --text-muted: #8b949e;
+            --green: #238636;
+            --yellow: #9e6a03;
+            --red: #da3633;
+            --blue: #58a6ff;
+        }
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+            background: var(--bg);
+            color: var(--text);
+            line-height: 1.5;
+            padding: 2rem;
+        }
+        .container { max-width: 1200px; margin: 0 auto; }
+        h1 { margin-bottom: 0.5rem; }
+        .meta { color: var(--text-muted); margin-bottom: 2rem; }
+
+        .score-card {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 2rem;
+            margin-bottom: 2rem;
+            display: flex;
+            align-items: center;
+            gap: 2rem;
+        }
+        .score-circle {
+            width: 120px;
+            height: 120px;
+            border-radius: 50%;
+            border: 8px solid;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            font-size: 2rem;
+            font-weight: bold;
+        }
+        .score-label { font-size: 0.9rem; font-weight: normal; }
+        .score-details h3 { margin-bottom: 0.5rem; }
+
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 1rem;
+            margin-bottom: 2rem;
+        }
+        .stat-card {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 1.5rem;
+        }
+        .stat-card h4 { color: var(--text-muted); font-size: 0.85rem; margin-bottom: 0.5rem; }
+        .stat-card .value { font-size: 2rem; font-weight: bold; }
+        .stat-card .value.green { color: var(--green); }
+        .stat-card .value.yellow { color: var(--yellow); }
+        .stat-card .value.red { color: var(--red); }
+
+        .section {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            margin-bottom: 1.5rem;
+            overflow: hidden;
+        }
+        .section-header {
+            padding: 1rem 1.5rem;
+            border-bottom: 1px solid var(--border);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            cursor: pointer;
+        }
+        .section-header:hover { background: rgba(255,255,255,0.02); }
+        .section-header h3 { font-size: 1rem; }
+        .section-content { display: none; padding: 1rem 1.5rem; }
+        .section.open .section-content { display: block; }
+
+        .category-row {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 0.75rem 0;
+            border-bottom: 1px solid var(--border);
+        }
+        .category-row:last-child { border-bottom: none; }
+        .category-name { font-weight: 500; }
+        .category-stats { display: flex; gap: 1rem; align-items: center; }
+        .category-bar {
+            width: 100px;
+            height: 8px;
+            background: var(--border);
+            border-radius: 4px;
+            overflow: hidden;
+        }
+        .category-bar-fill {
+            height: 100%;
+            background: var(--green);
+            transition: width 0.3s;
+        }
+
+        .string-table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+        .string-table th, .string-table td {
+            padding: 0.75rem;
+            text-align: left;
+            border-bottom: 1px solid var(--border);
+        }
+        .string-table th {
+            color: var(--text-muted);
+            font-weight: 500;
+            font-size: 0.85rem;
+        }
+        .string-table tr:last-child td { border-bottom: none; }
+        .string-text { font-family: monospace; background: rgba(255,255,255,0.05); padding: 0.2rem 0.4rem; border-radius: 3px; }
+        .string-key { color: var(--blue); font-family: monospace; font-size: 0.85rem; }
+        .string-file { color: var(--text-muted); font-size: 0.85rem; }
+        .string-category {
+            font-size: 0.75rem;
+            padding: 0.2rem 0.5rem;
+            border-radius: 3px;
+            background: rgba(88, 166, 255, 0.1);
+            color: var(--blue);
+        }
+
+        .json-preview {
+            background: var(--bg);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            padding: 1rem;
+            overflow-x: auto;
+            font-family: monospace;
+            font-size: 0.85rem;
+            white-space: pre;
+            max-height: 400px;
+            overflow-y: auto;
+        }
+
+        .copy-btn {
+            background: var(--blue);
+            color: white;
+            border: none;
+            padding: 0.5rem 1rem;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 0.85rem;
+        }
+        .copy-btn:hover { opacity: 0.9; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>i18n Compliance Report</h1>
+        <p class="meta">Generated: 2025-12-24 12:12:03</p>
+
+        <div class="score-card">
+            <div class="score-circle" style="border-color: var(--green); color: var(--green);">
+                100%
+                <span class="score-label">score</span>
+            </div>
+            <div class="score-details">
+                <h3>i18n Compliance</h3>
+                <p style="color: var(--text-muted);">
+                    87 of 87 checks passed
+                </p>
+            </div>
+        </div>
+
+        <div class="stats-grid">
+            <div class="stat-card">
+                <h4>Total Checks</h4>
+                <div class="value">87</div>
+            </div>
+            <div class="stat-card">
+                <h4>Passed</h4>
+                <div class="value green">87</div>
+            </div>
+            <div class="stat-card">
+                <h4>Failed</h4>
+                <div class="value green">0</div>
+            </div>
+            <div class="stat-card">
+                <h4>Categories</h4>
+                <div class="value">11</div>
+            </div>
+        </div>
+
+        
+        <h2 style="font-size: 1.5rem; margin: 2rem 0 1rem; border-bottom: 1px solid var(--border); padding-bottom: 0.5rem;">Category Breakdown</h2>
+        <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 1rem; margin-bottom: 2rem;">
+            
+            <div style="background: var(--bg-secondary); border: 1px solid var(--border); border-radius: 8px; padding: 1rem;">
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.5rem;">
+                    <span style="font-weight: 600;">Labels &amp; Titles</span>
+                    <span style="font-size: 1.2rem; font-weight: bold; color: var(--green);">100%</span>
+                </div>
+                <div class="category-bar">
+                    <div class="category-bar-fill" style="width: 100%; background: var(--green);"></div>
+                </div>
+                
+                <p style="margin-top: 0.25rem; color: var(--text-muted); font-size: 0.8rem;">21 passed / 21 checks</p>
+            </div>
+            
+            <div style="background: var(--bg-secondary); border: 1px solid var(--border); border-radius: 8px; padding: 1rem;">
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.5rem;">
+                    <span style="font-weight: 600;">Navigation &amp; Actions</span>
+                    <span style="font-size: 1.2rem; font-weight: bold; color: var(--green);">100%</span>
+                </div>
+                <div class="category-bar">
+                    <div class="category-bar-fill" style="width: 100%; background: var(--green);"></div>
+                </div>
+                
+                <p style="margin-top: 0.25rem; color: var(--text-muted); font-size: 0.8rem;">12 passed / 12 checks</p>
+            </div>
+            
+            <div style="background: var(--bg-secondary); border: 1px solid var(--border); border-radius: 8px; padding: 1rem;">
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.5rem;">
+                    <span style="font-weight: 600;">Buttons &amp; Links</span>
+                    <span style="font-size: 1.2rem; font-weight: bold; color: var(--green);">100%</span>
+                </div>
+                <div class="category-bar">
+                    <div class="category-bar-fill" style="width: 100%; background: var(--green);"></div>
+                </div>
+                
+                <p style="margin-top: 0.25rem; color: var(--text-muted); font-size: 0.8rem;">9 passed / 9 checks</p>
+            </div>
+            
+            <div style="background: var(--bg-secondary); border: 1px solid var(--border); border-radius: 8px; padding: 1rem;">
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.5rem;">
+                    <span style="font-weight: 600;">Actions (config)</span>
+                    <span style="font-size: 1.2rem; font-weight: bold; color: var(--green);">100%</span>
+                </div>
+                <div class="category-bar">
+                    <div class="category-bar-fill" style="width: 100%; background: var(--green);"></div>
+                </div>
+                
+                <p style="margin-top: 0.25rem; color: var(--text-muted); font-size: 0.8rem;">9 passed / 9 checks</p>
+            </div>
+            
+            <div style="background: var(--bg-secondary); border: 1px solid var(--border); border-radius: 8px; padding: 1rem;">
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.5rem;">
+                    <span style="font-weight: 600;">Messages &amp; Prompts</span>
+                    <span style="font-size: 1.2rem; font-weight: bold; color: var(--green);">100%</span>
+                </div>
+                <div class="category-bar">
+                    <div class="category-bar-fill" style="width: 100%; background: var(--green);"></div>
+                </div>
+                
+                <p style="margin-top: 0.25rem; color: var(--text-muted); font-size: 0.8rem;">6 passed / 6 checks</p>
+            </div>
+            
+            <div style="background: var(--bg-secondary); border: 1px solid var(--border); border-radius: 8px; padding: 1rem;">
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.5rem;">
+                    <span style="font-weight: 600;">Kind Filters (config)</span>
+                    <span style="font-size: 1.2rem; font-weight: bold; color: var(--green);">100%</span>
+                </div>
+                <div class="category-bar">
+                    <div class="category-bar-fill" style="width: 100%; background: var(--green);"></div>
+                </div>
+                
+                <p style="margin-top: 0.25rem; color: var(--text-muted); font-size: 0.8rem;">6 passed / 6 checks</p>
+            </div>
+            
+            <div style="background: var(--bg-secondary); border: 1px solid var(--border); border-radius: 8px; padding: 1rem;">
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.5rem;">
+                    <span style="font-weight: 600;">Status Indicators</span>
+                    <span style="font-size: 1.2rem; font-weight: bold; color: var(--green);">100%</span>
+                </div>
+                <div class="category-bar">
+                    <div class="category-bar-fill" style="width: 100%; background: var(--green);"></div>
+                </div>
+                
+                <p style="margin-top: 0.25rem; color: var(--text-muted); font-size: 0.8rem;">5 passed / 5 checks</p>
+            </div>
+            
+            <div style="background: var(--bg-secondary); border: 1px solid var(--border); border-radius: 8px; padding: 1rem;">
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.5rem;">
+                    <span style="font-weight: 600;">Date &amp; Time</span>
+                    <span style="font-size: 1.2rem; font-weight: bold; color: var(--green);">100%</span>
+                </div>
+                <div class="category-bar">
+                    <div class="category-bar-fill" style="width: 100%; background: var(--green);"></div>
+                </div>
+                <p style="margin-top: 0.25rem; color: var(--text-muted); font-size: 0.8rem;">Locale-aware date and time formatting</p>
+                <p style="margin-top: 0.25rem; color: var(--text-muted); font-size: 0.8rem;">9 passed / 9 checks</p>
+            </div>
+            
+            <div style="background: var(--bg-secondary); border: 1px solid var(--border); border-radius: 8px; padding: 1rem;">
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.5rem;">
+                    <span style="font-weight: 600;">Feed Modes (config)</span>
+                    <span style="font-size: 1.2rem; font-weight: bold; color: var(--green);">100%</span>
+                </div>
+                <div class="category-bar">
+                    <div class="category-bar-fill" style="width: 100%; background: var(--green);"></div>
+                </div>
+                
+                <p style="margin-top: 0.25rem; color: var(--text-muted); font-size: 0.8rem;">2 passed / 2 checks</p>
+            </div>
+            
+            <div style="background: var(--bg-secondary); border: 1px solid var(--border); border-radius: 8px; padding: 1rem;">
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.5rem;">
+                    <span style="font-weight: 600;">Pluralization</span>
+                    <span style="font-size: 1.2rem; font-weight: bold; color: var(--green);">100%</span>
+                </div>
+                <div class="category-bar">
+                    <div class="category-bar-fill" style="width: 100%; background: var(--green);"></div>
+                </div>
+                <p style="margin-top: 0.25rem; color: var(--text-muted); font-size: 0.8rem;">Proper handling of singular/plural forms</p>
+                <p style="margin-top: 0.25rem; color: var(--text-muted); font-size: 0.8rem;">4 passed / 4 checks</p>
+            </div>
+            
+            <div style="background: var(--bg-secondary); border: 1px solid var(--border); border-radius: 8px; padding: 1rem;">
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.5rem;">
+                    <span style="font-weight: 600;">Number Formatting</span>
+                    <span style="font-size: 1.2rem; font-weight: bold; color: var(--green);">100%</span>
+                </div>
+                <div class="category-bar">
+                    <div class="category-bar-fill" style="width: 100%; background: var(--green);"></div>
+                </div>
+                <p style="margin-top: 0.25rem; color: var(--text-muted); font-size: 0.8rem;">Locale-aware number and currency formatting</p>
+                <p style="margin-top: 0.25rem; color: var(--text-muted); font-size: 0.8rem;">4 passed / 4 checks</p>
+            </div>
+            
+        </div>
+        
+
+        
+        <h2 style="font-size: 1.5rem; margin: 2rem 0 1rem; border-bottom: 1px solid var(--border); padding-bottom: 0.5rem;">Detailed Findings</h2>
+        <button class="toggle-btn" style="background: var(--bg); border: 1px solid var(--border); color: var(--text); padding: 0.5rem 1rem; border-radius: 6px; cursor: pointer; margin-bottom: 1rem;" onclick="document.querySelectorAll('.section').forEach(s => s.classList.toggle('open'))">
+            Toggle All
+        </button>
+        
+        
+        <div class="section">
+            <div class="section-header" onclick="this.parentElement.classList.toggle('open')">
+                <span>
+                    <span style="font-family: monospace; color: var(--blue);">Labels &amp; Titles</span>
+                </span>
+                <div style="display: flex; gap: 1rem;">
+                    <span style="padding: 0.2rem 0.5rem; border-radius: 4px; font-size: 0.85rem; background: rgba(35,134,54,0.2); color: var(--green);">21 passed</span>
+                    
+                </div>
+            </div>
+            <div class="section-content">
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                <div style="padding: 0.75rem 0; border-bottom: 1px solid var(--border); display: flex; gap: 1rem; align-items: flex-start;">
+                    <div style="width: 20px; height: 20px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 12px; flex-shrink: 0; background: var(--green); color: white;">✓</div>
+                    <div style="flex: 1;">
+                        <div style="font-weight: 500;"><span class="string-text">About</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.9rem;">Key: <span class="string-key">label.about</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.8rem; font-family: monospace;">templates/*.go</div>
+                    </div>
+                </div>
+                
+                
+                
+                <div style="padding: 0.75rem 0; border-bottom: 1px solid var(--border); display: flex; gap: 1rem; align-items: flex-start;">
+                    <div style="width: 20px; height: 20px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 12px; flex-shrink: 0; background: var(--green); color: white;">✓</div>
+                    <div style="flex: 1;">
+                        <div style="font-weight: 500;"><span class="string-text">Articles</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.9rem;">Key: <span class="string-key">label.articles</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.8rem; font-family: monospace;">templates/*.go</div>
+                    </div>
+                </div>
+                
+                
+                
+                <div style="padding: 0.75rem 0; border-bottom: 1px solid var(--border); display: flex; gap: 1rem; align-items: flex-start;">
+                    <div style="width: 20px; height: 20px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 12px; flex-shrink: 0; background: var(--green); color: white;">✓</div>
+                    <div style="flex: 1;">
+                        <div style="font-weight: 500;"><span class="string-text">Banner URL</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.9rem;">Key: <span class="string-key">label.banner_url</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.8rem; font-family: monospace;">templates/*.go</div>
+                    </div>
+                </div>
+                
+                
+                
+                <div style="padding: 0.75rem 0; border-bottom: 1px solid var(--border); display: flex; gap: 1rem; align-items: flex-start;">
+                    <div style="width: 20px; height: 20px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 12px; flex-shrink: 0; background: var(--green); color: white;">✓</div>
+                    <div style="flex: 1;">
+                        <div style="font-weight: 500;"><span class="string-text">Bookmarks</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.9rem;">Key: <span class="string-key">label.bookmarks</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.8rem; font-family: monospace;">templates/*.go</div>
+                    </div>
+                </div>
+                
+                
+                
+                <div style="padding: 0.75rem 0; border-bottom: 1px solid var(--border); display: flex; gap: 1rem; align-items: flex-start;">
+                    <div style="width: 20px; height: 20px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 12px; flex-shrink: 0; background: var(--green); color: white;">✓</div>
+                    <div style="flex: 1;">
+                        <div style="font-weight: 500;"><span class="string-text">Display Name</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.9rem;">Key: <span class="string-key">label.display_name</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.8rem; font-family: monospace;">templates/*.go</div>
+                    </div>
+                </div>
+                
+                
+                
+                <div style="padding: 0.75rem 0; border-bottom: 1px solid var(--border); display: flex; gap: 1rem; align-items: flex-start;">
+                    <div style="width: 20px; height: 20px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 12px; flex-shrink: 0; background: var(--green); color: white;">✓</div>
+                    <div style="flex: 1;">
+                        <div style="font-weight: 500;"><span class="string-text">Edit Profile</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.9rem;">Key: <span class="string-key">label.edit_profile</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.8rem; font-family: monospace;">templates/*.go</div>
+                    </div>
+                </div>
+                
+                
+                
+                <div style="padding: 0.75rem 0; border-bottom: 1px solid var(--border); display: flex; gap: 1rem; align-items: flex-start;">
+                    <div style="width: 20px; height: 20px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 12px; flex-shrink: 0; background: var(--green); color: white;">✓</div>
+                    <div style="flex: 1;">
+                        <div style="font-weight: 500;"><span class="string-text">Events</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.9rem;">Key: <span class="string-key">label.events</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.8rem; font-family: monospace;">templates/*.go</div>
+                    </div>
+                </div>
+                
+                
+                
+                <div style="padding: 0.75rem 0; border-bottom: 1px solid var(--border); display: flex; gap: 1rem; align-items: flex-start;">
+                    <div style="width: 20px; height: 20px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 12px; flex-shrink: 0; background: var(--green); color: white;">✓</div>
+                    <div style="flex: 1;">
+                        <div style="font-weight: 500;"><span class="string-text">Hashtags</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.9rem;">Key: <span class="string-key">label.hashtags</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.8rem; font-family: monospace;">templates/*.go</div>
+                    </div>
+                </div>
+                
+                
+                
+                <div style="padding: 0.75rem 0; border-bottom: 1px solid var(--border); display: flex; gap: 1rem; align-items: flex-start;">
+                    <div style="width: 20px; height: 20px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 12px; flex-shrink: 0; background: var(--green); color: white;">✓</div>
+                    <div style="flex: 1;">
+                        <div style="font-weight: 500;"><span class="string-text">Host:</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.9rem;">Key: <span class="string-key">label.host</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.8rem; font-family: monospace;">templates/*.go</div>
+                    </div>
+                </div>
+                
+                
+                
+                <div style="padding: 0.75rem 0; border-bottom: 1px solid var(--border); display: flex; gap: 1rem; align-items: flex-start;">
+                    <div style="width: 20px; height: 20px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 12px; flex-shrink: 0; background: var(--green); color: white;">✓</div>
+                    <div style="flex: 1;">
+                        <div style="font-weight: 500;"><span class="string-text">Lightning Address</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.9rem;">Key: <span class="string-key">label.lightning_address</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.8rem; font-family: monospace;">templates/*.go</div>
+                    </div>
+                </div>
+                
+                
+                
+                <div style="padding: 0.75rem 0; border-bottom: 1px solid var(--border); display: flex; gap: 1rem; align-items: flex-start;">
+                    <div style="width: 20px; height: 20px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 12px; flex-shrink: 0; background: var(--green); color: white;">✓</div>
+                    <div style="flex: 1;">
+                        <div style="font-weight: 500;"><span class="string-text">Links</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.9rem;">Key: <span class="string-key">label.links</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.8rem; font-family: monospace;">templates/*.go</div>
+                    </div>
+                </div>
+                
+                
+                
+                <div style="padding: 0.75rem 0; border-bottom: 1px solid var(--border); display: flex; gap: 1rem; align-items: flex-start;">
+                    <div style="width: 20px; height: 20px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 12px; flex-shrink: 0; background: var(--green); color: white;">✓</div>
+                    <div style="flex: 1;">
+                        <div style="font-weight: 500;"><span class="string-text">NIP-05</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.9rem;">Key: <span class="string-key">label.nip05</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.8rem; font-family: monospace;">templates/*.go</div>
+                    </div>
+                </div>
+                
+                
+                
+                <div style="padding: 0.75rem 0; border-bottom: 1px solid var(--border); display: flex; gap: 1rem; align-items: flex-start;">
+                    <div style="width: 20px; height: 20px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 12px; flex-shrink: 0; background: var(--green); color: white;">✓</div>
+                    <div style="flex: 1;">
+                        <div style="font-weight: 500;"><span class="string-text">Picture URL</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.9rem;">Key: <span class="string-key">label.picture_url</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.8rem; font-family: monospace;">templates/*.go</div>
+                    </div>
+                </div>
+                
+                
+                
+                <div style="padding: 0.75rem 0; border-bottom: 1px solid var(--border); display: flex; gap: 1rem; align-items: flex-start;">
+                    <div style="width: 20px; height: 20px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 12px; flex-shrink: 0; background: var(--green); color: white;">✓</div>
+                    <div style="flex: 1;">
+                        <div style="font-weight: 500;"><span class="string-text">Replies</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.9rem;">Key: <span class="string-key">label.replies</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.8rem; font-family: monospace;">templates/*.go</div>
+                    </div>
+                </div>
+                
+                
+                
+                <div style="padding: 0.75rem 0; border-bottom: 1px solid var(--border); display: flex; gap: 1rem; align-items: flex-start;">
+                    <div style="width: 20px; height: 20px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 12px; flex-shrink: 0; background: var(--green); color: white;">✓</div>
+                    <div style="flex: 1;">
+                        <div style="font-weight: 500;"><span class="string-text">Skip to main content</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.9rem;">Key: <span class="string-key">a11y.skip_to_main</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.8rem; font-family: monospace;">templates/*.go</div>
+                    </div>
+                </div>
+                
+                
+                
+                <div style="padding: 0.75rem 0; border-bottom: 1px solid var(--border); display: flex; gap: 1rem; align-items: flex-start;">
+                    <div style="width: 20px; height: 20px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 12px; flex-shrink: 0; background: var(--green); color: white;">✓</div>
+                    <div style="flex: 1;">
+                        <div style="font-weight: 500;"><span class="string-text">Username</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.9rem;">Key: <span class="string-key">label.username</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.8rem; font-family: monospace;">templates/*.go</div>
+                    </div>
+                </div>
+                
+                
+                
+                <div style="padding: 0.75rem 0; border-bottom: 1px solid var(--border); display: flex; gap: 1rem; align-items: flex-start;">
+                    <div style="width: 20px; height: 20px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 12px; flex-shrink: 0; background: var(--green); color: white;">✓</div>
+                    <div style="flex: 1;">
+                        <div style="font-weight: 500;"><span class="string-text">Website</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.9rem;">Key: <span class="string-key">label.website</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.8rem; font-family: monospace;">templates/*.go</div>
+                    </div>
+                </div>
+                
+                
+                
+                <div style="padding: 0.75rem 0; border-bottom: 1px solid var(--border); display: flex; gap: 1rem; align-items: flex-start;">
+                    <div style="width: 20px; height: 20px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 12px; flex-shrink: 0; background: var(--green); color: white;">✓</div>
+                    <div style="flex: 1;">
+                        <div style="font-weight: 500;"><span class="string-text">replying to</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.9rem;">Key: <span class="string-key">label.replying_to</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.8rem; font-family: monospace;">templates/*.go</div>
+                    </div>
+                </div>
+                
+                
+                
+                <div style="padding: 0.75rem 0; border-bottom: 1px solid var(--border); display: flex; gap: 1rem; align-items: flex-start;">
+                    <div style="width: 20px; height: 20px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 12px; flex-shrink: 0; background: var(--green); color: white;">✓</div>
+                    <div style="flex: 1;">
+                        <div style="font-weight: 500;"><span class="string-text">reposted</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.9rem;">Key: <span class="string-key">label.reposted</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.8rem; font-family: monospace;">templates/*.go</div>
+                    </div>
+                </div>
+                
+                
+                
+                <div style="padding: 0.75rem 0; border-bottom: 1px solid var(--border); display: flex; gap: 1rem; align-items: flex-start;">
+                    <div style="width: 20px; height: 20px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 12px; flex-shrink: 0; background: var(--green); color: white;">✓</div>
+                    <div style="flex: 1;">
+                        <div style="font-weight: 500;"><span class="string-text">to reply</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.9rem;">Key: <span class="string-key">label.to_reply</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.8rem; font-family: monospace;">templates/*.go</div>
+                    </div>
+                </div>
+                
+                
+                
+                <div style="padding: 0.75rem 0; border-bottom: 1px solid var(--border); display: flex; gap: 1rem; align-items: flex-start;">
+                    <div style="width: 20px; height: 20px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 12px; flex-shrink: 0; background: var(--green); color: white;">✓</div>
+                    <div style="flex: 1;">
+                        <div style="font-weight: 500;"><span class="string-text">zapped</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.9rem;">Key: <span class="string-key">label.zapped</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.8rem; font-family: monospace;">templates/*.go</div>
+                    </div>
+                </div>
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+            </div>
+        </div>
+        
+        
+        <div class="section">
+            <div class="section-header" onclick="this.parentElement.classList.toggle('open')">
+                <span>
+                    <span style="font-family: monospace; color: var(--blue);">Navigation &amp; Actions</span>
+                </span>
+                <div style="display: flex; gap: 1rem;">
+                    <span style="padding: 0.2rem 0.5rem; border-radius: 4px; font-size: 0.85rem; background: rgba(35,134,54,0.2); color: var(--green);">12 passed</span>
+                    
+                </div>
+            </div>
+            <div class="section-content">
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                <div style="padding: 0.75rem 0; border-bottom: 1px solid var(--border); display: flex; gap: 1rem; align-items: flex-start;">
+                    <div style="width: 20px; height: 20px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 12px; flex-shrink: 0; background: var(--green); color: white;">✓</div>
+                    <div style="flex: 1;">
+                        <div style="font-weight: 500;"><span class="string-text">Load More</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.9rem;">Key: <span class="string-key">nav.load_more</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.8rem; font-family: monospace;">templates/*.go</div>
+                    </div>
+                </div>
+                
+                
+                
+                <div style="padding: 0.75rem 0; border-bottom: 1px solid var(--border); display: flex; gap: 1rem; align-items: flex-start;">
+                    <div style="width: 20px; height: 20px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 12px; flex-shrink: 0; background: var(--green); color: white;">✓</div>
+                    <div style="flex: 1;">
+                        <div style="font-weight: 500;"><span class="string-text">Read article</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.9rem;">Key: <span class="string-key">nav.read_article</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.8rem; font-family: monospace;">templates/*.go</div>
+                    </div>
+                </div>
+                
+                
+                
+                <div style="padding: 0.75rem 0; border-bottom: 1px solid var(--border); display: flex; gap: 1rem; align-items: flex-start;">
+                    <div style="width: 20px; height: 20px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 12px; flex-shrink: 0; background: var(--green); color: white;">✓</div>
+                    <div style="flex: 1;">
+                        <div style="font-weight: 500;"><span class="string-text">View note</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.9rem;">Key: <span class="string-key">nav.view_note</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.8rem; font-family: monospace;">templates/*.go</div>
+                    </div>
+                </div>
+                
+                
+                
+                <div style="padding: 0.75rem 0; border-bottom: 1px solid var(--border); display: flex; gap: 1rem; align-items: flex-start;">
+                    <div style="width: 20px; height: 20px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 12px; flex-shrink: 0; background: var(--green); color: white;">✓</div>
+                    <div style="flex: 1;">
+                        <div style="font-weight: 500;"><span class="string-text">View original note</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.9rem;">Key: <span class="string-key">nav.view_original_note</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.8rem; font-family: monospace;">templates/*.go</div>
+                    </div>
+                </div>
+                
+                
+                
+                <div style="padding: 0.75rem 0; border-bottom: 1px solid var(--border); display: flex; gap: 1rem; align-items: flex-start;">
+                    <div style="width: 20px; height: 20px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 12px; flex-shrink: 0; background: var(--green); color: white;">✓</div>
+                    <div style="flex: 1;">
+                        <div style="font-weight: 500;"><span class="string-text">View quoted note</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.9rem;">Key: <span class="string-key">nav.view_quoted_note</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.8rem; font-family: monospace;">templates/*.go</div>
+                    </div>
+                </div>
+                
+                
+                
+                <div style="padding: 0.75rem 0; border-bottom: 1px solid var(--border); display: flex; gap: 1rem; align-items: flex-start;">
+                    <div style="width: 20px; height: 20px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 12px; flex-shrink: 0; background: var(--green); color: white;">✓</div>
+                    <div style="flex: 1;">
+                        <div style="font-weight: 500;"><span class="string-text">View thread</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.9rem;">Key: <span class="string-key">nav.view_thread</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.8rem; font-family: monospace;">templates/*.go</div>
+                    </div>
+                </div>
+                
+                
+                
+                <div style="padding: 0.75rem 0; border-bottom: 1px solid var(--border); display: flex; gap: 1rem; align-items: flex-start;">
+                    <div style="width: 20px; height: 20px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 12px; flex-shrink: 0; background: var(--green); color: white;">✓</div>
+                    <div style="flex: 1;">
+                        <div style="font-weight: 500;"><span class="string-text">View zapped note</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.9rem;">Key: <span class="string-key">nav.view_zapped_note</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.8rem; font-family: monospace;">templates/*.go</div>
+                    </div>
+                </div>
+                
+                
+                
+                <div style="padding: 0.75rem 0; border-bottom: 1px solid var(--border); display: flex; gap: 1rem; align-items: flex-start;">
+                    <div style="width: 20px; height: 20px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 12px; flex-shrink: 0; background: var(--green); color: white;">✓</div>
+                    <div style="flex: 1;">
+                        <div style="font-weight: 500;"><span class="string-text">Watch Recording</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.9rem;">Key: <span class="string-key">nav.watch_recording</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.8rem; font-family: monospace;">templates/*.go</div>
+                    </div>
+                </div>
+                
+                
+                
+                <div style="padding: 0.75rem 0; border-bottom: 1px solid var(--border); display: flex; gap: 1rem; align-items: flex-start;">
+                    <div style="width: 20px; height: 20px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 12px; flex-shrink: 0; background: var(--green); color: white;">✓</div>
+                    <div style="flex: 1;">
+                        <div style="font-weight: 500;"><span class="string-text">Watch Stream</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.9rem;">Key: <span class="string-key">nav.watch_stream</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.8rem; font-family: monospace;">templates/*.go</div>
+                    </div>
+                </div>
+                
+                
+                
+                <div style="padding: 0.75rem 0; border-bottom: 1px solid var(--border); display: flex; gap: 1rem; align-items: flex-start;">
+                    <div style="width: 20px; height: 20px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 12px; flex-shrink: 0; background: var(--green); color: white;">✓</div>
+                    <div style="flex: 1;">
+                        <div style="font-weight: 500;"><span class="string-text">Watch on zap.stream</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.9rem;">Key: <span class="string-key">nav.watch_zap_stream</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.8rem; font-family: monospace;">templates/*.go</div>
+                    </div>
+                </div>
+                
+                
+                
+                <div style="padding: 0.75rem 0; border-bottom: 1px solid var(--border); display: flex; gap: 1rem; align-items: flex-start;">
+                    <div style="width: 20px; height: 20px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 12px; flex-shrink: 0; background: var(--green); color: white;">✓</div>
+                    <div style="flex: 1;">
+                        <div style="font-weight: 500;"><span class="string-text">notifications</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.9rem;">Key: <span class="string-key">nav.notifications</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.8rem; font-family: monospace;">config/navigation.json</div>
+                    </div>
+                </div>
+                
+                
+                
+                <div style="padding: 0.75rem 0; border-bottom: 1px solid var(--border); display: flex; gap: 1rem; align-items: flex-start;">
+                    <div style="width: 20px; height: 20px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 12px; flex-shrink: 0; background: var(--green); color: white;">✓</div>
+                    <div style="flex: 1;">
+                        <div style="font-weight: 500;"><span class="string-text">search</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.9rem;">Key: <span class="string-key">nav.search</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.8rem; font-family: monospace;">config/navigation.json</div>
+                    </div>
+                </div>
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+            </div>
+        </div>
+        
+        
+        <div class="section">
+            <div class="section-header" onclick="this.parentElement.classList.toggle('open')">
+                <span>
+                    <span style="font-family: monospace; color: var(--blue);">Buttons &amp; Links</span>
+                </span>
+                <div style="display: flex; gap: 1rem;">
+                    <span style="padding: 0.2rem 0.5rem; border-radius: 4px; font-size: 0.85rem; background: rgba(35,134,54,0.2); color: var(--green);">9 passed</span>
+                    
+                </div>
+            </div>
+            <div class="section-content">
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                <div style="padding: 0.75rem 0; border-bottom: 1px solid var(--border); display: flex; gap: 1rem; align-items: flex-start;">
+                    <div style="width: 20px; height: 20px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 12px; flex-shrink: 0; background: var(--green); color: white;">✓</div>
+                    <div style="flex: 1;">
+                        <div style="font-weight: 500;"><span class="string-text">Cancel</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.9rem;">Key: <span class="string-key">btn.cancel</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.8rem; font-family: monospace;">templates/*.go</div>
+                    </div>
+                </div>
+                
+                
+                
+                <div style="padding: 0.75rem 0; border-bottom: 1px solid var(--border); display: flex; gap: 1rem; align-items: flex-start;">
+                    <div style="width: 20px; height: 20px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 12px; flex-shrink: 0; background: var(--green); color: white;">✓</div>
+                    <div style="flex: 1;">
+                        <div style="font-weight: 500;"><span class="string-text">Follow</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.9rem;">Key: <span class="string-key">btn.follow</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.8rem; font-family: monospace;">templates/*.go</div>
+                    </div>
+                </div>
+                
+                
+                
+                <div style="padding: 0.75rem 0; border-bottom: 1px solid var(--border); display: flex; gap: 1rem; align-items: flex-start;">
+                    <div style="width: 20px; height: 20px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 12px; flex-shrink: 0; background: var(--green); color: white;">✓</div>
+                    <div style="flex: 1;">
+                        <div style="font-weight: 500;"><span class="string-text">Login</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.9rem;">Key: <span class="string-key">btn.login</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.8rem; font-family: monospace;">templates/*.go</div>
+                    </div>
+                </div>
+                
+                
+                
+                <div style="padding: 0.75rem 0; border-bottom: 1px solid var(--border); display: flex; gap: 1rem; align-items: flex-start;">
+                    <div style="width: 20px; height: 20px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 12px; flex-shrink: 0; background: var(--green); color: white;">✓</div>
+                    <div style="flex: 1;">
+                        <div style="font-weight: 500;"><span class="string-text">Post</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.9rem;">Key: <span class="string-key">btn.post</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.8rem; font-family: monospace;">templates/*.go</div>
+                    </div>
+                </div>
+                
+                
+                
+                <div style="padding: 0.75rem 0; border-bottom: 1px solid var(--border); display: flex; gap: 1rem; align-items: flex-start;">
+                    <div style="width: 20px; height: 20px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 12px; flex-shrink: 0; background: var(--green); color: white;">✓</div>
+                    <div style="flex: 1;">
+                        <div style="font-weight: 500;"><span class="string-text">Post Commentary</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.9rem;">Key: <span class="string-key">btn.post_commentary</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.8rem; font-family: monospace;">templates/*.go</div>
+                    </div>
+                </div>
+                
+                
+                
+                <div style="padding: 0.75rem 0; border-bottom: 1px solid var(--border); display: flex; gap: 1rem; align-items: flex-start;">
+                    <div style="width: 20px; height: 20px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 12px; flex-shrink: 0; background: var(--green); color: white;">✓</div>
+                    <div style="flex: 1;">
+                        <div style="font-weight: 500;"><span class="string-text">Reply</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.9rem;">Key: <span class="string-key">btn.reply</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.8rem; font-family: monospace;">templates/*.go</div>
+                    </div>
+                </div>
+                
+                
+                
+                <div style="padding: 0.75rem 0; border-bottom: 1px solid var(--border); display: flex; gap: 1rem; align-items: flex-start;">
+                    <div style="width: 20px; height: 20px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 12px; flex-shrink: 0; background: var(--green); color: white;">✓</div>
+                    <div style="flex: 1;">
+                        <div style="font-weight: 500;"><span class="string-text">Save Profile</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.9rem;">Key: <span class="string-key">btn.save_profile</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.8rem; font-family: monospace;">templates/*.go</div>
+                    </div>
+                </div>
+                
+                
+                
+                <div style="padding: 0.75rem 0; border-bottom: 1px solid var(--border); display: flex; gap: 1rem; align-items: flex-start;">
+                    <div style="width: 20px; height: 20px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 12px; flex-shrink: 0; background: var(--green); color: white;">✓</div>
+                    <div style="flex: 1;">
+                        <div style="font-weight: 500;"><span class="string-text">Search</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.9rem;">Key: <span class="string-key">btn.search</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.8rem; font-family: monospace;">templates/*.go</div>
+                    </div>
+                </div>
+                
+                
+                
+                <div style="padding: 0.75rem 0; border-bottom: 1px solid var(--border); display: flex; gap: 1rem; align-items: flex-start;">
+                    <div style="width: 20px; height: 20px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 12px; flex-shrink: 0; background: var(--green); color: white;">✓</div>
+                    <div style="flex: 1;">
+                        <div style="font-weight: 500;"><span class="string-text">Unfollow</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.9rem;">Key: <span class="string-key">btn.unfollow</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.8rem; font-family: monospace;">templates/*.go</div>
+                    </div>
+                </div>
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+            </div>
+        </div>
+        
+        
+        <div class="section">
+            <div class="section-header" onclick="this.parentElement.classList.toggle('open')">
+                <span>
+                    <span style="font-family: monospace; color: var(--blue);">Actions (config)</span>
+                </span>
+                <div style="display: flex; gap: 1rem;">
+                    <span style="padding: 0.2rem 0.5rem; border-radius: 4px; font-size: 0.85rem; background: rgba(35,134,54,0.2); color: var(--green);">9 passed</span>
+                    
+                </div>
+            </div>
+            <div class="section-content">
+                
+                
+                <div style="padding: 0.75rem 0; border-bottom: 1px solid var(--border); display: flex; gap: 1rem; align-items: flex-start;">
+                    <div style="width: 20px; height: 20px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 12px; flex-shrink: 0; background: var(--green); color: white;">✓</div>
+                    <div style="flex: 1;">
+                        <div style="font-weight: 500;"><span class="string-text">bookmark</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.9rem;">Key: <span class="string-key">action.bookmark</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.8rem; font-family: monospace;">config/actions.json</div>
+                    </div>
+                </div>
+                
+                
+                
+                <div style="padding: 0.75rem 0; border-bottom: 1px solid var(--border); display: flex; gap: 1rem; align-items: flex-start;">
+                    <div style="width: 20px; height: 20px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 12px; flex-shrink: 0; background: var(--green); color: white;">✓</div>
+                    <div style="flex: 1;">
+                        <div style="font-weight: 500;"><span class="string-text">mute</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.9rem;">Key: <span class="string-key">action.mute</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.8rem; font-family: monospace;">config/actions.json</div>
+                    </div>
+                </div>
+                
+                
+                
+                <div style="padding: 0.75rem 0; border-bottom: 1px solid var(--border); display: flex; gap: 1rem; align-items: flex-start;">
+                    <div style="width: 20px; height: 20px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 12px; flex-shrink: 0; background: var(--green); color: white;">✓</div>
+                    <div style="flex: 1;">
+                        <div style="font-weight: 500;"><span class="string-text">quote</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.9rem;">Key: <span class="string-key">action.quote</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.8rem; font-family: monospace;">config/actions.json</div>
+                    </div>
+                </div>
+                
+                
+                
+                <div style="padding: 0.75rem 0; border-bottom: 1px solid var(--border); display: flex; gap: 1rem; align-items: flex-start;">
+                    <div style="width: 20px; height: 20px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 12px; flex-shrink: 0; background: var(--green); color: white;">✓</div>
+                    <div style="flex: 1;">
+                        <div style="font-weight: 500;"><span class="string-text">react</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.9rem;">Key: <span class="string-key">action.react</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.8rem; font-family: monospace;">config/actions.json</div>
+                    </div>
+                </div>
+                
+                
+                
+                <div style="padding: 0.75rem 0; border-bottom: 1px solid var(--border); display: flex; gap: 1rem; align-items: flex-start;">
+                    <div style="width: 20px; height: 20px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 12px; flex-shrink: 0; background: var(--green); color: white;">✓</div>
+                    <div style="flex: 1;">
+                        <div style="font-weight: 500;"><span class="string-text">read</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.9rem;">Key: <span class="string-key">action.read</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.8rem; font-family: monospace;">config/actions.json</div>
+                    </div>
+                </div>
+                
+                
+                
+                <div style="padding: 0.75rem 0; border-bottom: 1px solid var(--border); display: flex; gap: 1rem; align-items: flex-start;">
+                    <div style="width: 20px; height: 20px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 12px; flex-shrink: 0; background: var(--green); color: white;">✓</div>
+                    <div style="flex: 1;">
+                        <div style="font-weight: 500;"><span class="string-text">reply</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.9rem;">Key: <span class="string-key">action.reply</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.8rem; font-family: monospace;">config/actions.json</div>
+                    </div>
+                </div>
+                
+                
+                
+                <div style="padding: 0.75rem 0; border-bottom: 1px solid var(--border); display: flex; gap: 1rem; align-items: flex-start;">
+                    <div style="width: 20px; height: 20px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 12px; flex-shrink: 0; background: var(--green); color: white;">✓</div>
+                    <div style="flex: 1;">
+                        <div style="font-weight: 500;"><span class="string-text">report</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.9rem;">Key: <span class="string-key">action.report</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.8rem; font-family: monospace;">config/actions.json</div>
+                    </div>
+                </div>
+                
+                
+                
+                <div style="padding: 0.75rem 0; border-bottom: 1px solid var(--border); display: flex; gap: 1rem; align-items: flex-start;">
+                    <div style="width: 20px; height: 20px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 12px; flex-shrink: 0; background: var(--green); color: white;">✓</div>
+                    <div style="flex: 1;">
+                        <div style="font-weight: 500;"><span class="string-text">repost</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.9rem;">Key: <span class="string-key">action.repost</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.8rem; font-family: monospace;">config/actions.json</div>
+                    </div>
+                </div>
+                
+                
+                
+                <div style="padding: 0.75rem 0; border-bottom: 1px solid var(--border); display: flex; gap: 1rem; align-items: flex-start;">
+                    <div style="width: 20px; height: 20px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 12px; flex-shrink: 0; background: var(--green); color: white;">✓</div>
+                    <div style="flex: 1;">
+                        <div style="font-weight: 500;"><span class="string-text">zap</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.9rem;">Key: <span class="string-key">action.zap</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.8rem; font-family: monospace;">config/actions.json</div>
+                    </div>
+                </div>
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+            </div>
+        </div>
+        
+        
+        <div class="section">
+            <div class="section-header" onclick="this.parentElement.classList.toggle('open')">
+                <span>
+                    <span style="font-family: monospace; color: var(--blue);">Messages &amp; Prompts</span>
+                </span>
+                <div style="display: flex; gap: 1rem;">
+                    <span style="padding: 0.2rem 0.5rem; border-radius: 4px; font-size: 0.85rem; background: rgba(35,134,54,0.2); color: var(--green);">6 passed</span>
+                    
+                </div>
+            </div>
+            <div class="section-content">
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                <div style="padding: 0.75rem 0; border-bottom: 1px solid var(--border); display: flex; gap: 1rem; align-items: flex-start;">
+                    <div style="width: 20px; height: 20px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 12px; flex-shrink: 0; background: var(--green); color: white;">✓</div>
+                    <div style="flex: 1;">
+                        <div style="font-weight: 500;"><span class="string-text">Live Event</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.9rem;">Key: <span class="string-key">msg.live_event</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.8rem; font-family: monospace;">templates/*.go</div>
+                    </div>
+                </div>
+                
+                
+                
+                <div style="padding: 0.75rem 0; border-bottom: 1px solid var(--border); display: flex; gap: 1rem; align-items: flex-start;">
+                    <div style="width: 20px; height: 20px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 12px; flex-shrink: 0; background: var(--green); color: white;">✓</div>
+                    <div style="flex: 1;">
+                        <div style="font-weight: 500;"><span class="string-text">No notifications</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.9rem;">Key: <span class="string-key">msg.no_notifications</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.8rem; font-family: monospace;">templates/*.go</div>
+                    </div>
+                </div>
+                
+                
+                
+                <div style="padding: 0.75rem 0; border-bottom: 1px solid var(--border); display: flex; gap: 1rem; align-items: flex-start;">
+                    <div style="width: 20px; height: 20px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 12px; flex-shrink: 0; background: var(--green); color: white;">✓</div>
+                    <div style="flex: 1;">
+                        <div style="font-weight: 500;"><span class="string-text">Reposted note not available</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.9rem;">Key: <span class="string-key">msg.repost_not_available</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.8rem; font-family: monospace;">templates/*.go</div>
+                    </div>
+                </div>
+                
+                
+                
+                <div style="padding: 0.75rem 0; border-bottom: 1px solid var(--border); display: flex; gap: 1rem; align-items: flex-start;">
+                    <div style="width: 20px; height: 20px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 12px; flex-shrink: 0; background: var(--green); color: white;">✓</div>
+                    <div style="flex: 1;">
+                        <div style="font-weight: 500;"><span class="string-text">Untitled</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.9rem;">Key: <span class="string-key">msg.untitled</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.8rem; font-family: monospace;">templates/*.go</div>
+                    </div>
+                </div>
+                
+                
+                
+                <div style="padding: 0.75rem 0; border-bottom: 1px solid var(--border); display: flex; gap: 1rem; align-items: flex-start;">
+                    <div style="width: 20px; height: 20px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 12px; flex-shrink: 0; background: var(--green); color: white;">✓</div>
+                    <div style="flex: 1;">
+                        <div style="font-weight: 500;"><span class="string-text">Video not available</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.9rem;">Key: <span class="string-key">msg.video_not_available</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.8rem; font-family: monospace;">templates/*.go</div>
+                    </div>
+                </div>
+                
+                
+                
+                <div style="padding: 0.75rem 0; border-bottom: 1px solid var(--border); display: flex; gap: 1rem; align-items: flex-start;">
+                    <div style="width: 20px; height: 20px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 12px; flex-shrink: 0; background: var(--green); color: white;">✓</div>
+                    <div style="flex: 1;">
+                        <div style="font-weight: 500;"><span class="string-text">Your browser does not support</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.9rem;">Key: <span class="string-key">msg.browser_not_supported</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.8rem; font-family: monospace;">templates/*.go</div>
+                    </div>
+                </div>
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+            </div>
+        </div>
+        
+        
+        <div class="section">
+            <div class="section-header" onclick="this.parentElement.classList.toggle('open')">
+                <span>
+                    <span style="font-family: monospace; color: var(--blue);">Kind Filters (config)</span>
+                </span>
+                <div style="display: flex; gap: 1rem;">
+                    <span style="padding: 0.2rem 0.5rem; border-radius: 4px; font-size: 0.85rem; background: rgba(35,134,54,0.2); color: var(--green);">6 passed</span>
+                    
+                </div>
+            </div>
+            <div class="section-content">
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                <div style="padding: 0.75rem 0; border-bottom: 1px solid var(--border); display: flex; gap: 1rem; align-items: flex-start;">
+                    <div style="width: 20px; height: 20px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 12px; flex-shrink: 0; background: var(--green); color: white;">✓</div>
+                    <div style="flex: 1;">
+                        <div style="font-weight: 500;"><span class="string-text">all</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.9rem;">Key: <span class="string-key">kind.all</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.8rem; font-family: monospace;">config/navigation.json</div>
+                    </div>
+                </div>
+                
+                
+                
+                <div style="padding: 0.75rem 0; border-bottom: 1px solid var(--border); display: flex; gap: 1rem; align-items: flex-start;">
+                    <div style="width: 20px; height: 20px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 12px; flex-shrink: 0; background: var(--green); color: white;">✓</div>
+                    <div style="flex: 1;">
+                        <div style="font-weight: 500;"><span class="string-text">longform</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.9rem;">Key: <span class="string-key">kind.longform</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.8rem; font-family: monospace;">config/navigation.json</div>
+                    </div>
+                </div>
+                
+                
+                
+                <div style="padding: 0.75rem 0; border-bottom: 1px solid var(--border); display: flex; gap: 1rem; align-items: flex-start;">
+                    <div style="width: 20px; height: 20px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 12px; flex-shrink: 0; background: var(--green); color: white;">✓</div>
+                    <div style="flex: 1;">
+                        <div style="font-weight: 500;"><span class="string-text">more</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.9rem;">Key: <span class="string-key">kind.more</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.8rem; font-family: monospace;">config/navigation.json</div>
+                    </div>
+                </div>
+                
+                
+                
+                <div style="padding: 0.75rem 0; border-bottom: 1px solid var(--border); display: flex; gap: 1rem; align-items: flex-start;">
+                    <div style="width: 20px; height: 20px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 12px; flex-shrink: 0; background: var(--green); color: white;">✓</div>
+                    <div style="flex: 1;">
+                        <div style="font-weight: 500;"><span class="string-text">notes</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.9rem;">Key: <span class="string-key">kind.notes</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.8rem; font-family: monospace;">config/navigation.json</div>
+                    </div>
+                </div>
+                
+                
+                
+                <div style="padding: 0.75rem 0; border-bottom: 1px solid var(--border); display: flex; gap: 1rem; align-items: flex-start;">
+                    <div style="width: 20px; height: 20px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 12px; flex-shrink: 0; background: var(--green); color: white;">✓</div>
+                    <div style="flex: 1;">
+                        <div style="font-weight: 500;"><span class="string-text">photos</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.9rem;">Key: <span class="string-key">kind.photos</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.8rem; font-family: monospace;">config/navigation.json</div>
+                    </div>
+                </div>
+                
+                
+                
+                <div style="padding: 0.75rem 0; border-bottom: 1px solid var(--border); display: flex; gap: 1rem; align-items: flex-start;">
+                    <div style="width: 20px; height: 20px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 12px; flex-shrink: 0; background: var(--green); color: white;">✓</div>
+                    <div style="flex: 1;">
+                        <div style="font-weight: 500;"><span class="string-text">videos</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.9rem;">Key: <span class="string-key">kind.videos</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.8rem; font-family: monospace;">config/navigation.json</div>
+                    </div>
+                </div>
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+            </div>
+        </div>
+        
+        
+        <div class="section">
+            <div class="section-header" onclick="this.parentElement.classList.toggle('open')">
+                <span>
+                    <span style="font-family: monospace; color: var(--blue);">Status Indicators</span>
+                </span>
+                <div style="display: flex; gap: 1rem;">
+                    <span style="padding: 0.2rem 0.5rem; border-radius: 4px; font-size: 0.85rem; background: rgba(35,134,54,0.2); color: var(--green);">5 passed</span>
+                    
+                </div>
+            </div>
+            <div class="section-content">
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                <div style="padding: 0.75rem 0; border-bottom: 1px solid var(--border); display: flex; gap: 1rem; align-items: flex-start;">
+                    <div style="width: 20px; height: 20px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 12px; flex-shrink: 0; background: var(--green); color: white;">✓</div>
+                    <div style="flex: 1;">
+                        <div style="font-weight: 500;"><span class="string-text">ENDED</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.9rem;">Key: <span class="string-key">status.ended</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.8rem; font-family: monospace;">templates/*.go</div>
+                    </div>
+                </div>
+                
+                
+                
+                <div style="padding: 0.75rem 0; border-bottom: 1px solid var(--border); display: flex; gap: 1rem; align-items: flex-start;">
+                    <div style="width: 20px; height: 20px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 12px; flex-shrink: 0; background: var(--green); color: white;">✓</div>
+                    <div style="flex: 1;">
+                        <div style="font-weight: 500;"><span class="string-text">LIVE</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.9rem;">Key: <span class="string-key">status.live</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.8rem; font-family: monospace;">templates/*.go</div>
+                    </div>
+                </div>
+                
+                
+                
+                <div style="padding: 0.75rem 0; border-bottom: 1px solid var(--border); display: flex; gap: 1rem; align-items: flex-start;">
+                    <div style="width: 20px; height: 20px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 12px; flex-shrink: 0; background: var(--green); color: white;">✓</div>
+                    <div style="flex: 1;">
+                        <div style="font-weight: 500;"><span class="string-text">Loading</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.9rem;">Key: <span class="string-key">status.loading</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.8rem; font-family: monospace;">templates/*.go</div>
+                    </div>
+                </div>
+                
+                
+                
+                <div style="padding: 0.75rem 0; border-bottom: 1px solid var(--border); display: flex; gap: 1rem; align-items: flex-start;">
+                    <div style="width: 20px; height: 20px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 12px; flex-shrink: 0; background: var(--green); color: white;">✓</div>
+                    <div style="flex: 1;">
+                        <div style="font-weight: 500;"><span class="string-text">SCHEDULED</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.9rem;">Key: <span class="string-key">status.scheduled</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.8rem; font-family: monospace;">templates/*.go</div>
+                    </div>
+                </div>
+                
+                
+                
+                <div style="padding: 0.75rem 0; border-bottom: 1px solid var(--border); display: flex; gap: 1rem; align-items: flex-start;">
+                    <div style="width: 20px; height: 20px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 12px; flex-shrink: 0; background: var(--green); color: white;">✓</div>
+                    <div style="flex: 1;">
+                        <div style="font-weight: 500;"><span class="string-text">watching</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.9rem;">Key: <span class="string-key">status.watching</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.8rem; font-family: monospace;">templates/*.go</div>
+                    </div>
+                </div>
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+            </div>
+        </div>
+        
+        
+        <div class="section">
+            <div class="section-header" onclick="this.parentElement.classList.toggle('open')">
+                <span>
+                    <span style="font-family: monospace; color: var(--blue);">Date &amp; Time</span>
+                </span>
+                <div style="display: flex; gap: 1rem;">
+                    <span style="padding: 0.2rem 0.5rem; border-radius: 4px; font-size: 0.85rem; background: rgba(35,134,54,0.2); color: var(--green);">9 passed</span>
+                    
+                </div>
+            </div>
+            <div class="section-content">
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                <div style="padding: 0.75rem 0; border-bottom: 1px solid var(--border); display: flex; gap: 1rem; align-items: flex-start;">
+                    <div style="width: 20px; height: 20px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 12px; flex-shrink: 0; background: var(--green); color: white;">✓</div>
+                    <div style="flex: 1;">
+                        <div style="font-weight: 500;"><span class="string-text">Ended:</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.9rem;">Key: <span class="string-key">time.ended</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.8rem; font-family: monospace;">templates/*.go</div>
+                    </div>
+                </div>
+                
+                
+                
+                <div style="padding: 0.75rem 0; border-bottom: 1px solid var(--border); display: flex; gap: 1rem; align-items: flex-start;">
+                    <div style="width: 20px; height: 20px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 12px; flex-shrink: 0; background: var(--green); color: white;">✓</div>
+                    <div style="flex: 1;">
+                        <div style="font-weight: 500;"><span class="string-text">Started:</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.9rem;">Key: <span class="string-key">time.started</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.8rem; font-family: monospace;">templates/*.go</div>
+                    </div>
+                </div>
+                
+                
+                
+                <div style="padding: 0.75rem 0; border-bottom: 1px solid var(--border); display: flex; gap: 1rem; align-items: flex-start;">
+                    <div style="width: 20px; height: 20px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 12px; flex-shrink: 0; background: var(--green); color: white;">✓</div>
+                    <div style="flex: 1;">
+                        <div style="font-weight: 500;"><span class="string-text">Starts:</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.9rem;">Key: <span class="string-key">time.starts</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.8rem; font-family: monospace;">templates/*.go</div>
+                    </div>
+                </div>
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                <div style="padding: 0.75rem 0; border-bottom: 1px solid var(--border); display: flex; gap: 1rem; align-items: flex-start;">
+                    <div style="width: 20px; height: 20px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 12px; flex-shrink: 0; background: var(--green); color: white;">✓</div>
+                    <div style="flex: 1;">
+                        <div style="font-weight: 500;">Time formatting used</div>
+                        <div style="color: var(--text-muted); font-size: 0.9rem;">Codebase uses time formatting</div>
+                        <div style="color: var(--text-muted); font-size: 0.8rem; font-family: monospace;">*.go</div>
+                    </div>
+                </div>
+                
+                
+                
+                <div style="padding: 0.75rem 0; border-bottom: 1px solid var(--border); display: flex; gap: 1rem; align-items: flex-start;">
+                    <div style="width: 20px; height: 20px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 12px; flex-shrink: 0; background: var(--green); color: white;">✓</div>
+                    <div style="flex: 1;">
+                        <div style="font-weight: 500;">Datetime attributes</div>
+                        <div style="color: var(--text-muted); font-size: 0.9rem;">HTML time elements use datetime attribute</div>
+                        <div style="color: var(--text-muted); font-size: 0.8rem; font-family: monospace;">templates/*.go</div>
+                    </div>
+                </div>
+                
+                
+                
+                <div style="padding: 0.75rem 0; border-bottom: 1px solid var(--border); display: flex; gap: 1rem; align-items: flex-start;">
+                    <div style="width: 20px; height: 20px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 12px; flex-shrink: 0; background: var(--green); color: white;">✓</div>
+                    <div style="flex: 1;">
+                        <div style="font-weight: 500;">Semantic time elements</div>
+                        <div style="color: var(--text-muted); font-size: 0.9rem;">Uses &lt;time&gt; elements for dates</div>
+                        <div style="color: var(--text-muted); font-size: 0.8rem; font-family: monospace;">templates/*.go</div>
+                    </div>
+                </div>
+                
+                
+                
+                <div style="padding: 0.75rem 0; border-bottom: 1px solid var(--border); display: flex; gap: 1rem; align-items: flex-start;">
+                    <div style="width: 20px; height: 20px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 12px; flex-shrink: 0; background: var(--green); color: white;">✓</div>
+                    <div style="flex: 1;">
+                        <div style="font-weight: 500;">Relative time display</div>
+                        <div style="color: var(--text-muted); font-size: 0.9rem;">Uses relative time patterns (ago, today, etc.)</div>
+                        <div style="color: var(--text-muted); font-size: 0.8rem; font-family: monospace;">*.go</div>
+                    </div>
+                </div>
+                
+                
+                
+                <div style="padding: 0.75rem 0; border-bottom: 1px solid var(--border); display: flex; gap: 1rem; align-items: flex-start;">
+                    <div style="width: 20px; height: 20px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 12px; flex-shrink: 0; background: var(--green); color: white;">✓</div>
+                    <div style="flex: 1;">
+                        <div style="font-weight: 500;">Timezone awareness</div>
+                        <div style="color: var(--text-muted); font-size: 0.9rem;">Code handles timezones</div>
+                        <div style="color: var(--text-muted); font-size: 0.8rem; font-family: monospace;">*.go</div>
+                    </div>
+                </div>
+                
+                
+                
+                <div style="padding: 0.75rem 0; border-bottom: 1px solid var(--border); display: flex; gap: 1rem; align-items: flex-start;">
+                    <div style="width: 20px; height: 20px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 12px; flex-shrink: 0; background: var(--green); color: white;">✓</div>
+                    <div style="flex: 1;">
+                        <div style="font-weight: 500;">Unix timestamps</div>
+                        <div style="color: var(--text-muted); font-size: 0.9rem;">Uses Unix timestamps (locale-independent storage)</div>
+                        <div style="color: var(--text-muted); font-size: 0.8rem; font-family: monospace;">*.go</div>
+                    </div>
+                </div>
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+            </div>
+        </div>
+        
+        
+        <div class="section">
+            <div class="section-header" onclick="this.parentElement.classList.toggle('open')">
+                <span>
+                    <span style="font-family: monospace; color: var(--blue);">Feed Modes (config)</span>
+                </span>
+                <div style="display: flex; gap: 1rem;">
+                    <span style="padding: 0.2rem 0.5rem; border-radius: 4px; font-size: 0.85rem; background: rgba(35,134,54,0.2); color: var(--green);">2 passed</span>
+                    
+                </div>
+            </div>
+            <div class="section-content">
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                <div style="padding: 0.75rem 0; border-bottom: 1px solid var(--border); display: flex; gap: 1rem; align-items: flex-start;">
+                    <div style="width: 20px; height: 20px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 12px; flex-shrink: 0; background: var(--green); color: white;">✓</div>
+                    <div style="flex: 1;">
+                        <div style="font-weight: 500;"><span class="string-text">follows</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.9rem;">Key: <span class="string-key">feed.follows</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.8rem; font-family: monospace;">config/navigation.json</div>
+                    </div>
+                </div>
+                
+                
+                
+                <div style="padding: 0.75rem 0; border-bottom: 1px solid var(--border); display: flex; gap: 1rem; align-items: flex-start;">
+                    <div style="width: 20px; height: 20px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 12px; flex-shrink: 0; background: var(--green); color: white;">✓</div>
+                    <div style="flex: 1;">
+                        <div style="font-weight: 500;"><span class="string-text">global</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.9rem;">Key: <span class="string-key">feed.global</span></div>
+                        <div style="color: var(--text-muted); font-size: 0.8rem; font-family: monospace;">config/navigation.json</div>
+                    </div>
+                </div>
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+            </div>
+        </div>
+        
+        
+        <div class="section">
+            <div class="section-header" onclick="this.parentElement.classList.toggle('open')">
+                <span>
+                    <span style="font-family: monospace; color: var(--blue);">Pluralization</span>
+                </span>
+                <div style="display: flex; gap: 1rem;">
+                    <span style="padding: 0.2rem 0.5rem; border-radius: 4px; font-size: 0.85rem; background: rgba(35,134,54,0.2); color: var(--green);">4 passed</span>
+                    
+                </div>
+            </div>
+            <div class="section-content">
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                <div style="padding: 0.75rem 0; border-bottom: 1px solid var(--border); display: flex; gap: 1rem; align-items: flex-start;">
+                    <div style="width: 20px; height: 20px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 12px; flex-shrink: 0; background: var(--green); color: white;">✓</div>
+                    <div style="flex: 1;">
+                        <div style="font-weight: 500;">Icon&#43;count patterns</div>
+                        <div style="color: var(--text-muted); font-size: 0.9rem;">Found 3 icon patterns for counts (avoids pluralization)</div>
+                        <div style="color: var(--text-muted); font-size: 0.8rem; font-family: monospace;">templates/*.go</div>
+                    </div>
+                </div>
+                
+                
+                
+                <div style="padding: 0.75rem 0; border-bottom: 1px solid var(--border); display: flex; gap: 1rem; align-items: flex-start;">
+                    <div style="width: 20px; height: 20px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 12px; flex-shrink: 0; background: var(--green); color: white;">✓</div>
+                    <div style="flex: 1;">
+                        <div style="font-weight: 500;">Avoids count&#43;word patterns</div>
+                        <div style="color: var(--text-muted); font-size: 0.9rem;">No problematic count&#43;word patterns found</div>
+                        <div style="color: var(--text-muted); font-size: 0.8rem; font-family: monospace;">templates/*.go</div>
+                    </div>
+                </div>
+                
+                
+                
+                <div style="padding: 0.75rem 0; border-bottom: 1px solid var(--border); display: flex; gap: 1rem; align-items: flex-start;">
+                    <div style="width: 20px; height: 20px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 12px; flex-shrink: 0; background: var(--green); color: white;">✓</div>
+                    <div style="flex: 1;">
+                        <div style="font-weight: 500;">Time string variants</div>
+                        <div style="color: var(--text-muted); font-size: 0.9rem;">Has singular/plural time variants (1m ago, Xm ago)</div>
+                        <div style="color: var(--text-muted); font-size: 0.8rem; font-family: monospace;">config/i18n/en.json</div>
+                    </div>
+                </div>
+                
+                
+                
+                <div style="padding: 0.75rem 0; border-bottom: 1px solid var(--border); display: flex; gap: 1rem; align-items: flex-start;">
+                    <div style="width: 20px; height: 20px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 12px; flex-shrink: 0; background: var(--green); color: white;">✓</div>
+                    <div style="flex: 1;">
+                        <div style="font-weight: 500;">Zero state messages</div>
+                        <div style="color: var(--text-muted); font-size: 0.9rem;">Templates handle zero/empty states</div>
+                        <div style="color: var(--text-muted); font-size: 0.8rem; font-family: monospace;">templates/*.go</div>
+                    </div>
+                </div>
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+            </div>
+        </div>
+        
+        
+        <div class="section">
+            <div class="section-header" onclick="this.parentElement.classList.toggle('open')">
+                <span>
+                    <span style="font-family: monospace; color: var(--blue);">Number Formatting</span>
+                </span>
+                <div style="display: flex; gap: 1rem;">
+                    <span style="padding: 0.2rem 0.5rem; border-radius: 4px; font-size: 0.85rem; background: rgba(35,134,54,0.2); color: var(--green);">4 passed</span>
+                    
+                </div>
+            </div>
+            <div class="section-content">
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                <div style="padding: 0.75rem 0; border-bottom: 1px solid var(--border); display: flex; gap: 1rem; align-items: flex-start;">
+                    <div style="width: 20px; height: 20px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 12px; flex-shrink: 0; background: var(--green); color: white;">✓</div>
+                    <div style="flex: 1;">
+                        <div style="font-weight: 500;">Number formatting</div>
+                        <div style="color: var(--text-muted); font-size: 0.9rem;">Uses number formatting functions</div>
+                        <div style="color: var(--text-muted); font-size: 0.8rem; font-family: monospace;">*.go</div>
+                    </div>
+                </div>
+                
+                
+                
+                <div style="padding: 0.75rem 0; border-bottom: 1px solid var(--border); display: flex; gap: 1rem; align-items: flex-start;">
+                    <div style="width: 20px; height: 20px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 12px; flex-shrink: 0; background: var(--green); color: white;">✓</div>
+                    <div style="flex: 1;">
+                        <div style="font-weight: 500;">Thousands separators</div>
+                        <div style="color: var(--text-muted); font-size: 0.9rem;">May use thousands separators</div>
+                        <div style="color: var(--text-muted); font-size: 0.8rem; font-family: monospace;">*.go</div>
+                    </div>
+                </div>
+                
+                
+                
+                <div style="padding: 0.75rem 0; border-bottom: 1px solid var(--border); display: flex; gap: 1rem; align-items: flex-start;">
+                    <div style="width: 20px; height: 20px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 12px; flex-shrink: 0; background: var(--green); color: white;">✓</div>
+                    <div style="flex: 1;">
+                        <div style="font-weight: 500;">Currency/sats formatting</div>
+                        <div style="color: var(--text-muted); font-size: 0.9rem;">Has zap/currency amount display</div>
+                        <div style="color: var(--text-muted); font-size: 0.8rem; font-family: monospace;">*.go</div>
+                    </div>
+                </div>
+                
+                
+                
+                <div style="padding: 0.75rem 0; border-bottom: 1px solid var(--border); display: flex; gap: 1rem; align-items: flex-start;">
+                    <div style="width: 20px; height: 20px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 12px; flex-shrink: 0; background: var(--green); color: white;">✓</div>
+                    <div style="flex: 1;">
+                        <div style="font-weight: 500;">Number abbreviations</div>
+                        <div style="color: var(--text-muted); font-size: 0.9rem;">May use number abbreviations (K, M)</div>
+                        <div style="color: var(--text-muted); font-size: 0.8rem; font-family: monospace;">*.go</div>
+                    </div>
+                </div>
+                
+                
+            </div>
+        </div>
+        
+        
+    </div>
+
+    <script>
+        
+    </script>
+</body>
+</html>

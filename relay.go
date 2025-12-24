@@ -289,9 +289,10 @@ collectLoop:
 
 // fetchProfileEventsFromRelays fetches kind 0 profile events with early exit when all pubkeys found
 // This is optimized for profile fetches where we want exactly 1 event per pubkey
-func fetchProfileEventsFromRelays(relays []string, pubkeys []string, timeout time.Duration) []Event {
+// Returns events and a bool indicating if at least one relay responded (for not-found caching decisions)
+func fetchProfileEventsFromRelays(relays []string, pubkeys []string, timeout time.Duration) ([]Event, bool) {
 	if len(pubkeys) == 0 || len(relays) == 0 {
-		return nil
+		return nil, false
 	}
 
 	filter := Filter{
@@ -381,7 +382,10 @@ collectLoop:
 		}
 	}
 
-	return events
+	// Return events and whether any relay responded (eoseCount > 0)
+	// This helps callers decide whether to cache "not found" results
+	hadResponse := eoseCount > 0
+	return events, hadResponse
 }
 
 func fetchFromRelayWithURL(ctx context.Context, relayURL string, filter Filter, eventChan chan<- Event, eoseChan chan<- string) {
@@ -562,9 +566,12 @@ func fetchAddressableEvent(relays []string, kind uint32, author string, dTag str
 }
 
 // fetchProfilesWithOptionsDirect fetches kind 0 profiles directly without singleflight.
-// If cacheOnly is true, returns only cached profiles without fetching from relays
-// Priority: relays parameter (NIP-65) first, then profileRelays as fallback
-func fetchProfilesWithOptionsDirect(relays []string, pubkeys []string, cacheOnly bool) map[string]*ProfileInfo {
+// If cacheOnly is true, returns only cached profiles without fetching from relays.
+// Uses NIP-65 outbox model: fetches profiles from users' WRITE relays when relay lists are cached,
+// falls back to aggregator relays (profileRelays) for users without cached relay lists.
+// Note: The relays parameter is kept for API compatibility but is no longer used - the function
+// now determines the correct relays to query based on each target user's cached relay list.
+func fetchProfilesWithOptionsDirect(_ []string, pubkeys []string, cacheOnly bool) map[string]*ProfileInfo {
 	if len(pubkeys) == 0 {
 		return nil
 	}
@@ -585,18 +592,46 @@ func fetchProfilesWithOptionsDirect(relays []string, pubkeys []string, cacheOnly
 
 	var events []Event
 	foundPubkeys := make(map[string]bool)
+	hadAnyRelayResponse := false // Track if at least one relay responded (for not-found caching)
 
-	// Stage 1: Try user's relays first (NIP-65 read relays when logged in)
-	// Uses optimized profile fetch with early exit when all pubkeys found
-	if len(relays) > 0 {
-		primaryEvents := fetchProfileEventsFromRelays(relays, missing, 1500*time.Millisecond)
-		events = append(events, primaryEvents...)
-		for _, evt := range primaryEvents {
+	// Check relay list cache to determine which pubkeys have known WRITE relays (outbox model)
+	// This is a cache-only check - no network calls
+	cachedRelayLists, _ := relayListCache.GetMultiple(missing)
+
+	// Build outbox relays for pubkeys with cached relay lists
+	var outboxRelays []string
+	var outboxPubkeys []string
+	var aggregatorPubkeys []string
+
+	for _, pk := range missing {
+		if rl, ok := cachedRelayLists[pk]; ok && rl != nil && len(rl.Write) > 0 {
+			outboxPubkeys = append(outboxPubkeys, pk)
+			// Add up to 2 WRITE relays per author (sorted by health)
+			writeRelays := relayHealthStore.SortRelaysByScore(rl.Write)
+			if len(writeRelays) > 2 {
+				writeRelays = writeRelays[:2]
+			}
+			outboxRelays = append(outboxRelays, writeRelays...)
+		} else {
+			aggregatorPubkeys = append(aggregatorPubkeys, pk)
+		}
+	}
+
+	// Stage 1: Fetch from outbox relays (target users' WRITE relays) - proper NIP-65
+	if len(outboxPubkeys) > 0 {
+		slog.Debug("profile fetch: using outbox relays", "pubkeys", len(outboxPubkeys), "relays", len(outboxRelays))
+		outboxEvents, hadResponse := fetchProfileEventsFromRelays(outboxRelays, outboxPubkeys, 1500*time.Millisecond)
+		if hadResponse {
+			hadAnyRelayResponse = true
+		}
+		events = append(events, outboxEvents...)
+		for _, evt := range outboxEvents {
 			foundPubkeys[evt.PubKey] = true
 		}
 	}
 
-	// Stage 2: Fall back to profileRelays (aggregators) for any still missing
+	// Stage 2: Fetch from aggregators for pubkeys without cached relay lists
+	// AND any outbox pubkeys that weren't found (fallback)
 	var stillMissing []string
 	for _, pk := range missing {
 		if !foundPubkeys[pk] {
@@ -606,7 +641,11 @@ func fetchProfilesWithOptionsDirect(relays []string, pubkeys []string, cacheOnly
 
 	if len(stillMissing) > 0 {
 		profileRelays := config.GetProfileRelays()
-		fallbackEvents := fetchProfileEventsFromRelays(profileRelays, stillMissing, 2000*time.Millisecond)
+		slog.Debug("profile fetch: using aggregators", "pubkeys", len(stillMissing), "noRelayList", len(aggregatorPubkeys))
+		fallbackEvents, hadResponse := fetchProfileEventsFromRelays(profileRelays, stillMissing, 2000*time.Millisecond)
+		if hadResponse {
+			hadAnyRelayResponse = true
+		}
 		events = append(events, fallbackEvents...)
 	}
 
@@ -668,15 +707,22 @@ func fetchProfilesWithOptionsDirect(relays []string, pubkeys []string, cacheOnly
 		}
 	}
 
-	var notFound []string // Cache "not found" to avoid repeated lookups
-	for _, pk := range missing {
-		if _, ok := freshProfiles[pk]; !ok {
-			notFound = append(notFound, pk)
+	// Only mark profiles as "not found" if at least one relay responded
+	// If all relays are in backoff (e.g., expired SSL certs), we shouldn't cache
+	// negative results since the profiles may actually exist
+	if hadAnyRelayResponse {
+		var notFound []string
+		for _, pk := range missing {
+			if _, ok := freshProfiles[pk]; !ok {
+				notFound = append(notFound, pk)
+			}
 		}
-	}
-	if len(notFound) > 0 {
-		slog.Debug("profile fetch: marking as not found", "count", len(notFound))
-		profileCache.SetNotFound(notFound)
+		if len(notFound) > 0 {
+			slog.Debug("profile fetch: marking as not found", "count", len(notFound))
+			profileCache.SetNotFound(notFound)
+		}
+	} else if len(missing) > 0 {
+		slog.Debug("profile fetch: skipping not-found cache (no relays responded)", "missing", len(missing))
 	}
 
 	result := make(map[string]*ProfileInfo, len(cached)+len(freshProfiles))
@@ -687,7 +733,15 @@ func fetchProfilesWithOptionsDirect(relays []string, pubkeys []string, cacheOnly
 		result[pk] = p
 	}
 
-	slog.Debug("profile fetch complete", "requested", len(missing), "fetched", len(freshProfiles), "notFound", len(notFound), "returning", len(result))
+	stillMissingCount := len(missing) - len(freshProfiles)
+	slog.Debug("profile fetch complete",
+		"requested", len(missing),
+		"fetched", len(freshProfiles),
+		"viaOutbox", len(outboxPubkeys),
+		"viaAggregator", len(aggregatorPubkeys),
+		"stillMissing", stillMissingCount,
+		"hadRelayResponse", hadAnyRelayResponse,
+		"returning", len(result))
 	return result
 }
 

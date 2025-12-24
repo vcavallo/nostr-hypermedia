@@ -218,6 +218,7 @@ var replyResponseTemplate = `{{define "reply-response"}}
   <input type="hidden" name="reply_to_pubkey" value="{{.ReplyToPubkey}}">
   <input type="hidden" name="reply_to_kind" value="{{.ReplyToKind}}">
   {{if .ReplyToDTag}}<input type="hidden" name="reply_to_dtag" value="{{.ReplyToDTag}}">{{end}}
+  <input type="hidden" name="reply_to_root" value="{{.ReplyToRoot}}">
   <input type="hidden" name="reply_count" value="{{.ReplyCount}}">
   <input type="hidden" id="mentions-data-reply" name="mentions" value="{}">
   <label for="reply-content" class="sr-only">Write a reply</label>

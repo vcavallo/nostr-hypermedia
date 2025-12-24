@@ -4,10 +4,10 @@
     "wss://nostr.mutinywallet.com"
   ],
   "defaultRelays": [
-    "wss://relay.nostr.band",
     "wss://relay.primal.net",
     "wss://relay.damus.io",
     "wss://nos.lol",
+    "wss://relay.nostr.band",
     "wss://nostr.mom"
   ],
   "nostrConnectRelays": [
@@ -17,9 +17,9 @@
   ],
   "searchRelays": ["wss://relay.nostr.band"],
   "publishRelays": [
-    "wss://relay.nostr.band",
     "wss://relay.primal.net",
-    "wss://relay.damus.io"
+    "wss://relay.damus.io",
+    "wss://relay.nostr.band"
   ],
   "profileRelays": [
     "wss://purplepag.es",

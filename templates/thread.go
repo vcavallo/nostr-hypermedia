@@ -97,6 +97,7 @@ var threadContent = `{{define "content"}}
     <input type="hidden" name="reply_to_pubkey" value="{{.Root.Pubkey}}">
     <input type="hidden" name="reply_to_kind" value="{{.Root.Kind}}">
     {{if .Root.DTag}}<input type="hidden" name="reply_to_dtag" value="{{.Root.DTag}}">{{end}}
+    <input type="hidden" name="reply_to_root" value="{{.ThreadRootID}}">
     <input type="hidden" name="reply_count" value="{{.TotalReplyCount}}">
     <input type="hidden" id="mentions-data-reply" name="mentions" value="{}">
     <label for="reply-content" class="sr-only">Write a reply</label>

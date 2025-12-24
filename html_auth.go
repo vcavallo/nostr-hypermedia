@@ -879,6 +879,7 @@ func htmlReplyHandler(w http.ResponseWriter, r *http.Request) {
 	replyToPubkey := strings.TrimSpace(r.FormValue("reply_to_pubkey"))
 	replyToKindStr := r.FormValue("reply_to_kind")
 	replyToDTag := strings.TrimSpace(r.FormValue("reply_to_dtag"))
+	replyToRoot := strings.TrimSpace(r.FormValue("reply_to_root"))
 	replyCountStr := r.FormValue("reply_count")
 	contentWarning := strings.TrimSpace(r.FormValue("content_warning"))
 	contentWarningCustom := strings.TrimSpace(r.FormValue("content_warning_custom"))
@@ -918,11 +919,23 @@ func htmlReplyHandler(w http.ResponseWriter, r *http.Request) {
 	var tags [][]string
 
 	if replyToKind == 1 {
-		// NIP-10 reply (kind 1): e tag with "reply" marker, p tag
+		// NIP-10 reply (kind 1): use explicit root and reply markers
 		eventKind = 1
-		tags = [][]string{
-			{"e", replyTo, "", "reply"},
+
+		// Determine if we're replying to the thread root or a nested reply
+		if replyToRoot == "" || replyToRoot == replyTo {
+			// Replying directly to the thread root: single tag with "root" marker
+			tags = [][]string{
+				{"e", replyTo, "", "root"},
+			}
+		} else {
+			// Replying to a nested reply: both root and reply tags
+			tags = [][]string{
+				{"e", replyToRoot, "", "root"},
+				{"e", replyTo, "", "reply"},
+			}
 		}
+
 		if replyToPubkey != "" {
 			if decoded, err := hex.DecodeString(replyToPubkey); err == nil && len(decoded) == 32 {
 				tags = append(tags, []string{"p", replyToPubkey})
@@ -1072,7 +1085,7 @@ func htmlReplyHandler(w http.ResponseWriter, r *http.Request) {
 			replyCount = n + 1
 		}
 
-		html, err := renderReplyResponse(newCSRFToken, replyTo, replyToPubkey, replyToKind, replyToDTag, userDisplayName, userAvatarURL, npub, newReply, replyCount)
+		html, err := renderReplyResponse(newCSRFToken, replyTo, replyToPubkey, replyToKind, replyToDTag, replyToRoot, userDisplayName, userAvatarURL, npub, newReply, replyCount)
 		if err != nil {
 			slog.Error("failed to render reply response", "error", err)
 			util.RespondInternalError(w, "Failed to render response")
@@ -3188,9 +3201,11 @@ func htmlFollowHandler(w http.ResponseWriter, r *http.Request) {
 
 	// Fetch user's current contact list (kind 3)
 	existingTags := [][]string{}
+	existingContent := "" // Preserve content (some clients store relay hints as JSON)
 	contactEvents := fetchKind3(relays, userPubkey)
 	if len(contactEvents) > 0 {
 		existingTags = contactEvents[0].Tags
+		existingContent = contactEvents[0].Content
 	}
 
 	// Build new tags list
@@ -3222,7 +3237,7 @@ func htmlFollowHandler(w http.ResponseWriter, r *http.Request) {
 	// Create the kind 3 event (replaceable)
 	event := UnsignedEvent{
 		Kind:      3,
-		Content:   "", // Content is usually empty for contact lists
+		Content:   existingContent, // Preserve original content (relay hints, etc.)
 		Tags:      newTags,
 		CreatedAt: time.Now().Unix(),
 	}

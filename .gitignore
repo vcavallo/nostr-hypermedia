@@ -35,8 +35,6 @@ coverage.out
 /cmd/markup-check/markup-check
 /cmd/nateoas-check/nateoas-check
 /cmd/security-check/security-check
-reports/
-reports/*
 
 # Temporary files
 *.tmp
