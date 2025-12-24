@@ -1,0 +1,49 @@
+/* Live chat message styles (kind 1311) */
+.live-chat-message {
+  padding: 8px 0;
+}
+.live-chat-content {
+  font-size: 14px;
+  color: var(--text-content);
+  line-height: 1.5;
+}
+.live-chat-context {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 8px;
+  padding: 8px 12px;
+  background: var(--bg-secondary);
+  border-radius: 6px;
+  font-size: 13px;
+  color: var(--text-muted);
+}
+.live-chat-icon {
+  font-size: 14px;
+}
+.live-chat-event-link {
+  color: var(--accent);
+  text-decoration: none;
+  font-weight: 500;
+}
+.live-chat-event-link:hover {
+  text-decoration: underline;
+}
+.live-chat-reply-indicator {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-top: 6px;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+.live-chat-reply-icon {
+  font-size: 12px;
+}
+.live-chat-reply-link {
+  color: var(--accent);
+  text-decoration: none;
+}
+.live-chat-reply-link:hover {
+  text-decoration: underline;
+}

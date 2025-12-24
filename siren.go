@@ -3,6 +3,8 @@ package main
 import (
 	"strconv"
 	"strings"
+
+	"nostr-server/internal/util"
 )
 
 type SirenEntity struct {
@@ -42,7 +44,7 @@ type SirenField struct {
 	Title string      `json:"title,omitempty"`
 }
 
-func toSirenTimeline(resp TimelineResponse, relays []string, authors []string, kinds []int, limit int, fast bool) SirenEntity {
+func toSirenTimeline(resp TimelineResponse, relays []string, authors []string, kinds []int, limit int) SirenEntity {
 	// Build main entity
 	entity := SirenEntity{
 		Class: []string{"timeline"},
@@ -91,19 +93,44 @@ func toSirenTimeline(resp TimelineResponse, relays []string, authors []string, k
 		// Add reply count
 		props["reply_count"] = item.ReplyCount
 
+		// Build actions for this event using unified action system
+		// For Siren API, we show all available actions (auth required on submission)
+		// Extract d-tag for addressable events (kind 30xxx)
+		var dTag string
+		if item.Kind >= 30000 && item.Kind < 40000 {
+			dTag = util.GetTagValue(item.Tags, "d")
+		}
+		ctx := ActionContext{
+			EventID:      item.ID,
+			EventPubkey:  item.Pubkey,
+			Kind:         item.Kind,
+			DTag:         dTag,
+			ReplyCount:   item.ReplyCount,
+			LoggedIn:     true, // Show all actions in API
+			HasWallet:    true, // Show zap in API (consumer checks wallet status)
+			CSRFToken:    "",   // Not needed for API
+			ReturnURL:    "",
+			LoginURL:     "",
+		}
+		hypermedia := BuildHypermediaEntity(ctx, item.Tags, nil)
+		sirenActions := make([]SirenAction, len(hypermedia.Actions))
+		for i, def := range hypermedia.Actions {
+			sirenActions[i] = def.ToSirenAction()
+		}
+
 		subEntity := SirenSubEntity{
 			Class:      []string{"event", "note"},
 			Rel:        []string{"item"},
 			Properties: props,
 			Links:      []SirenLink{},
-			Actions:    []SirenAction{},
+			Actions:    sirenActions,
 		}
 
 		entity.Entities = append(entity.Entities, subEntity)
 	}
 
 	// Add self link
-	selfURL := buildTimelineURL("/timeline", relays, authors, kinds, limit, nil, fast)
+	selfURL := buildTimelineURL("/timeline", relays, authors, kinds, limit, nil)
 	entity.Links = append(entity.Links, SirenLink{
 		Rel:  []string{"self"},
 		Href: selfURL,
@@ -120,7 +147,7 @@ func toSirenTimeline(resp TimelineResponse, relays []string, authors []string, k
 	return entity
 }
 
-func buildTimelineURL(base string, relays []string, authors []string, kinds []int, limit int, until *int64, fast bool) string {
+func buildTimelineURL(base string, relays []string, authors []string, kinds []int, limit int, until *int64) string {
 	parts := []string{base + "?"}
 
 	if len(relays) > 0 {
@@ -139,9 +166,6 @@ func buildTimelineURL(base string, relays []string, authors []string, kinds []in
 	parts = append(parts, "limit="+strconv.Itoa(limit))
 	if until != nil {
 		parts = append(parts, "until="+strconv.FormatInt(*until, 10))
-	}
-	if fast {
-		parts = append(parts, "fast=1")
 	}
 
 	return strings.Join(parts, "&")

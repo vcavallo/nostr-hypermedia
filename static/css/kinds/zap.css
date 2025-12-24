@@ -1,0 +1,38 @@
+/* Kind 9735 zap receipt styles */
+.zap-content {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+}
+.zap-icon {
+  font-size: 20px;
+  line-height: 1;
+}
+.zap-info { flex: 1; }
+.zap-header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  font-size: 15px;
+}
+.zap-sender, .zap-recipient {
+  font-weight: 600;
+  color: var(--accent);
+  text-decoration: none;
+}
+.zap-sender:hover, .zap-recipient:hover { text-decoration: underline; }
+.zap-action { color: var(--text-muted); }
+.zap-amount {
+  font-weight: 600;
+  color: var(--text-primary);
+}
+.zap-comment {
+  margin-top: 8px;
+  font-size: 14px;
+  color: var(--text-primary);
+}
+.zap-target {
+  margin-top: 8px;
+  font-size: 13px;
+}

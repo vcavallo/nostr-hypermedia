@@ -7,13 +7,15 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"net/url"
 	"os"
 	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
+	"nostr-server/internal/config"
+	"nostr-server/internal/nips"
 )
 
 // ServerKeypair holds the persistent server keypair for NIP-46
@@ -26,10 +28,8 @@ var (
 	serverKeypair     *ServerKeypair
 	serverKeypairOnce sync.Once
 
-	// pendingConnections tracks nostrconnect sessions waiting for signer response
-	pendingConnections = &PendingConnectionStore{
-		connections: make(map[string]*PendingConnection),
-	}
+	// pendingConnections provides backward-compatible access to pending connection store
+	pendingConnections = &pendingConnectionsWrapper{}
 )
 
 const devKeypairFile = ".dev-keypair"
@@ -50,27 +50,20 @@ type PendingConnection struct {
 	mu                 sync.Mutex
 }
 
-type PendingConnectionStore struct {
-	connections map[string]*PendingConnection
-	mu          sync.RWMutex
+// pendingConnectionsWrapper provides backward-compatible access to pending connection store
+type pendingConnectionsWrapper struct{}
+
+func (w *pendingConnectionsWrapper) Get(secret string) *PendingConnection {
+	conn, _ := pendingConnStore.Get(context.Background(), secret)
+	return conn
 }
 
-func (s *PendingConnectionStore) Get(secret string) *PendingConnection {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.connections[secret]
+func (w *pendingConnectionsWrapper) Set(secret string, conn *PendingConnection) {
+	pendingConnStore.Set(context.Background(), secret, conn)
 }
 
-func (s *PendingConnectionStore) Set(secret string, conn *PendingConnection) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.connections[secret] = conn
-}
-
-func (s *PendingConnectionStore) Delete(secret string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	delete(s.connections, secret)
+func (w *pendingConnectionsWrapper) Delete(secret string) {
+	pendingConnStore.Delete(context.Background(), secret)
 }
 
 // GetServerKeypair returns the persistent server keypair, loading or generating as needed
@@ -90,9 +83,9 @@ func loadOrCreateKeypair() (*ServerKeypair, error) {
 		if data, err := os.ReadFile(devKeypairFile); err == nil {
 			privKey, decodeErr := hex.DecodeString(string(data))
 			if decodeErr == nil && len(privKey) == 32 {
-				pubKey, pkErr := GetPublicKey(privKey)
+				pubKey, pkErr := nips.GetPublicKey(privKey)
 				if pkErr == nil {
-					log.Printf("NIP-46: Loaded persistent dev keypair: %s", hex.EncodeToString(pubKey))
+					slog.Info("NIP-46: loaded persistent dev keypair", "pubkey", hex.EncodeToString(pubKey))
 					return &ServerKeypair{PrivKey: privKey, PubKey: pubKey}, nil
 				}
 			}
@@ -100,11 +93,11 @@ func loadOrCreateKeypair() (*ServerKeypair, error) {
 	}
 
 	// Generate new keypair
-	privKey, err := GeneratePrivateKey()
+	privKey, err := nips.GeneratePrivateKey()
 	if err != nil {
 		return nil, fmt.Errorf("failed to generate keypair: %v", err)
 	}
-	pubKey, err := GetPublicKey(privKey)
+	pubKey, err := nips.GetPublicKey(privKey)
 	if err != nil {
 		return nil, fmt.Errorf("failed to derive pubkey: %v", err)
 	}
@@ -112,12 +105,12 @@ func loadOrCreateKeypair() (*ServerKeypair, error) {
 	if devMode {
 		// Save for next time
 		if err := os.WriteFile(devKeypairFile, []byte(hex.EncodeToString(privKey)), 0600); err != nil {
-			log.Printf("Warning: failed to save dev keypair: %v", err)
+			slog.Warn("failed to save dev keypair", "error", err)
 		} else {
-			log.Printf("NIP-46: Created and saved new dev keypair: %s", hex.EncodeToString(pubKey))
+			slog.Info("NIP-46: created and saved new dev keypair", "pubkey", hex.EncodeToString(pubKey))
 		}
 	} else {
-		log.Printf("NIP-46: Generated ephemeral keypair: %s", hex.EncodeToString(pubKey))
+		slog.Info("NIP-46: generated ephemeral keypair", "pubkey", hex.EncodeToString(pubKey))
 	}
 
 	return &ServerKeypair{PrivKey: privKey, PubKey: pubKey}, nil
@@ -169,7 +162,7 @@ func GenerateNostrConnectURL(relays []string) (string, string, error) {
 func StartConnectionListener(relays []string) {
 	kp, err := GetServerKeypair()
 	if err != nil {
-		log.Printf("NIP-46: Failed to get server keypair for listener: %v", err)
+		slog.Error("NIP-46: failed to get server keypair for listener", "error", err)
 		return
 	}
 
@@ -182,7 +175,7 @@ func listenForConnections(relayURL string, kp *ServerKeypair) {
 	for {
 		err := listenOnRelay(relayURL, kp)
 		if err != nil {
-			log.Printf("NIP-46: Relay listener error (%s): %v, reconnecting...", relayURL, err)
+			slog.Warn("NIP-46: relay listener error, reconnecting", "relay", relayURL, "error", err)
 		}
 		time.Sleep(5 * time.Second)
 	}
@@ -210,15 +203,48 @@ func listenOnRelay(relayURL string, kp *ServerKeypair) error {
 		return fmt.Errorf("subscribe failed: %v", err)
 	}
 
-	log.Printf("NIP-46: Listening for connections on %s", relayURL)
+	slog.Info("NIP-46: listening for connections", "relay", relayURL)
+
+	// Set up pong handler to extend read deadline when server responds to our pings
+	conn.SetPongHandler(func(string) error {
+		conn.SetReadDeadline(time.Now().Add(30 * time.Second))
+		return nil
+	})
+
+	// Start ping goroutine to keep connection alive
+	// Ping interval must be shorter than read deadline to prevent timeouts on idle connections
+	pingDone := make(chan struct{})
+	var writeMu sync.Mutex
+	go func() {
+		ticker := time.NewTicker(20 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-pingDone:
+				return
+			case <-ticker.C:
+				writeMu.Lock()
+				err := conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(10*time.Second))
+				writeMu.Unlock()
+				if err != nil {
+					return
+				}
+			}
+		}
+	}()
+	defer close(pingDone)
+
+	// Set initial read deadline (longer than ping interval to allow keepalive to work)
+	conn.SetReadDeadline(time.Now().Add(30 * time.Second))
 
 	// Read loop
 	for {
-		conn.SetReadDeadline(time.Now().Add(60 * time.Second))
 		var msg []interface{}
 		if err := conn.ReadJSON(&msg); err != nil {
 			return fmt.Errorf("read error: %v", err)
 		}
+		// Extend deadline after successful read
+		conn.SetReadDeadline(time.Now().Add(30 * time.Second))
 
 		if len(msg) < 2 {
 			continue
@@ -252,14 +278,14 @@ func handlePotentialConnectResponse(event Event, kp *ServerKeypair) {
 	}
 
 	// Compute conversation key
-	convKey, err := GetConversationKey(kp.PrivKey, remoteSignerPubKey)
+	convKey, err := nips.GetConversationKey(kp.PrivKey, remoteSignerPubKey)
 	if err != nil {
-		log.Printf("NIP-46: Failed to compute conversation key: %v", err)
+		slog.Error("NIP-46: failed to compute conversation key", "error", err)
 		return
 	}
 
 	// Try to decrypt
-	decrypted, err := Nip44Decrypt(event.Content, convKey)
+	decrypted, err := nips.Nip44Decrypt(event.Content, convKey)
 	if err != nil {
 		// Not for us or wrong key
 		return
@@ -268,7 +294,7 @@ func handlePotentialConnectResponse(event Event, kp *ServerKeypair) {
 	// Parse response
 	var response NIP46Response
 	if err := json.Unmarshal([]byte(decrypted), &response); err != nil {
-		log.Printf("NIP-46: Failed to parse response: %v", err)
+		slog.Error("NIP-46: failed to parse response", "error", err)
 		return
 	}
 
@@ -285,25 +311,36 @@ func handlePotentialConnectResponse(event Event, kp *ServerKeypair) {
 		return
 	}
 
-	log.Printf("NIP-46: Received connect response for secret %s from %s", response.Result[:8], event.PubKey[:16])
+	// Check if already connected (avoid duplicate processing from multiple relays)
+	pending.mu.Lock()
+	if pending.Connected {
+		pending.mu.Unlock()
+		return
+	}
+
+	slog.Info("NIP-46: received connect response", "pubkey", event.PubKey[:16])
 
 	// Update pending connection
 	pending.RemoteSignerPubKey = remoteSignerPubKey
 	pending.ConversationKey = convKey
 	pending.Connected = true
+	pending.mu.Unlock()
+
+	// Persist to store (important for Redis)
+	pendingConnections.Set(response.Result, pending)
 
 	// Now get the user's public key
-	go fetchUserPubKey(pending, event.PubKey)
+	go fetchUserPubKey(pending, event.PubKey, response.Result)
 }
 
-func fetchUserPubKey(pending *PendingConnection, remoteSignerPubKeyHex string) {
+func fetchUserPubKey(pending *PendingConnection, remoteSignerPubKeyHex string, secret string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
 	// Send get_public_key request
 	reqIDBytes := make([]byte, 8)
 	if _, err := rand.Read(reqIDBytes); err != nil {
-		log.Printf("NIP-46: Failed to generate request ID: %v", err)
+		slog.Error("NIP-46: failed to generate request ID", "error", err)
 		return
 	}
 	reqID := hex.EncodeToString(reqIDBytes)
@@ -315,9 +352,9 @@ func fetchUserPubKey(pending *PendingConnection, remoteSignerPubKeyHex string) {
 	}
 
 	requestJSON, _ := json.Marshal(request)
-	encryptedContent, err := Nip44Encrypt(string(requestJSON), pending.ConversationKey)
+	encryptedContent, err := nips.Nip44Encrypt(string(requestJSON), pending.ConversationKey)
 	if err != nil {
-		log.Printf("NIP-46: Failed to encrypt get_public_key request: %v", err)
+		slog.Error("NIP-46: failed to encrypt get_public_key request", "error", err)
 		return
 	}
 
@@ -327,25 +364,40 @@ func fetchUserPubKey(pending *PendingConnection, remoteSignerPubKeyHex string) {
 	for _, relay := range pending.Relays {
 		userPubKey, err := sendAndWaitForResponse(ctx, relay, requestEvent, reqID, pending.ConversationKey, remoteSignerPubKeyHex)
 		if err != nil {
-			log.Printf("NIP-46: get_public_key failed on %s: %v", relay, err)
+			slog.Debug("NIP-46: get_public_key failed", "relay", relay, "error", err)
 			continue
 		}
 
 		userPubKeyBytes, err := hex.DecodeString(userPubKey)
 		if err != nil {
-			log.Printf("NIP-46: Invalid user pubkey: %v", err)
+			slog.Error("NIP-46: invalid user pubkey", "error", err)
 			continue
 		}
 
+		pending.mu.Lock()
 		pending.UserPubKey = userPubKeyBytes
-		log.Printf("NIP-46: Got user pubkey: %s", userPubKey)
+		pending.mu.Unlock()
+		slog.Info("NIP-46: got user pubkey", "pubkey", userPubKey)
+
+		// Persist to store (important for Redis)
+		pendingConnections.Set(secret, pending)
 
 		// Fetch user's NIP-65 relay list in background
-		go func(pubkeyHex string) {
+		go func(pubkeyHex string, secret string) {
 			relayList := fetchRelayList(pubkeyHex)
-			pending.mu.Lock()
-			pending.UserRelayList = relayList
-			pending.mu.Unlock()
+			// Re-fetch from store to get latest state
+			p := pendingConnections.Get(secret)
+			if p != nil {
+				p.mu.Lock()
+				p.UserRelayList = relayList
+				p.mu.Unlock()
+				pendingConnections.Set(secret, p)
+			}
+		}(userPubKey, secret)
+
+		// Fetch user's profile in background (for avatar in settings toggle)
+		go func(pubkeyHex string) {
+			fetchProfilesWithOptions(config.GetProfileRelays(), []string{pubkeyHex}, false)
 		}(userPubKey)
 
 		return
@@ -405,7 +457,7 @@ func sendAndWaitForResponse(ctx context.Context, relayURL string, event *Event, 
 			continue
 		}
 
-		decrypted, err := Nip44Decrypt(respEvent.Content, convKey)
+		decrypted, err := nips.Nip44Decrypt(respEvent.Content, convKey)
 		if err != nil {
 			continue
 		}
@@ -434,10 +486,12 @@ func sendAndWaitForResponse(ctx context.Context, relayURL string, event *Event, 
 func CheckConnection(secret string) *BunkerSession {
 	pending := pendingConnections.Get(secret)
 	if pending == nil {
+		slog.Debug("NIP-46: CheckConnection - pending connection not found", "secret", secret[:8]+"...")
 		return nil
 	}
 
-	if !pending.Connected || pending.UserPubKey == nil {
+	if !pending.Connected || len(pending.UserPubKey) == 0 {
+		slog.Debug("NIP-46: CheckConnection - not ready", "connected", pending.Connected, "has_pubkey", len(pending.UserPubKey) > 0)
 		return nil
 	}
 
@@ -446,8 +500,14 @@ func CheckConnection(secret string) *BunkerSession {
 	userRelayList := pending.UserRelayList
 	pending.mu.Unlock()
 
+	sessionID, err := generateSessionID()
+	if err != nil {
+		slog.Error("NIP-46: failed to generate session ID", "error", err)
+		return nil
+	}
+
 	session := &BunkerSession{
-		ID:                 generateSessionID(),
+		ID:                 sessionID,
 		ClientPrivKey:      pending.ClientPrivKey,
 		ClientPubKey:       pending.ClientPubKey,
 		RemoteSignerPubKey: pending.RemoteSignerPubKey,
@@ -465,10 +525,9 @@ func CheckConnection(secret string) *BunkerSession {
 	return session
 }
 
-// Default relays for nostrconnect
-var defaultNostrConnectRelays = []string{
-	"wss://relay.nsec.app",
-	"wss://relay.damus.io",
+// defaultNostrConnectRelays returns the default relays for nostrconnect from config
+func defaultNostrConnectRelays() []string {
+	return config.GetNostrConnectRelays()
 }
 
 // TryReconnectToSigner attempts to reconnect to an existing approved signer
@@ -485,7 +544,7 @@ func TryReconnectToSigner(signerPubKeyHex string, relays []string) (*BunkerSessi
 	}
 
 	// Compute conversation key
-	convKey, err := GetConversationKey(kp.PrivKey, signerPubKey)
+	convKey, err := nips.GetConversationKey(kp.PrivKey, signerPubKey)
 	if err != nil {
 		return nil, fmt.Errorf("failed to compute conversation key: %v", err)
 	}
@@ -507,7 +566,7 @@ func TryReconnectToSigner(signerPubKeyHex string, relays []string) (*BunkerSessi
 	}
 
 	requestJSON, _ := json.Marshal(request)
-	encryptedContent, err := Nip44Encrypt(string(requestJSON), convKey)
+	encryptedContent, err := nips.Nip44Encrypt(string(requestJSON), convKey)
 	if err != nil {
 		return nil, fmt.Errorf("failed to encrypt request: %v", err)
 	}
@@ -518,19 +577,24 @@ func TryReconnectToSigner(signerPubKeyHex string, relays []string) (*BunkerSessi
 	for _, relay := range relays {
 		userPubKey, err := sendAndWaitForResponse(ctx, relay, requestEvent, reqID, convKey, signerPubKeyHex)
 		if err != nil {
-			log.Printf("NIP-46: reconnect get_public_key failed on %s: %v", relay, err)
+			slog.Debug("NIP-46: reconnect get_public_key failed", "relay", relay, "error", err)
 			continue
 		}
 
 		userPubKeyBytes, err := hex.DecodeString(userPubKey)
 		if err != nil {
-			log.Printf("NIP-46: Invalid user pubkey from reconnect: %v", err)
+			slog.Error("NIP-46: invalid user pubkey from reconnect", "error", err)
 			continue
 		}
 
 		// Success! Create session
+		sessionID, err := generateSessionID()
+		if err != nil {
+			slog.Error("NIP-46: failed to generate session ID", "error", err)
+			continue
+		}
 		session := &BunkerSession{
-			ID:                 generateSessionID(),
+			ID:                 sessionID,
 			ClientPrivKey:      kp.PrivKey,
 			ClientPubKey:       kp.PubKey,
 			RemoteSignerPubKey: signerPubKey,
@@ -541,7 +605,13 @@ func TryReconnectToSigner(signerPubKeyHex string, relays []string) (*BunkerSessi
 			CreatedAt:          time.Now(),
 		}
 
-		log.Printf("NIP-46: Reconnected to signer %s, user pubkey: %s", signerPubKeyHex[:16], userPubKey)
+		slog.Info("NIP-46: reconnected to signer", "signer", signerPubKeyHex[:16], "user_pubkey", userPubKey)
+
+		// Fetch user's profile in background (for avatar in settings toggle)
+		go func(pubkeyHex string) {
+			fetchProfilesWithOptions(config.GetProfileRelays(), []string{pubkeyHex}, false)
+		}(userPubKey)
+
 		return session, nil
 	}
 

@@ -1,0 +1,60 @@
+/* Short-form video (kind 22 - NIP-71) styles */
+.shortvideo-note { padding: 0; }
+.shortvideo-title {
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--text-primary);
+  margin: 0 0 12px 0;
+  padding: 0 20px;
+  line-height: 1.4;
+}
+.shortvideo-player-container {
+  position: relative;
+  background: #000;
+  max-width: 100%;
+}
+.shortvideo-player {
+  width: 100%;
+  max-height: 80vh;
+  display: block;
+}
+.shortvideo-thumbnail {
+  width: 100%;
+  max-height: 80vh;
+  object-fit: contain;
+  display: block;
+}
+.shortvideo-placeholder {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 200px;
+  background: var(--bg-secondary);
+  color: var(--text-muted);
+  gap: 8px;
+}
+.shortvideo-caption {
+  font-size: 14px;
+  color: var(--text-content);
+  padding: 12px 20px 0;
+  line-height: 1.5;
+}
+.note-video {
+  max-width: 100%;
+  border-radius: 8px;
+  margin: 8px 0;
+  display: block;
+}
+.note-audio {
+  width: 100%;
+  margin: 8px 0;
+  display: block;
+}
+.youtube-embed {
+  width: 100%;
+  aspect-ratio: 16/9;
+  border: none;
+  border-radius: 8px;
+  margin: 8px 0;
+  display: block;
+}

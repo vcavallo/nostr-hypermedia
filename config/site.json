@@ -1,0 +1,33 @@
+{
+  "site": {
+    "name": "Nostr Hypermedia",
+    "titleFormat": "{title} - {siteName}",
+    "description": "A hypermedia Nostr client for the web"
+  },
+  "meta": {
+    "themeColor": {
+      "light": "#f5f5f5",
+      "dark": "#121212"
+    }
+  },
+  "openGraph": {
+    "type": "website",
+    "image": "/static/og-image.png"
+  },
+  "links": {
+    "favicon": "/static/favicon.ico",
+    "stylesheet": "/static/style.css",
+    "preconnect": [
+      "https://nostr.build",
+      "https://image.nostr.build",
+      "https://void.cat",
+      "https://blob.satellite.earth"
+    ]
+  },
+  "scripts": [
+    {
+      "src": "/static/helm.js",
+      "defer": true
+    }
+  ]
+}

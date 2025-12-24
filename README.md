@@ -1,452 +1,134 @@
-# Nostr Hypermedia Server
+# Nostr Hypermedia Client
 
-HTTP-only Nostr client aggregator with REST and hypermedia support.
+A hypermedia-first Nostr web client implementing NATEOAS (Nostr As The Engine Of Application State). Server-rendered HTML with progressive enhancement via [HelmJS](https://github.com/Letdown2491/helmjs).
 
-Maintains long-lived WebSocket connections to Nostr relays and exposes events over plain HTTP—no WebSockets needed on the client.
+## Philosophy
+
+**Hypermedia-Driven**: The server returns complete, self-describing HTML documents. The browser is a generic hypermedia renderer that follows links and submits forms—no client-side routing or state management.
+
+**Zero-Trust Authentication**: NIP-46 remote signing means your private key never touches the server. Authentication happens entirely in your signer app (nsec.app, Amber).
+
+**Progressive Enhancement**: Everything works without JavaScript. With JS enabled, HelmJS enhances interactions with partial page updates and smoother UX.
 
 ## Features
 
-- **HTTP-only client interface** - No WebSocket handling required
-- **Multi-relay aggregation** - Fan-out queries to multiple relays with deduplication
-- **Two hypermedia UIs**:
-  - **JavaScript Siren browser** - Generic client that discovers features from API responses
-  - **Zero-JS HTML client** - Pure server-rendered HTML, works without JavaScript
-- **Zero-trust authentication** - NIP-46 remote signing (your keys never touch the server)
-- **Thread views** - View notes with their replies
-- **Profile pages** - View user profiles with follow/unfollow
-- **Profile editing** - Update your display name, about, avatar, and banner
-- **Notifications** - View mentions, replies, reactions, reposts, and zaps
-- **Social actions** - React, reply, repost, quote, bookmark, and follow
-- **Multiple content types** - Notes, photos, longform articles, highlights, and livestreams
-- **Link previews** - Rich Open Graph previews for shared URLs
-- **Theme switching** - Light and dark mode support
-- **Profile enrichment** - Author names/pictures fetched and cached
-- **Reactions & reply counts** - See engagement on notes
-- **Multiple response formats** - JSON, Siren (HATEOAS), or HTML based on Accept header
-- **Smart caching** - ETag/Last-Modified support for efficient refreshes
-- **Signature verification** - Validates Nostr event signatures
-- **Pagination** - Cursor-based pagination with `until` parameter
+### Content & Discovery
+- **Timeline feeds**: Follows and Global feeds with kind filters
+- **DVM feeds**: Algorithmic/trending content via NIP-90 Data Vending Machines
+- **Content types**: Notes, reposts, photos, videos, articles, highlights, comments, live streams, live chat, classifieds, calendar events, files, marketplace (stalls/products), communities, badges, repositories, labels, reports, app recommendations
+- **Handler discovery**: NIP-89 "Open in app" links for unsupported event kinds, with web of trust filtering
+- **Full-text search**: NIP-50 search across Nostr
+- **Link previews**: Open Graph metadata for shared URLs
+- **Thread views**: Notes with nested replies
+- **Profile pages**: User profiles with follow/unfollow
+
+### Social Actions
+- **Post & reply**: Create notes and participate in threads
+- **Reactions**: Like/react to notes
+- **Reposts & quotes**: Share notes with optional commentary
+- **Zaps**: Send Lightning payments via NIP-47 wallets (Alby, Primal, any NWC-compatible)
+- **Bookmarks**: Save notes for later (kind 10003)
+- **Follow/unfollow**: Manage your social graph
+- **Mute users**: Hide content from specific users (kind 10000)
+- **Report content**: Flag abusive content (NIP-56 kind 1984)
+
+### User Experience
+- **Notifications**: Mentions, replies, reactions, reposts, zaps
+- **Theme switching**: Light and dark mode
+- **Profile editing**: Update display name, about, avatar, banner
+- **Relay management**: Uses your NIP-65 relay list when logged in
+- **NIP-05 verification**: Display verified identities with configurable badge
+
+### Technical
+- **Multi-relay aggregation**: Fan-out queries with deduplication
+- **Relay health scoring**: Prioritizes faster, more reliable relays
+- **Connection pooling**: Managed relay connections with limits and health tracking
+- **Flexible caching**: In-memory or Redis backends for profiles, events, sessions, relay health, and more
+- **Signature verification**: Validates all Nostr event signatures
+- **Hot-reload config**: SIGHUP reloads all JSON config without restart
 
 ## Quick Start
 
+### Development
+
 ```bash
-go build -o nostr-server .
-PORT=3000 ./nostr-server
+# Build and run
+go build && ./nostr-server
+
+# With options
+go build && DEV_MODE=1 ./nostr-server
+go build && DEV_MODE=1 LOG_LEVEL=debug ./nostr-server
 ```
 
-**Open in browser:**
-- JS client: http://localhost:3000/
-- Zero-JS client: http://localhost:3000/html/timeline?kinds=1&limit=20
+Open http://localhost:3000 in your browser.
 
-## User Interfaces
+**Hot reload configuration** (auto-refreshes connected browsers via SSE):
+```bash
+kill -HUP $(pgrep nostr-server)
+```
 
-### JavaScript Siren Browser (`/`)
+### Production
 
-A **generic hypermedia client** that:
-- Fetches Siren JSON and dynamically renders entities, links, and actions
-- Has no hardcoded knowledge of Nostr—discovers everything from API responses
-- Renders notes, pagination, profile/thread links all from hypermedia
-- Would work with any Siren API (blog, todo app, etc.)
-
-When you add new endpoints server-side (threads, profiles, search), the UI automatically exposes them by following links.
-
-### Zero-JS HTML Client (`/html/timeline`)
-
-A **pure HTML hypermedia client** that:
-- Requires no JavaScript—works in Lynx, curl, ancient browsers
-- Uses plain `<a>` tags for navigation and `<form>` tags for actions
-- Server renders complete HTML pages
-- True REST/HATEOAS over HTML—the original web architecture
-- **NIP-46 authentication** - Login with remote signers (nsec.app, Amber)
-- **Post notes** - Create and publish notes without JavaScript
-- **Reply to threads** - Participate in conversations
-- **Reactions** - React to notes with '+' button
-- **Reposts & quotes** - Share notes with optional commentary
-- **Bookmarks** - Save notes for later (kind 10003)
-- **Follow/unfollow** - Manage your social graph
-- **Profile editing** - Update display name, about, avatar, banner
-- **Notifications** - View mentions, replies, reactions, reposts, zaps
-- **Content filtering** - Filter by notes, photos, longform, highlights, livestreams
-- **Theme switching** - Toggle between light and dark modes
-- **Link previews** - Rich previews for shared URLs
-
-Both clients follow the same hypermedia principles: links and actions are discovered from server responses, not hardcoded.
+See [DEPLOYMENT.md](docs/DEPLOYMENT.md) for production deployment, Docker, reverse proxy setup, and configuration reference.
 
 ## Authentication (NIP-46)
 
-The HTML client supports **zero-trust authentication** via NIP-46 (Nostr Connect). Your private key never leaves your signer app.
+Login with a remote signer—your private key never leaves your device.
 
-### How it works
+**Supported Signers:**
+- [nsec.app](https://nsec.app) - Web-based remote signer
+- [Amber](https://github.com/greenart7c3/Amber) - Android signer
 
-**Option 1: Bunker URL**
-1. Go to `/html/login`
-2. Paste your `bunker://` URL from a remote signer:
-   - [nsec.app](https://nsec.app) - Web-based remote signer
-   - [Amber](https://github.com/greenart7c3/Amber) - Android signer
-3. The server connects to your signer via relay
-4. When you post, the server requests a signature from your signer
-5. You approve/reject in your signer app
+**Login Options:**
+1. Paste your `bunker://` URL from your signer
+2. Scan the QR code or copy the `nostrconnect://` URI
 
-**Option 2: Nostr Connect (QR code flow)**
-1. Go to `/html/login`
-2. Copy the `nostrconnect://` URI or scan the QR code with your signer app
-3. Approve the connection in your signer
-4. The page auto-refreshes when connected
+Your private key never touches the server. Communication is NIP-44 encrypted via relay.
 
-### Security model
+## Supported Event Kinds
 
-- Server only sees your **public key**
-- All signing happens in your signer app
-- Communication is **NIP-44 encrypted** (ChaCha20 + HMAC-SHA256)
-- Server uses a **disposable keypair** for each session
-- Sessions stored server-side with HTTP-only cookies
-
-## API Endpoints
-
-### `GET /timeline`
-
-Fetch aggregated events from Nostr relays (JSON/Siren formats).
-
-### `GET /html/timeline`
-
-Fetch aggregated events as server-rendered HTML (zero-JS client).
-
-### `GET /html/thread/{eventId}`
-
-View a note with its replies as server-rendered HTML.
-
-### `GET /html/profile/{pubkey}`
-
-View a user's profile and their notes. Accepts hex pubkey or `npub1...` format.
-
-### `GET /html/login`
-
-Login page for NIP-46 authentication. POST with `bunker_url` to connect.
-
-### `GET /html/logout`
-
-Logout and clear session.
-
-### `POST /html/post`
-
-Post a new note (requires login). Form field: `content`.
-
-### `POST /html/reply`
-
-Reply to a note (requires login). Form fields: `content`, `event_id`, `event_pubkey`.
-
-### `POST /html/react`
-
-React to a note (requires login). Form fields: `event_id`, `event_pubkey`, `return_url`.
-
-### `POST /html/bookmark`
-
-Bookmark a note (requires login). Form fields: `event_id`, `return_url`.
-
-### `POST /html/repost`
-
-Repost a note (requires login). Form fields: `event_id`, `event_pubkey`, `return_url`.
-
-### `GET /html/quote/{eventId}`
-
-Quote form for composing a quote post. Shows original note with compose area.
-
-### `POST /html/follow`
-
-Follow or unfollow a user (requires login). Form fields: `pubkey`, `action` (follow/unfollow), `return_url`.
-
-### `GET /html/profile/edit`
-
-Edit your profile (requires login). Form to update display name, about, avatar URL, and banner URL.
-
-### `GET /html/notifications`
-
-View your notifications (requires login). Shows mentions, replies, reactions, reposts, and zaps.
-
-### `GET /html/theme`
-
-Toggle between light and dark themes. Stores preference in cookie.
-
-### `GET /html/check-connection`
-
-Check NIP-46 connection status. Returns connection health info.
-
-### `GET /html/reconnect`
-
-Attempt to reconnect NIP-46 session if disconnected.
-
-**Query Parameters (timeline):**
-- `relays` - Comma-separated relay URLs (default uses user's NIP-65 relays if logged in, otherwise defaults)
-- `authors` - Comma-separated pubkeys to filter by
-- `kinds` - Comma-separated event kinds (e.g., `1` for notes, `7` for reactions)
-- `limit` - Max events to return (default: 50, max: 200)
-- `since` - Unix timestamp for oldest event
-- `until` - Unix timestamp for newest event (used for pagination)
-- `feed` - Feed mode: `follows` (notes from people you follow) or `global` (all notes). Defaults to `follows` when logged in.
-- `fast` - Set to `1` to skip fetching reactions (faster loading)
-
-**Examples:**
-
-```bash
-# Get latest 50 notes
-curl "http://localhost:3000/timeline?kinds=1&limit=50"
-
-# Filter by specific authors
-curl "http://localhost:3000/timeline?authors=pub1,pub2&kinds=1"
-
-# Pagination - use `until` from previous response
-curl "http://localhost:3000/timeline?kinds=1&until=1759635730"
-
-# Custom relays
-curl "http://localhost:3000/timeline?relays=wss://relay.damus.io,wss://nos.lol&kinds=1"
-```
-
-### Response Formats
-
-#### JSON (default)
-
-```json
-{
-  "items": [
-    {
-      "id": "...",
-      "kind": 1,
-      "pubkey": "...",
-      "created_at": 1759635732,
-      "content": "hello nostr",
-      "tags": [],
-      "sig": "...",
-      "relays_seen": ["wss://relay.damus.io"]
-    }
-  ],
-  "page": {
-    "until": 1759635730,
-    "next": "/timeline?...&until=1759635730"
-  },
-  "meta": {
-    "queried_relays": 2,
-    "eose": true,
-    "generated_at": "2025-10-04T22:00:00Z"
-  }
-}
-```
-
-#### Siren (Hypermedia)
-
-Request with `Accept: application/vnd.siren+json`:
-
-```bash
-curl -H "Accept: application/vnd.siren+json" "http://localhost:3000/timeline?kinds=1&limit=2"
-```
-
-Returns Siren entities with:
-- **Links** - Navigate to profiles, threads, pagination
-- **Actions** - Discoverable operations (publish, react)
-- **Properties** - Event data and metadata
-
-Example structure:
-```json
-{
-  "class": ["timeline"],
-  "properties": { "title": "Nostr Timeline", ... },
-  "entities": [
-    {
-      "class": ["event", "note"],
-      "properties": { "id": "...", "content": "...", ... },
-      "links": [
-        { "rel": ["author"], "href": "/profiles/..." },
-        { "rel": ["thread"], "href": "/threads/..." }
-      ],
-      "actions": [
-        {
-          "name": "react",
-          "method": "POST",
-          "href": "/actions/react",
-          "fields": [...]
-        }
-      ]
-    }
-  ],
-  "links": [
-    { "rel": ["self"], "href": "/timeline?..." },
-    { "rel": ["next"], "href": "/timeline?...&until=..." }
-  ],
-  "actions": [
-    { "name": "publish", "method": "POST", "href": "/events", ... }
-  ]
-}
-```
-
-## Caching & Performance
-
-The server sets HTTP cache headers:
-- **ETag** - Hash of first/last event ID + count
-- **Last-Modified** - Timestamp of most recent event
-- **Cache-Control: max-age=5** - 5-second CDN/browser cache
-
-Use `If-None-Match` with the ETag to get `304 Not Modified` when content hasn't changed:
-
-```bash
-curl -H 'If-None-Match: "4bff5e5ea3f03f38"' http://localhost:3000/timeline?kinds=1
-```
+Renders 30+ Nostr event kinds including notes, articles, photos, videos, live streams, highlights, classifieds, calendar events, marketplace listings, and more. See [API.md](docs/API.md#supported-event-kinds) for the complete list.
 
 ## Architecture
 
 ```
-┌─────────┐                 ┌──────────────┐
-│ Browser │────HTTP only────▶│ Aggregator   │
-│ Client  │◀────────────────│ Server       │
-└─────────┘                 └──────┬───────┘
-                                   │
-                        ┌──────────┼──────────┐
-                        │          │          │
-                        ▼          ▼          ▼
-                   ┌────────┐ ┌────────┐ ┌────────┐
-                   │ Relay  │ │ Relay  │ │ Relay  │
-                   │  WS    │ │  WS    │ │  WS    │
-                   └────────┘ └────────┘ └────────┘
+┌─────────┐                 ┌────────────────────────┐
+│ Browser │────HTTP only────▶│     nostr-server      │
+│         │◀────────────────│        Server          │
+└─────────┘                 └──────────┬─────────────┘
+                                       │
+                            ┌──────────┼──────────┐
+                            │          │          │
+                            ▼          ▼          ▼
+                       ┌────────┐ ┌────────┐ ┌────────┐
+                       │ Relay  │ │ Relay  │ │ Relay  │
+                       │  WS    │ │  WS    │ │  WS    │
+                       └────────┘ └────────┘ └────────┘
 ```
 
-- **Client** makes simple HTTP GET requests
-- **Server** maintains persistent WebSocket connections to relays
+- **Client** makes simple HTTP requests
+- **Server** maintains WebSocket connections to relays
 - **Fan-out** queries to multiple relays in parallel
 - **Dedupe** by event ID, verify signatures
-- **Order** by `(created_at DESC, id DESC)`
-- **Cache** results with ETag for fast refreshes
+- **Render** as complete HTML with embedded controls
 
-## Project Structure
+## Documentation
 
-**Server:**
-- `main.go` - HTTP server and routes
-- `handlers.go` - Timeline endpoint and response building
-- `html_handlers.go` - Server-side HTML rendering for timeline/threads/profiles/notifications
-- `html_auth.go` - NIP-46 login/logout/post/reply/react/bookmark/repost/follow handlers
-- `relay.go` - WebSocket client, fan-out, dedup, EOSE handling
-- `siren.go` - Hypermedia (Siren) format conversion
-- `html.go` - HTML template rendering with embedded CSS
-- `nip46.go` - NIP-46 bunker client (remote signing)
-- `nip44.go` - NIP-44 encryption (ChaCha20 + HMAC-SHA256)
-- `nostrconnect.go` - Nostr Connect flow (`nostrconnect://` URI handling)
-- `cache.go` - In-memory caching for events, contacts, profiles, relay lists, link previews
-- `link_preview.go` - Open Graph metadata fetching for link previews
-- `bech32.go` - Bech32 encoding/decoding (npub, naddr, etc.)
+| Document | Contents |
+|----------|----------|
+| [DEPLOYMENT.md](docs/DEPLOYMENT.md) | Production deployment, Docker, reverse proxy, Redis, NIP-89 client setup |
+| [API.md](docs/API.md) | All endpoints, query parameters, request/response formats |
+| [DEVELOPMENT.md](docs/DEVELOPMENT.md) | Configuration schemas, adding features, extending the codebase |
 
-**Clients:**
-- `static/index.html` - JS Siren browser entry point
-- `static/app.js` - Generic Siren client (entity/link/action renderer)
-- `static/style.css` - UI styling
+## Quality Checks
 
-## Next Steps
-
-### Phase 1 (✅ Complete)
-- [x] REST timeline endpoint
-- [x] Multi-relay fan-out with WebSocket
-- [x] Dedup and signature verification
-- [x] ETag/Last-Modified caching
-- [x] Siren hypermedia format
-- [x] JavaScript Siren browser (generic client)
-- [x] Zero-JS HTML client (server-rendered)
-
-### Phase 2 (✅ Complete)
-- [x] Thread views (`/html/thread/{id}`)
-- [x] Profile enrichment with caching
-- [x] Reactions and reply counts
-- [x] NIP-46 remote signing (zero-trust auth)
-- [x] NIP-44 encryption
-- [x] Note posting via HTML forms
-
-### Phase 3 (✅ Complete)
-- [x] Profile pages (`/html/profile/{pubkey}`)
-- [x] Reply to notes (thread participation)
-- [x] Reactions via HTML forms
-- [x] NIP-65 relay list support (use logged-in user's relays)
-- [x] Follows/Global feed toggle
-- [x] Contact list caching
-- [x] Nostr Connect flow (QR code / `nostrconnect://` URI)
-- [x] In-memory event caching for performance
-
-### Phase 4 (In Progress)
-- [x] Follow/unfollow users
-- [x] Bookmarks (kind 10003)
-- [x] Reposts (kind 6)
-- [x] Quote posts (kind 1 with q tag)
-- [x] Profile editing (kind 0)
-- [x] Notifications page (mentions, replies, reactions, reposts, zaps)
-- [x] Content type filtering (notes, photos, longform, highlights, livestreams)
-- [x] Livestream support (kind 30311)
-- [x] Theme switching (light/dark mode)
-- [x] Link previews (Open Graph metadata)
-- [x] Connection health monitoring
-- [ ] SSE endpoint for live updates (`/stream/timeline`)
-- [ ] Search endpoint (NIP-50)
-- [ ] Relay health tracking and scoring
-- [ ] Persistent storage (Redis/Postgres)
-
-## Dependencies
-
-- `github.com/gorilla/websocket` - WebSocket client for Nostr relays
-- `github.com/btcsuite/btcd/btcec/v2` - secp256k1 elliptic curve (for NIP-46/NIP-44)
-- `golang.org/x/crypto` - ChaCha20 and HKDF (for NIP-44 encryption)
-
-## Environment Variables
-
-- `PORT` - HTTP server port (default: 8080)
-- `DEV_MODE` - Set to `1` to use a persistent server keypair for NIP-46 reconnection
-
-## Deployment
-
-### Build for Linux
+Six static analysis tools validate accessibility, HATEOAS/NATEOAS compliance, markup, i18n, and security:
 
 ```bash
-# AMD64
-GOOS=linux GOARCH=amd64 go build -o nostr-server .
-
-# ARM64 (AWS Graviton, Raspberry Pi)
-GOOS=linux GOARCH=arm64 go build -o nostr-server .
+./cmd/run_checks.sh
 ```
 
-Copy the `nostr-server` binary and `static/` directory to your server.
-
-### Run with Caddy
-
-```caddyfile
-yourdomain.com {
-    reverse_proxy localhost:8080
-}
-```
-
-```bash
-DEV_MODE=1 PORT=8080 ./nostr-server
-```
-
-### Systemd Service
-
-Create `/etc/systemd/system/nostr-server.service`:
-
-```ini
-[Unit]
-Description=Nostr Hypermedia Server
-After=network.target
-
-[Service]
-Type=simple
-User=www-data
-WorkingDirectory=/path/to/nostr-hypermedia
-Environment=DEV_MODE=1
-Environment=PORT=8080
-ExecStart=/path/to/nostr-hypermedia/nostr-server
-Restart=always
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-```
-
-```bash
-sudo systemctl daemon-reload
-sudo systemctl enable nostr-server
-sudo systemctl start nostr-server
-```
+Reports are saved to `reports/`. See [cmd/README.md](cmd/README.md) for details.
 
 ## License
 

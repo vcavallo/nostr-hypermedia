@@ -1,0 +1,33 @@
+# Git
+.git
+.gitignore
+
+# Build artifacts
+nostr-server
+*.exe
+
+# Pre-compressed files (rebuilt in Docker)
+static/*.gz
+
+# Development files
+.env
+.dev-keypair
+reports/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Documentation (not needed in image)
+*.md
+LICENSE
+
+# Quality check tools (not needed in image)
+cmd/
+
+# Misc
+.DS_Store
+Thumbs.db

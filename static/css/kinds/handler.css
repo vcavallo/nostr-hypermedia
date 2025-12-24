@@ -1,0 +1,65 @@
+/* Application handler styles (kind 31990, NIP-89) */
+.handler-card .handler-info {
+  display: flex;
+  align-items: flex-start;
+  gap: 16px;
+  margin: 12px 0;
+}
+.handler-app-icon {
+  width: 64px;
+  height: 64px;
+  border-radius: 12px;
+  object-fit: contain;
+  background: var(--bg-secondary);
+  flex-shrink: 0;
+}
+.handler-details {
+  flex: 1;
+  min-width: 0;
+}
+.handler-name {
+  font-size: 18px;
+  font-weight: 600;
+  color: var(--text-primary);
+  margin: 0 0 4px 0;
+}
+.handler-about {
+  font-size: 14px;
+  color: var(--text-secondary);
+  line-height: 1.4;
+  margin: 0;
+}
+
+/* Supported kinds badges */
+.handler-kinds {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin: 12px 0;
+}
+.handler-kinds-label {
+  font-size: 13px;
+  color: var(--text-secondary);
+  font-weight: 500;
+}
+.handler-kind-badge {
+  background: var(--bg-tertiary);
+  color: var(--text-secondary);
+  padding: 4px 8px;
+  border-radius: 4px;
+  font-size: 12px;
+  font-family: monospace;
+}
+
+/* Website link */
+.handler-website-link {
+  display: inline-block;
+  color: var(--accent);
+  font-size: 14px;
+  text-decoration: none;
+  margin: 8px 0;
+}
+.handler-website-link:hover {
+  text-decoration: underline;
+}

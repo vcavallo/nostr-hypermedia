@@ -1,0 +1,30 @@
+/* User status styles (kind 30315) */
+.status-card {
+  background: var(--bg-secondary);
+  border-radius: 8px;
+  padding: 12px 16px;
+  margin: 8px 0;
+}
+.status-content {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.status-icon {
+  font-size: 18px;
+}
+.status-text {
+  font-size: 15px;
+  color: var(--text-content);
+}
+.status-link {
+  display: block;
+  margin-top: 8px;
+  font-size: 13px;
+  color: var(--accent);
+  text-decoration: none;
+  word-break: break-all;
+}
+.status-link:hover {
+  text-decoration: underline;
+}

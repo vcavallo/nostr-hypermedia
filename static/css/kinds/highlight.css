@@ -1,0 +1,39 @@
+/* Highlight (kind 9802) styles */
+.highlight { padding: 16px 20px; }
+.highlight-blockquote {
+  border-left: 4px solid var(--accent);
+  padding-left: 16px;
+  margin: 0 0 12px 0;
+  font-style: italic;
+  font-size: 15px;
+  line-height: 1.6;
+  color: var(--text-content);
+}
+.highlight-context {
+  margin-top: 8px;
+  padding: 12px;
+  background: var(--bg-secondary);
+  border-radius: 6px;
+  font-size: 13px;
+  color: var(--text-secondary);
+  font-style: normal;
+  line-height: 1.5;
+}
+.highlight-comment {
+  margin-top: 12px;
+  font-size: 14px;
+  color: var(--text-primary);
+  font-style: normal;
+}
+.highlight-source {
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border-color);
+  font-size: 13px;
+}
+.highlight-source-link {
+  color: var(--accent);
+  text-decoration: none;
+  word-break: break-all;
+}
+.highlight-source-link:hover { text-decoration: underline; }

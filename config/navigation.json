@@ -1,0 +1,161 @@
+{
+  "feeds": [
+    {
+      "name": "follows",
+      "requiresLogin": true
+    },
+    {
+      "name": "global"
+    }
+  ],
+  "utility": [
+    {
+      "name": "search",
+      "href": "/search",
+      "icon": "🔎︎",
+      "iconOnly": "always"
+    },
+    {
+      "name": "notifications",
+      "href": "/notifications",
+      "requiresLogin": true,
+      "icon": "🔔",
+      "iconOnly": "always"
+    }
+  ],
+  "settings": [
+    {
+      "name": "profile",
+      "requiresLogin": true
+    },
+    {
+      "name": "edit_profile",
+      "href": "/profile/edit",
+      "requiresLogin": true
+    },
+    {
+      "name": "wallet",
+      "href": "/wallet",
+      "requiresLogin": true
+    },
+    {
+      "name": "bookmarks",
+      "kinds": [10003],
+      "feed": "me",
+      "requiresLogin": true,
+      "dividerBefore": true
+    },
+    {
+      "name": "highlights",
+      "kinds": [9802],
+      "feed": "me",
+      "requiresLogin": true
+    },
+    {
+      "name": "mutes",
+      "href": "/mutes",
+      "requiresLogin": true
+    },
+    {
+      "name": "theme",
+      "dynamic": "theme",
+      "href": "/theme",
+      "method": "POST",
+      "requiresLogin": true
+    },
+    {
+      "name": "logout",
+      "href": "/logout",
+      "requiresLogin": true,
+      "dividerBefore": true
+    }
+  ],
+  "kindFilters": [
+    {
+      "name": "all",
+      "kinds": [1, 6, 16, 20, 22, 30, 30023]
+    },
+    {
+      "name": "notes",
+      "kinds": [1]
+    },
+    {
+      "name": "longform",
+      "kinds": [30023]
+    },
+    {
+      "name": "photos",
+      "kinds": [20]
+    },
+    {
+      "name": "recipes",
+      "kinds": [30023],
+      "tags": ["nostrcooking"]
+    },
+    {
+      "name": "videos",
+      "kinds": [22, 30]
+    },
+    {
+      "name": "more",
+      "children": [
+        {
+          "name": "apps",
+          "kinds": [31990],
+          "limit": 20
+        },
+        {
+          "name": "badges",
+          "kinds": [30009, 8]
+        },
+        {
+          "name": "communities",
+          "kinds": [34550]
+        },
+        {
+          "name": "classifieds",
+          "kinds": [30402]
+        },
+        {
+          "name": "events",
+          "kinds": [31922, 31923]
+        },
+        {
+          "name": "files",
+          "kinds": [1063]
+        },
+        {
+          "name": "highlights",
+          "kinds": [9802]
+        },
+        {
+          "name": "labels",
+          "kinds": [1985]
+        },
+        {
+          "name": "marketplace",
+          "kinds": [30017, 30018]
+        },
+        {
+          "name": "recommendations",
+          "kinds": [31989],
+          "limit": 25
+        },
+        {
+          "name": "repos",
+          "kinds": [30617]
+        },
+        {
+          "name": "live",
+          "kinds": [30311, 1311]
+        }
+      ]
+    }
+  ],
+  "defaults": {
+    "feed": "follows",
+    "loggedOutFeed": "global",
+    "settingsIcon": "avatar",
+    "settingsIconFallback": "/static/avatar.jpg"
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "enabled": false,
+  "name": "nostr-hypermedia",
+  "pubkey": "",
+  "dtag": "nostr-hypermedia",
+  "relayHint": "",
+  "tagKinds": [1, 6, 7],
+  "version": "0.1.0",
+  "nip05Badge": "🛡️"
+}
