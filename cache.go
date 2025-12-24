@@ -678,6 +678,11 @@ func buildEventCacheKey(relays []string, filter Filter) string {
 		sb.WriteString("|until:")
 		sb.WriteString(strconv.FormatInt(*filter.Until, 10))
 	}
+	if len(filter.TTags) > 0 {
+		sortedTags := util.SortedCopy(filter.TTags)
+		sb.WriteString("|ttags:")
+		sb.WriteString(strings.Join(sortedTags, ","))
+	}
 
 	// Hash the key to keep it short
 	hash := sha256.Sum256([]byte(sb.String()))

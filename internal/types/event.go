@@ -25,6 +25,7 @@ type Filter struct {
 	ATags   []string // #a tag filter (addressable events)
 	DTags   []string // #d tag filter (d-tag for addressable events)
 	KTags   []string // #k tag filter (kind references, used for NIP-89)
+	TTags   []string // #t tag filter (hashtags/topics)
 	Search  string   // NIP-50 search query
 }
 

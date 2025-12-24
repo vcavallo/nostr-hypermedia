@@ -14,7 +14,7 @@ var Comment = `{{define "render-comment"}}
       {{if .CommentRootURL}}
       <a href="{{.CommentRootURL}}" class="comment-context-link" target="_blank" rel="external noopener">{{.CommentRootURL}}</a>
       {{else if .CommentRootID}}
-      <a href="/thread/{{noteLink .CommentRootID}}" h-get h-target="#page-content" h-swap="inner" h-push-url h-prefetch class="comment-context-link" rel="related">{{if .CommentRootLabel}}{{.CommentRootLabel}}{{else}}event{{end}}</a>
+      <a href="/thread/{{noteLink .CommentRootID}}" h-get h-target="#page-content" h-swap="inner" h-push-url h-scroll="top" h-prefetch class="comment-context-link" rel="related">{{if .CommentRootLabel}}{{.CommentRootLabel}}{{else}}event{{end}}</a>
       {{end}}
     </span>
   </div>

@@ -417,6 +417,9 @@ func fetchFromRelayWithURL(ctx context.Context, relayURL string, filter Filter, 
 	if len(filter.KTags) > 0 {
 		reqFilter["#k"] = filter.KTags
 	}
+	if len(filter.TTags) > 0 {
+		reqFilter["#t"] = filter.TTags
+	}
 	if filter.Search != "" {
 		reqFilter["search"] = filter.Search
 	}
@@ -1498,6 +1501,7 @@ func fetchEventsFromOutbox(pubkeys []string, relayLists map[string]*RelayList, f
 				Limit:   filter.Limit,
 				Since:   filter.Since,
 				Until:   filter.Until,
+				TTags:   filter.TTags,
 			}
 			fetchFromRelayWithURL(ctx, g.RelayURL, groupFilter, eventChan, eoseChan)
 		}(group)
@@ -1517,6 +1521,7 @@ func fetchEventsFromOutbox(pubkeys []string, relayLists map[string]*RelayList, f
 					Limit:   filter.Limit,
 					Since:   filter.Since,
 					Until:   filter.Until,
+					TTags:   filter.TTags,
 				}
 				fetchFromRelayWithURL(ctx, relayURL, fallbackFilter, eventChan, eoseChan)
 			}(relay)
@@ -1597,6 +1602,7 @@ tier1Loop:
 					Limit:   filter.Limit,
 					Since:   filter.Since,
 					Until:   filter.Until,
+					TTags:   filter.TTags,
 				}
 				fetchFromRelayWithURL(ctx, g.RelayURL, groupFilter, eventChan, eoseChan)
 			}(group)

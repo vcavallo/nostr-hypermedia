@@ -161,9 +161,9 @@ var notificationsAppendTemplate = `{{define "notifications-append"}}
   <div class="notification-target-content">{{.TargetContentHTML}}</div>
   {{end}}
   {{if .TargetEventID}}
-  <a href="/thread/{{noteLink .TargetEventID}}" h-get h-target="#page-content" h-swap="inner" h-push-url h-prefetch class="notification-link" rel="related">{{i18n "nav.view_note"}} →</a>
+  <a href="/thread/{{noteLink .TargetEventID}}" h-get h-target="#page-content" h-swap="inner" h-push-url h-scroll="top" h-prefetch class="notification-link" rel="related">{{i18n "nav.view_note"}} →</a>
   {{else if .Event}}
-  <a href="/thread/{{noteLink .Event.ID}}" h-get h-target="#page-content" h-swap="inner" h-push-url h-prefetch class="notification-link" rel="related">{{i18n "nav.view_note"}} →</a>
+  <a href="/thread/{{noteLink .Event.ID}}" h-get h-target="#page-content" h-swap="inner" h-push-url h-scroll="top" h-prefetch class="notification-link" rel="related">{{i18n "nav.view_note"}} →</a>
   {{end}}
 </li>
 {{end}}
@@ -182,7 +182,7 @@ var searchAppendTemplate = `{{define "search-append"}}
   {{template "author-header" .}}
   <div class="note-content">{{.ContentHTML}}</div>
   <div class="note-footer">
-    <a href="/thread/{{eventLink .ID .Kind .Pubkey .DTag}}" h-get h-target="#page-content" h-swap="inner" h-push-url h-prefetch class="text-link" rel="related">{{i18n "nav.view_thread"}}</a>
+    <a href="/thread/{{eventLink .ID .Kind .Pubkey .DTag}}" h-get h-target="#page-content" h-swap="inner" h-push-url h-scroll="top" h-prefetch class="text-link" rel="related">{{i18n "nav.view_thread"}}</a>
     {{if or (gt .ReplyCount 0) (gt .ReactionCount 0)}}
     <span class="note-stats">
       {{if gt .ReplyCount 0}}<span class="stat-badge">💬 {{.ReplyCount}}</span>{{end}}

@@ -13,7 +13,7 @@ var Zap = `{{define "render-zap"}}
       </div>
       <div class="zap-amount">{{.ZapAmountSats}} sats</div>
       {{if .ZapComment}}<div class="zap-comment">{{.ZapComment}}</div>{{end}}
-      {{if .ZappedEventID}}<div class="zap-target"><a href="/thread/{{noteLink .ZappedEventID}}" h-get h-target="#page-content" h-swap="inner" h-push-url h-prefetch class="text-link" rel="related">{{i18n "nav.view_zapped_note"}}</a></div>{{end}}
+      {{if .ZappedEventID}}<div class="zap-target"><a href="/thread/{{noteLink .ZappedEventID}}" h-get h-target="#page-content" h-swap="inner" h-push-url h-scroll="top" h-prefetch class="text-link" rel="related">{{i18n "nav.view_zapped_note"}}</a></div>{{end}}
     </div>
   </div>
   <div class="note-meta">

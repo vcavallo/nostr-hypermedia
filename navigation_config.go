@@ -124,6 +124,7 @@ type KindFilterConfig struct {
 	Name        string             `json:"name"`
 	TitleKey    string             `json:"titleKey,omitempty"`    // i18n key (defaults to "kind.{name}")
 	Kinds       []int              `json:"kinds,omitempty"`       // Empty if using custom href or group
+	Tags        []string           `json:"tags,omitempty"`        // #t tag filter (e.g., ["nostrcooking"] for recipes)
 	KindsByFeed map[string][]int   `json:"kindsByFeed,omitempty"` // Per-feed kind overrides (for "all" filter)
 	Href        string             `json:"href,omitempty"`        // Custom href (overrides kinds-based URL)
 	Limit       int                `json:"limit,omitempty"`       // Custom limit (defaults to 10 if not set)
@@ -627,7 +628,7 @@ func ConfigGetKindFilters(ctx KindFilterContext) []KindFilter {
 	filters = append(filters, KindFilter{
 		Name:   "all",
 		Title:  cfgpkg.I18n("kind.all"),
-		Href:   buildKindFilterHref(allKindsStr, 0, ctx),
+		Href:   buildKindFilterHref(allKindsStr, nil, 0, ctx),
 		Active: allActive,
 	})
 
@@ -721,7 +722,7 @@ func buildEphemeralKindFilter(ctx KindFilterContext) *KindFilter {
 	}
 
 	// Build href - same URL (no-op when clicked)
-	href := buildKindFilterHref(ctx.ActiveKinds, 0, ctx)
+	href := buildKindFilterHref(ctx.ActiveKinds, nil, 0, ctx)
 
 	return &KindFilter{
 		Name:   "ephemeral",
@@ -754,8 +755,10 @@ func buildSingleKindFilter(filterCfg KindFilterConfig, ctx KindFilterContext) Ki
 		active = ctx.ActivePage == filterCfg.Name
 	} else {
 		kindsStr := intsToString(filterCfg.Kinds)
-		href = buildKindFilterHref(kindsStr, filterCfg.Limit, ctx)
-		active = ctx.ActiveKinds == kindsStr
+		href = buildKindFilterHref(kindsStr, filterCfg.Tags, filterCfg.Limit, ctx)
+		// Active when kinds match AND tags match (or filter has no tags)
+		tagsMatch := len(filterCfg.Tags) == 0 || ctx.ActiveTags == strings.Join(filterCfg.Tags, ",")
+		active = ctx.ActiveKinds == kindsStr && tagsMatch
 	}
 
 	return KindFilter{
@@ -840,7 +843,7 @@ func ConfigGetDefaultKinds(feed string) string {
 }
 
 // buildKindFilterHref builds the URL for a kind filter
-func buildKindFilterHref(kindsStr string, limit int, ctx KindFilterContext) string {
+func buildKindFilterHref(kindsStr string, tags []string, limit int, ctx KindFilterContext) string {
 	limitStr := "10"
 	if limit > 0 {
 		limitStr = strconv.Itoa(limit)
@@ -848,6 +851,9 @@ func buildKindFilterHref(kindsStr string, limit int, ctx KindFilterContext) stri
 	params := map[string]string{
 		"kinds": kindsStr,
 		"limit": limitStr,
+	}
+	if len(tags) > 0 {
+		params["t"] = strings.Join(tags, ",")
 	}
 	if ctx.ActiveFeed != "" {
 		params["feed"] = ctx.ActiveFeed

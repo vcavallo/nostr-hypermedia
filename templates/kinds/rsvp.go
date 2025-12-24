@@ -15,7 +15,7 @@ const RSVPTemplate = `
     {{if .CalendarEventRef}}
     <div class="rsvp-event">
       <span class="rsvp-event-icon">📅</span>
-      <a href="/thread/{{noteLink .CalendarEventRef}}" h-get h-target="#page-content" h-swap="inner" h-push-url h-prefetch class="rsvp-event-link">
+      <a href="/thread/{{noteLink .CalendarEventRef}}" h-get h-target="#page-content" h-swap="inner" h-push-url h-scroll="top" h-prefetch class="rsvp-event-link">
         {{if .CalendarEventTitle}}{{.CalendarEventTitle}}{{else}}{{i18n "kind.event.label"}}{{end}}
       </a>
     </div>

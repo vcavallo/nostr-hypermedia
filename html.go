@@ -2569,7 +2569,7 @@ func computeKindFilter(kinds []int) string {
 	return "all" // Unknown filter pattern, default to all
 }
 
-func renderHTML(resp TimelineResponse, relays []string, authors []string, kinds []int, limit int, session *BunkerSession, errorMsg, successMsg string, feedMode string, currentURL string, themeClass, themeLabel string, csrfToken string, hasUnreadNotifs bool, isFragment bool, isAppend bool, newestTimestamp int64, repostEvents map[string]*Event, dvmMetadata *DVMMetadata) (string, error) {
+func renderHTML(resp TimelineResponse, relays []string, authors []string, kinds []int, tags []string, limit int, session *BunkerSession, errorMsg, successMsg string, feedMode string, currentURL string, themeClass, themeLabel string, csrfToken string, hasUnreadNotifs bool, isFragment bool, isAppend bool, newestTimestamp int64, repostEvents map[string]*Event, dvmMetadata *DVMMetadata) (string, error) {
 	// Pre-fetch all nostr: references in parallel for much faster rendering
 	// Include embedded content from reposts so mentions inside reposted notes get resolved
 	contents := make([]string, 0, len(resp.Items)*2)
@@ -2967,6 +2967,7 @@ func renderHTML(resp TimelineResponse, relays []string, authors []string, kinds 
 		LoggedIn:    data.LoggedIn,
 		ActiveFeed:  feedMode,
 		ActiveKinds: kindsStr,
+		ActiveTags:  strings.Join(tags, ","),
 	})
 	settingsCtx := SettingsContext{
 		LoggedIn:      data.LoggedIn,

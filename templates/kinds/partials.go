@@ -78,7 +78,7 @@ var PartialNoteFooter = `{{define "note-footer"}}
 {{define "action-pill"}}
 {{$a := .Action}}{{$eid := .EventID}}
 {{if eq $a.Method "GET"}}
-<a href="{{$a.Href}}" h-get h-target="#page-content" h-swap="inner" h-push-url h-prefetch class="action-pill {{$a.Class}}{{if $a.Completed}} completed{{end}}"{{if $a.Rel}} rel="{{$a.Rel}}"{{end}}{{if eq $a.IconOnly "always"}} title="{{$a.Title}}" aria-label="{{$a.Title}}"{{end}}>{{template "pill-content" $a}}</a>
+<a href="{{$a.Href}}" h-get h-target="#page-content" h-swap="inner" h-push-url h-scroll="top" h-prefetch class="action-pill {{$a.Class}}{{if $a.Completed}} completed{{end}}"{{if $a.Rel}} rel="{{$a.Rel}}"{{end}}{{if eq $a.IconOnly "always"}} title="{{$a.Title}}" aria-label="{{$a.Title}}"{{end}}>{{template "pill-content" $a}}</a>
 {{else if eq $a.Name "mute"}}
 <form method="POST" action="{{$a.Href}}" class="action-pill-form" h-post h-target="#note-{{$eid}}" h-swap="delete" h-confirm="{{i18n "confirm.mute"}}">
   <input type="hidden" name="csrf_token" value="{{$a.CSRFToken}}">
@@ -115,7 +115,7 @@ var PartialNoteFooter = `{{define "note-footer"}}
 {{define "dropdown-action"}}
 {{$a := .Action}}{{$eid := .EventID}}
 {{if eq $a.Method "GET"}}
-<a href="{{$a.Href}}" h-get h-target="#page-content" h-swap="inner" h-push-url h-prefetch class="dropdown-action {{$a.Class}}"{{if $a.Rel}} rel="{{$a.Rel}}"{{end}}>{{$a.Title}}</a>
+<a href="{{$a.Href}}" h-get h-target="#page-content" h-swap="inner" h-push-url h-scroll="top" h-prefetch class="dropdown-action {{$a.Class}}"{{if $a.Rel}} rel="{{$a.Rel}}"{{end}}>{{$a.Title}}</a>
 {{else if eq $a.Name "mute"}}
 <form method="POST" action="{{$a.Href}}" class="dropdown-form" h-post h-target="#note-{{$eid}}" h-swap="delete" h-confirm="{{i18n "confirm.mute"}}">
   <input type="hidden" name="csrf_token" value="{{$a.CSRFToken}}">
@@ -145,17 +145,17 @@ var PartialQuotedNote = `{{define "quoted-note"}}
   {{if eq .QuotedEvent.TemplateName "longform"}}
   <div class="quoted-article-title">{{if .QuotedEvent.Title}}{{.QuotedEvent.Title}}{{else}}{{i18n "msg.untitled"}} Article{{end}}</div>
   {{if .QuotedEvent.Summary}}<div class="quoted-article-summary">{{.QuotedEvent.Summary}}</div>{{end}}
-  <a href="/thread/{{eventLink .QuotedEvent.ID .QuotedEvent.Kind .QuotedEvent.Pubkey .QuotedEvent.DTag}}" h-get h-target="#page-content" h-swap="inner" h-push-url h-prefetch class="view-note-link" rel="related">{{i18n "nav.read_article"}} &rarr;</a>
+  <a href="/thread/{{eventLink .QuotedEvent.ID .QuotedEvent.Kind .QuotedEvent.Pubkey .QuotedEvent.DTag}}" h-get h-target="#page-content" h-swap="inner" h-push-url h-scroll="top" h-prefetch class="view-note-link" rel="related">{{i18n "nav.read_article"}} &rarr;</a>
   {{else}}
   <div class="note-content">{{.QuotedEvent.ContentHTML}}</div>
-  <a href="/thread/{{eventLink .QuotedEvent.ID .QuotedEvent.Kind .QuotedEvent.Pubkey .QuotedEvent.DTag}}" h-get h-target="#page-content" h-swap="inner" h-push-url h-prefetch class="view-note-link" rel="related">{{i18n "nav.view_quoted_note"}} &rarr;</a>
+  <a href="/thread/{{eventLink .QuotedEvent.ID .QuotedEvent.Kind .QuotedEvent.Pubkey .QuotedEvent.DTag}}" h-get h-target="#page-content" h-swap="inner" h-push-url h-scroll="top" h-prefetch class="view-note-link" rel="related">{{i18n "nav.view_quoted_note"}} &rarr;</a>
   {{end}}
   {{if .QuotedEvent.HasContentWarning}}</div>
   </details>{{end}}
 </div>
 {{else if .QuotedEventID}}
 <div class="quoted-note quoted-note-fallback">
-  <a href="/thread/{{noteLink .QuotedEventID}}" h-get h-target="#page-content" h-swap="inner" h-push-url h-prefetch class="view-note-link" rel="related">{{i18n "nav.view_quoted_note"}} &rarr;</a>
+  <a href="/thread/{{noteLink .QuotedEventID}}" h-get h-target="#page-content" h-swap="inner" h-push-url h-scroll="top" h-prefetch class="view-note-link" rel="related">{{i18n "nav.view_quoted_note"}} &rarr;</a>
 </div>
 {{end}}
 {{end}}`

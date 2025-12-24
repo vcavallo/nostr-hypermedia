@@ -73,7 +73,7 @@ var searchContent = `{{define "content"}}
     {{template "author-header" .}}
     <div class="note-content">{{.ContentHTML}}</div>
     <div class="note-footer">
-      <a href="/thread/{{eventLink .ID .Kind .Pubkey .DTag}}" h-get h-target="#page-content" h-swap="inner" h-push-url h-prefetch class="text-link" rel="related">{{i18n "nav.view_thread"}}</a>
+      <a href="/thread/{{eventLink .ID .Kind .Pubkey .DTag}}" h-get h-target="#page-content" h-swap="inner" h-push-url h-scroll="top" h-prefetch class="text-link" rel="related">{{i18n "nav.view_thread"}}</a>
       {{if or (gt .ReplyCount 0) (and .Reactions (gt .Reactions.Total 0))}}
       <span class="note-stats">
         {{if gt .ReplyCount 0}}<span class="stat-badge">💬 {{.ReplyCount}}</span>{{end}}

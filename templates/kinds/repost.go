@@ -41,7 +41,7 @@ var Repost = `{{define "render-repost"}}
     {{end}}
     {{if .RepostedEvent.HasContentWarning}}</div>
     </details>{{end}}
-    <a href="/thread/{{eventLink .RepostedEvent.ID .RepostedEvent.Kind .RepostedEvent.Pubkey .RepostedEvent.DTag}}" h-get h-target="#page-content" h-swap="inner" h-push-url h-prefetch class="view-note-link" rel="related">{{i18n "nav.view_note"}} &rarr;</a>
+    <a href="/thread/{{eventLink .RepostedEvent.ID .RepostedEvent.Kind .RepostedEvent.Pubkey .RepostedEvent.DTag}}" h-get h-target="#page-content" h-swap="inner" h-push-url h-scroll="top" h-prefetch class="view-note-link" rel="related">{{i18n "nav.view_note"}} &rarr;</a>
   </div>
   {{else}}
   <div class="note-content repost-empty">{{i18n "msg.repost_not_available"}}</div>

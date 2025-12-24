@@ -88,6 +88,11 @@
       "kinds": [20]
     },
     {
+      "name": "recipes",
+      "kinds": [30023],
+      "tags": ["nostrcooking"]
+    },
+    {
       "name": "videos",
       "kinds": [22, 30]
     },

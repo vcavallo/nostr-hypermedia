@@ -28,9 +28,9 @@ var notificationsContent = `{{define "content"}}
   <div class="notification-target-content">{{.TargetContentHTML}}</div>
   {{end}}
   {{if .TargetEventID}}
-  <a href="/thread/{{noteLink .TargetEventID}}" h-get h-target="#page-content" h-swap="inner" h-push-url h-prefetch class="notification-link" rel="related">{{i18n "nav.view_note"}} →</a>
+  <a href="/thread/{{noteLink .TargetEventID}}" h-get h-target="#page-content" h-swap="inner" h-push-url h-scroll="top" h-prefetch class="notification-link" rel="related">{{i18n "nav.view_note"}} →</a>
   {{else if .Event}}
-  <a href="/thread/{{noteLink .Event.ID}}" h-get h-target="#page-content" h-swap="inner" h-push-url h-prefetch class="notification-link" rel="related">{{i18n "nav.view_note"}} →</a>
+  <a href="/thread/{{noteLink .Event.ID}}" h-get h-target="#page-content" h-swap="inner" h-push-url h-scroll="top" h-prefetch class="notification-link" rel="related">{{i18n "nav.view_note"}} →</a>
   {{end}}
 </li>
   {{end}}

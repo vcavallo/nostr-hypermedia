@@ -53,7 +53,7 @@ var threadContent = `{{define "content"}}
     {{else}}
     <div class="note-content">{{.Root.RepostedEvent.ContentHTML}}</div>
     {{end}}
-    <a href="/thread/{{eventLink .Root.RepostedEvent.ID .Root.RepostedEvent.Kind .Root.RepostedEvent.Pubkey .Root.RepostedEvent.DTag}}" h-get h-target="#page-content" h-swap="inner" h-push-url h-prefetch class="view-note-link" rel="related">{{i18n "nav.view_quoted_note"}} &rarr;</a>
+    <a href="/thread/{{eventLink .Root.RepostedEvent.ID .Root.RepostedEvent.Kind .Root.RepostedEvent.Pubkey .Root.RepostedEvent.DTag}}" h-get h-target="#page-content" h-swap="inner" h-push-url h-scroll="top" h-prefetch class="view-note-link" rel="related">{{i18n "nav.view_quoted_note"}} &rarr;</a>
   </div>
   {{else}}
   <div class="note-content repost-empty">{{i18n "msg.repost_not_available"}}</div>
@@ -66,7 +66,7 @@ var threadContent = `{{define "content"}}
   </details>{{end}}
   <footer class="note-footer" id="footer-{{.Root.ID}}">
     <div class="note-actions">
-      {{if .Root.ParentID}}<a href="/thread/{{noteLink .Root.ParentID}}" h-get h-target="#page-content" h-swap="inner" h-push-url h-prefetch class="action-pill action-parent" rel="up">↑ {{i18n "nav.view_parent"}}</a>{{end}}
+      {{if .Root.ParentID}}<a href="/thread/{{noteLink .Root.ParentID}}" h-get h-target="#page-content" h-swap="inner" h-push-url h-scroll="top" h-prefetch class="action-pill action-parent" rel="up">↑ {{i18n "nav.view_parent"}}</a>{{end}}
       {{range .Root.ActionGroups}}
         {{if .HasGroup}}
         <details class="action-group {{.Primary.Class}}{{if .Primary.Completed}} completed{{end}}">

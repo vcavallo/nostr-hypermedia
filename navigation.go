@@ -44,6 +44,7 @@ type KindFilterContext struct {
 	LoggedIn    bool
 	ActiveFeed  string // Current feed mode
 	ActiveKinds string // Current kinds parameter
+	ActiveTags  string // Current tags parameter (comma-separated)
 	ActivePage  string // Current page name (for custom href items like "mutes")
 }
 

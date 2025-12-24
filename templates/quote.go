@@ -17,10 +17,10 @@ var quoteContent = `{{define "content"}}
   {{if eq .QuotedEvent.TemplateName "longform"}}
   <div class="quoted-article-title">{{if .QuotedEvent.Title}}{{.QuotedEvent.Title}}{{else}}{{i18n "msg.untitled"}} Article{{end}}</div>
   {{if .QuotedEvent.Summary}}<div class="quoted-article-summary">{{.QuotedEvent.Summary}}</div>{{end}}
-  <a href="/thread/{{eventLink .QuotedEvent.ID .QuotedEvent.Kind .QuotedEvent.Pubkey .QuotedEvent.DTag}}" h-get h-target="#page-content" h-swap="inner" h-push-url h-prefetch class="view-note-link" rel="related">{{i18n "nav.read_article"}} &rarr;</a>
+  <a href="/thread/{{eventLink .QuotedEvent.ID .QuotedEvent.Kind .QuotedEvent.Pubkey .QuotedEvent.DTag}}" h-get h-target="#page-content" h-swap="inner" h-push-url h-scroll="top" h-prefetch class="view-note-link" rel="related">{{i18n "nav.read_article"}} &rarr;</a>
   {{else}}
   <div class="note-content">{{.QuotedEvent.ContentHTML}}</div>
-  <a href="/thread/{{eventLink .QuotedEvent.ID .QuotedEvent.Kind .QuotedEvent.Pubkey .QuotedEvent.DTag}}" h-get h-target="#page-content" h-swap="inner" h-push-url h-prefetch class="view-note-link" rel="related">{{i18n "nav.view_original_note"}} &rarr;</a>
+  <a href="/thread/{{eventLink .QuotedEvent.ID .QuotedEvent.Kind .QuotedEvent.Pubkey .QuotedEvent.DTag}}" h-get h-target="#page-content" h-swap="inner" h-push-url h-scroll="top" h-prefetch class="view-note-link" rel="related">{{i18n "nav.view_original_note"}} &rarr;</a>
   {{end}}
 </div>
 

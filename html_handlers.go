@@ -109,6 +109,7 @@ func htmlTimelineHandler(w http.ResponseWriter, r *http.Request) {
 
 	authors := parseStringList(q.Get("authors"))
 	kinds := parseIntList(q.Get("kinds"))
+	tags := parseStringList(q.Get("t")) // #t tag filter (hashtags/topics)
 	limit := parseLimit(q.Get("limit"), 50)
 	since := parseInt64(q.Get("since"))
 	until := parseInt64(q.Get("until"))
@@ -247,6 +248,7 @@ func htmlTimelineHandler(w http.ResponseWriter, r *http.Request) {
 
 	var events []Event
 	var eose bool
+	var hitFetchLimit bool // True if relay returned fetchLimit events (more might exist)
 
 	if isBookmarksView && len(bookmarkedEventIDs) > 0 {
 		filter := Filter{
@@ -269,10 +271,12 @@ func htmlTimelineHandler(w http.ResponseWriter, r *http.Request) {
 			Limit: fetchLimit,
 			Since: since,
 			Until: until,
+			TTags: tags,
 		}
 
 		// Use outbox fetch with default relays as fallback for users without relay lists
 		events, eose = fetchEventsFromOutbox(authors, relayLists, filter, config.GetDefaultRelays())
+		hitFetchLimit = len(events) >= fetchLimit
 		slog.Debug("outbox fetch for follows complete", "events", len(events))
 	} else {
 		filter := Filter{
@@ -281,6 +285,7 @@ func htmlTimelineHandler(w http.ResponseWriter, r *http.Request) {
 			Limit:   fetchLimit,
 			Since:   since,
 			Until:   until,
+			TTags:   tags,
 		}
 
 		// Try aggregator cache first for global timeline (no authors, kind 1)
@@ -289,12 +294,15 @@ func htmlTimelineHandler(w http.ResponseWriter, r *http.Request) {
 			if aggEvents := GetAggregatedEvents(filter); len(aggEvents) >= limit {
 				events = aggEvents
 				eose = true
+				hitFetchLimit = len(events) >= fetchLimit
 				slog.Debug("timeline served from aggregator", "count", len(events))
 			} else {
 				events, eose = fetchEventsFromRelaysCachedWithOptions(relays, filter, cacheOnly)
+				hitFetchLimit = len(events) >= fetchLimit
 			}
 		} else {
 			events, eose = fetchEventsFromRelaysCachedWithOptions(relays, filter, cacheOnly)
+			hitFetchLimit = len(events) >= fetchLimit
 		}
 	}
 
@@ -463,9 +471,10 @@ func htmlTimelineHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Pagination (subtract 1 from until - Nostr's filter is inclusive)
-	// Only show pagination if we got a full page (more might exist)
+	// Show pagination if we hit the fetch limit (more might exist on relays)
+	// This accounts for filtering reducing the final count below the requested limit
 	// Skip for bookmarks - all bookmarks are fetched at once by event ID
-	if len(items) >= limit && !isBookmarksView {
+	if hitFetchLimit && len(items) > 0 && !isBookmarksView {
 		lastCreatedAt := items[len(items)-1].CreatedAt
 		resp.Page.Until = &lastCreatedAt
 		// Build pagination URL params
@@ -479,6 +488,10 @@ func htmlTimelineHandler(w http.ResponseWriter, r *http.Request) {
 		// This prevents massive URLs with 100+ authors in the query string
 		if len(authors) > 0 && feedMode != "follows" && feedMode != "me" {
 			params["authors"] = strings.Join(authors, ",")
+		}
+		// Include tags filter for pagination
+		if len(tags) > 0 {
+			params["t"] = strings.Join(tags, ",")
 		}
 		nextURL := util.BuildURL(r.URL.Path, params)
 		resp.Page.Next = &nextURL
@@ -522,7 +535,7 @@ func htmlTimelineHandler(w http.ResponseWriter, r *http.Request) {
 		newestTimestamp = items[0].CreatedAt
 	}
 
-	html, err := renderHTML(resp, relays, authors, kinds, limit, session, errorMsg, successMsg, feedMode, currentURL, themeClass, themeLabel, csrfToken, hasUnreadNotifs, isFragment, isAppend, newestTimestamp, repostEvents, nil)
+	html, err := renderHTML(resp, relays, authors, kinds, tags, limit, session, errorMsg, successMsg, feedMode, currentURL, themeClass, themeLabel, csrfToken, hasUnreadNotifs, isFragment, isAppend, newestTimestamp, repostEvents, nil)
 	if err != nil {
 		slog.Error("error rendering HTML", "error", err)
 		util.RespondInternalError(w, "Error rendering page")
@@ -678,7 +691,7 @@ func handleDVMTimeline(w http.ResponseWriter, r *http.Request, dvmConfig *DVMCon
 	// Note: DVM feeds don't have repost events to inline
 	repostEvents := make(map[string]*Event)
 
-	html, renderErr := renderHTML(resp, relays, nil, nil, limit, session, errorMsg, successMsg, feedMode, currentURL, themeClass, themeLabel, csrfToken, hasUnreadNotifs, isFragment, isAppend, 0, repostEvents, dvmMetadata)
+	html, renderErr := renderHTML(resp, relays, nil, nil, nil, limit, session, errorMsg, successMsg, feedMode, currentURL, themeClass, themeLabel, csrfToken, hasUnreadNotifs, isFragment, isAppend, 0, repostEvents, dvmMetadata)
 	if renderErr != nil {
 		slog.Error("error rendering DVM timeline", "error", renderErr)
 		util.RespondInternalError(w, "Error rendering page")
@@ -716,7 +729,7 @@ func renderDVMError(w http.ResponseWriter, r *http.Request, feedMode string, ses
 	hasUnreadNotifs := checkUnreadNotifications(r, session, relays)
 	repostEvents := make(map[string]*Event)
 
-	html, renderErr := renderHTML(resp, relays, nil, nil, 10, session, config.I18n("msg.dvm_unavailable"), "", feedMode, currentURL, themeClass, themeLabel, csrfToken, hasUnreadNotifs, false, false, 0, repostEvents, nil)
+	html, renderErr := renderHTML(resp, relays, nil, nil, nil, 10, session, config.I18n("msg.dvm_unavailable"), "", feedMode, currentURL, themeClass, themeLabel, csrfToken, hasUnreadNotifs, false, false, 0, repostEvents, nil)
 	if renderErr != nil {
 		util.RespondInternalError(w, "Error rendering page")
 		return
@@ -2780,7 +2793,15 @@ func extractMentionQuery(content string) string {
 		}
 	}
 
-	return query.String()
+	queryStr := query.String()
+
+	// Only trigger if query is at end of content (user actively typing)
+	// If there's more content after the query, the mention is complete
+	if len(queryStr) != len(after) {
+		return ""
+	}
+
+	return queryStr
 }
 
 // searchMentionProfiles searches for profiles matching the query

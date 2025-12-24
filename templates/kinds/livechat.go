@@ -11,13 +11,13 @@ const LiveChatTemplate = `
     <div class="live-chat-context">
       <span class="live-chat-icon">📺</span>
       <span>{{i18n "label.chat_in"}}</span>
-      <a href="/thread/{{noteLink .LiveEventRef}}" h-get h-target="#page-content" h-swap="inner" h-push-url h-prefetch class="live-chat-event-link">{{if .LiveEventTitle}}{{.LiveEventTitle}}{{else}}{{i18n "msg.live_event"}}{{end}}</a>
+      <a href="/thread/{{noteLink .LiveEventRef}}" h-get h-target="#page-content" h-swap="inner" h-push-url h-scroll="top" h-prefetch class="live-chat-event-link">{{if .LiveEventTitle}}{{.LiveEventTitle}}{{else}}{{i18n "msg.live_event"}}{{end}}</a>
     </div>
     {{end}}
     {{if .ReplyToID}}
     <div class="live-chat-reply-indicator">
       <span class="live-chat-reply-icon">↩</span>
-      <a href="/thread/{{noteLink .ReplyToID}}" h-get h-target="#page-content" h-swap="inner" h-push-url h-prefetch class="live-chat-reply-link">{{i18n "nav.view_thread"}}</a>
+      <a href="/thread/{{noteLink .ReplyToID}}" h-get h-target="#page-content" h-swap="inner" h-push-url h-scroll="top" h-prefetch class="live-chat-reply-link">{{i18n "nav.view_thread"}}</a>
     </div>
     {{end}}
   </div>
